@@ -375,6 +375,7 @@ class HubState:
             record = session.scalar(select(AgentModel).where(AgentModel.agent_id == agent_id))
             if record is None or not record.agent_key_hash:
                 return False
+            # Agent key defaults to non-expiring. key_issued_at is audit metadata only.
             return hmac.compare_digest(record.agent_key_hash, _hash_agent_key(presented_key))
 
     def _disconnect_agent_sync(self, agent_id: str) -> None:

@@ -40,7 +40,7 @@ class AgentSnapshot(BaseModel):
     online: bool = Field(title="是否在线")
     credential_configured: bool = Field(title="是否已配置凭据")
     remote: str | None = Field(default=None, title="远端地址")
-    key_issued_at: datetime | None = Field(default=None, title="密钥签发时间")
+    key_issued_at: datetime | None = Field(default=None, title="密钥签发时间", description="最近一次签发时间，仅用于审计，不代表过期时间。")
     connected_at: datetime | None = Field(default=None, title="连接时间")
     disconnected_at: datetime | None = Field(default=None, title="断开时间")
     last_seen_at: datetime | None = Field(default=None, title="最后活跃时间")
@@ -54,7 +54,7 @@ class AgentCredentialResponse(BaseModel):
 
     agent_id: str = Field(title="Agent 标识")
     agent_key: str = Field(title="Agent 密钥")
-    issued_at: datetime = Field(title="签发时间")
+    issued_at: datetime = Field(title="签发时间", description="签发时间，仅用于审计；该密钥不会按时间自动过期，直到被轮换。")
     created: bool = Field(title="是否为首次创建")
 
 
@@ -69,7 +69,7 @@ class AgentProvisionResponse(BaseModel):
 
     agent: AgentSnapshot = Field(title="Agent 信息")
     agent_key: str = Field(title="Agent 密钥")
-    issued_at: datetime = Field(title="签发时间")
+    issued_at: datetime = Field(title="签发时间", description="签发时间，仅用于审计；该密钥不会按时间自动过期，直到被轮换。")
 
 
 class CommandSnapshot(BaseModel):

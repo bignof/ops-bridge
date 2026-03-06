@@ -2,7 +2,10 @@ import asyncio
 from datetime import timedelta
 from pathlib import Path
 
+from sqlalchemy import select
+
 from app.db import Database
+from app.db_models import AgentModel
 from app.store import HubState, _as_utc, _loads_payload, utc_now
 
 
@@ -149,5 +152,21 @@ def test_hub_state_retry_and_missing_updates(tmp_path: Path) -> None:
 
     retry_events = asyncio.run(state.list_command_events("req-1"))
     assert retry_events[-1]["event_type"] == "retry"
+
+    database.engine.dispose()
+
+
+def test_agent_key_does_not_expire_by_issued_timestamp(tmp_path: Path) -> None:
+    state, database = _create_state(tmp_path)
+
+    credential = asyncio.run(state.rotate_agent_key("agent-a"))
+
+    with database.session_factory() as session:
+        record = session.scalar(select(AgentModel).where(AgentModel.agent_id == "agent-a"))
+        assert record is not None
+        record.key_issued_at = utc_now() - timedelta(days=3650)
+        session.commit()
+
+    assert asyncio.run(state.authenticate_agent("agent-a", credential["agent_key"])) is True
 
     database.engine.dispose()

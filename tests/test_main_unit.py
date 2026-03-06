@@ -211,12 +211,12 @@ def test_dispatch_command_error_branches(monkeypatch: pytest.MonkeyPatch) -> Non
     recording_state.agent = {"agent_id": "agent-a", "online": True}
     recording_state.connection = None
     with pytest.raises(HTTPException, match="Agent connection is unavailable"):
-        asyncio.run(dispatch_command("agent-a", request))
+        asyncio.run(dispatch_command(request, "agent-a"))
     assert recording_state.results[-1] == ("req-1", "failed", None, None, "Agent connection is unavailable")
 
     recording_state.connection = FailingSocket()
     with pytest.raises(HTTPException, match="Failed to dispatch command"):
-        asyncio.run(dispatch_command("agent-a", request))
+        asyncio.run(dispatch_command(request, "agent-a"))
     assert recording_state.results[-1][0] == "req-1"
     assert recording_state.results[-1][-1] == "Failed to dispatch command: boom"
 

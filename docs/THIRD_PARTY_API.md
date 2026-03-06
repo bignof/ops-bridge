@@ -203,6 +203,8 @@ Content-Type: application/json
 
 已存在的 agent 会返回 `409 Agent already exists`。
 
+说明：`agentKey` 默认不会按时间自动过期，会一直有效，直到你主动调用轮换接口生成新 key。
+
 注意：这里的 `X-Admin-Token` 就是 hub 进程环境变量 `ADMIN_TOKEN` 的值。
 
 ### 4. 为已有 Agent 轮换 key
@@ -213,6 +215,8 @@ X-Admin-Token: <ADMIN_TOKEN>
 ```
 
 返回：包含新的 `agentKey`。该明文只会在响应里出现一次。
+
+说明：轮换后，新 key 立即生效，旧 key 立即失效；新 key 同样不会按时间自动过期。
 
 调用示例：
 

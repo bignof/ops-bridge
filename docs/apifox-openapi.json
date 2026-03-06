@@ -62,7 +62,7 @@
           "Agent 管理"
         ],
         "summary": "创建 Agent 并签发初始密钥",
-        "description": "创建新的 Agent 记录，并返回该 Agent 的首次连接密钥。",
+        "description": "创建新的 Agent 记录，并返回该 Agent 的首次连接密钥。密钥默认长期有效，直到显式轮换。",
         "operationId": "provision_agent_api_agents_post",
         "parameters": [
           {
@@ -169,7 +169,7 @@
           "Agent 管理"
         ],
         "summary": "轮换 Agent 密钥",
-        "description": "为指定 Agent 重新签发连接密钥。",
+        "description": "为指定 Agent 重新签发连接密钥。新密钥默认长期有效，旧密钥在轮换后立即失效。",
         "operationId": "rotate_agent_credentials_api_agents__agent_id__credentials_rotate_post",
         "parameters": [
           {
@@ -929,7 +929,8 @@
           "issuedAt": {
             "type": "string",
             "format": "date-time",
-            "title": "签发时间"
+            "title": "签发时间",
+            "description": "签发时间，仅用于审计；该密钥不会按时间自动过期，直到被轮换。"
           },
           "created": {
             "type": "boolean",
@@ -971,7 +972,8 @@
           "issuedAt": {
             "type": "string",
             "format": "date-time",
-            "title": "签发时间"
+            "title": "签发时间",
+            "description": "签发时间，仅用于审计；该密钥不会按时间自动过期，直到被轮换。"
           }
         },
         "type": "object",
@@ -1021,7 +1023,8 @@
                 "type": "null"
               }
             ],
-            "title": "密钥签发时间"
+            "title": "密钥签发时间",
+            "description": "最近一次签发时间，仅用于审计，不代表过期时间。"
           },
           "connectedAt": {
             "anyOf": [

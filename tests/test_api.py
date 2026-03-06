@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 import os
 from pathlib import Path
 from typing import Any, Iterator
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 os.environ.setdefault("ADMIN_TOKEN", "test-admin-token")
 
 from app.db import Database
+from app.db_models import AgentModel
 from app.main import app
-from app.store import HubState
+from app.store import HubState, utc_now
 
 
 @pytest.fixture()
@@ -25,8 +28,10 @@ def client(tmp_path: Path) -> Iterator[TestClient]:
 
     old_database = main_module.database
     old_hub_state = main_module.hub_state
+    old_admin_token = main_module.settings.admin_token
     main_module.database = database
     main_module.hub_state = test_state
+    object.__setattr__(main_module.settings, "admin_token", "test-admin-token")
     app.dependency_overrides = {}
 
     with TestClient(app) as test_client:
@@ -35,6 +40,7 @@ def client(tmp_path: Path) -> Iterator[TestClient]:
     database.engine.dispose()
     main_module.database = old_database
     main_module.hub_state = old_hub_state
+    object.__setattr__(main_module.settings, "admin_token", old_admin_token)
 
 
 class FakeSocket:
@@ -135,6 +141,32 @@ def test_provision_agent_creates_offline_agent_and_returns_initial_key(client: T
 
     assert conflict.status_code == 409
     assert conflict.json() == {"detail": "Agent already exists"}
+
+
+def test_provisioned_key_remains_valid_even_if_issued_at_is_old(client: TestClient) -> None:
+    import app.main as main_module
+
+    response = client.post(
+        "/api/agents",
+        headers={"X-Admin-Token": "test-admin-token"},
+        json={"agentId": "agent-e2e"},
+    )
+
+    assert response.status_code == 201
+    agent_key = response.json()["agentKey"]
+
+    with main_module.database.session_factory() as session:
+        record = session.scalar(select(AgentModel).where(AgentModel.agent_id == "agent-e2e"))
+        assert record is not None
+        record.key_issued_at = utc_now() - timedelta(days=3650)
+        session.commit()
+
+    with client.websocket_connect(f"/ws/agent/agent-e2e?key={agent_key}") as websocket:
+        websocket.send_json({"type": "heartbeat"})
+
+    agent_response = client.get("/api/agents/agent-e2e")
+    assert agent_response.status_code == 200
+    assert agent_response.json()["credentialConfigured"] is True
 
 
 def test_get_unknown_agent_returns_404(client: TestClient) -> None:
