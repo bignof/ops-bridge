@@ -1,132 +1,176 @@
 import asyncio
-from dataclasses import asdict, dataclass, field
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from uuid import uuid4
 
 from fastapi import WebSocket
+from sqlalchemy import func, select
 
+from app.db import Database
+from app.db_models import AgentModel, CommandEventModel, CommandModel
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-@dataclass
-class AgentRecord:
-    agent_id: str
-    connected: bool = False
-    remote: str | None = None
-    connected_at: datetime | None = None
-    disconnected_at: datetime | None = None
-    last_seen_at: datetime | None = None
-    last_heartbeat_at: datetime | None = None
-    last_pong_at: datetime | None = None
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
-@dataclass
-class CommandRecord:
-    request_id: str
-    agent_id: str
-    payload: dict[str, Any]
-    status: str
-    action: str
-    dir: str
-    image: str | None = None
-    output: str | None = None
-    message: str | None = None
-    error: str | None = None
-    created_at: datetime = field(default_factory=utc_now)
-    updated_at: datetime = field(default_factory=utc_now)
-    ack_at: datetime | None = None
-    result_at: datetime | None = None
+def _loads_payload(value: str) -> dict[str, Any]:
+    return json.loads(value) if value else {}
+
+
+def _agent_to_dict(record: AgentModel) -> dict[str, Any]:
+    return {
+        "agent_id": record.agent_id,
+        "status": record.status,
+        "remote": record.remote_addr,
+        "connected_at": _as_utc(record.connected_at),
+        "disconnected_at": _as_utc(record.last_disconnect_at),
+        "last_seen_at": _as_utc(record.last_seen_at),
+        "last_heartbeat_at": _as_utc(record.last_heartbeat_at),
+        "last_pong_at": _as_utc(record.last_pong_at),
+    }
+
+
+def command_to_dict(record: CommandModel) -> dict[str, Any]:
+    return {
+        "request_id": record.request_id,
+        "agent_id": record.agent_id,
+        "status": record.status,
+        "action": record.action,
+        "dir": record.target_dir,
+        "image": record.target_image,
+        "original_request_id": record.original_request_id,
+        "retry_count": record.retry_count,
+        "requested_by": record.requested_by,
+        "request_source": record.request_source,
+        "payload": _loads_payload(record.payload_json),
+        "output": record.output,
+        "message": record.message,
+        "error": record.error,
+        "created_at": _as_utc(record.created_at),
+        "updated_at": _as_utc(record.updated_at),
+        "ack_at": _as_utc(record.ack_at),
+        "result_at": _as_utc(record.result_at),
+    }
+
+
+def command_event_to_dict(record: CommandEventModel) -> dict[str, Any]:
+    return {
+        "id": record.id,
+        "request_id": record.request_id,
+        "event_type": record.event_type,
+        "payload": _loads_payload(record.payload_json),
+        "created_at": _as_utc(record.created_at),
+    }
+
+
+def _apply_command_filters(
+    statement: Any,
+    *,
+    agent_id: str | None,
+    status: str | None,
+    action: str | None,
+    requested_by: str | None,
+    request_source: str | None,
+    created_after: datetime | None,
+    created_before: datetime | None,
+) -> Any:
+    if agent_id:
+        statement = statement.where(CommandModel.agent_id == agent_id)
+    if status:
+        statement = statement.where(CommandModel.status == status)
+    if action:
+        statement = statement.where(CommandModel.action == action)
+    if requested_by:
+        statement = statement.where(CommandModel.requested_by == requested_by)
+    if request_source:
+        statement = statement.where(CommandModel.request_source == request_source)
+    if created_after:
+        statement = statement.where(CommandModel.created_at >= created_after)
+    if created_before:
+        statement = statement.where(CommandModel.created_at <= created_before)
+    return statement
 
 
 class HubState:
-    def __init__(self, heartbeat_timeout: int, command_history_limit: int) -> None:
+    def __init__(self, heartbeat_timeout: int, command_history_limit: int, database: Database) -> None:
         self.heartbeat_timeout = heartbeat_timeout
         self.command_history_limit = command_history_limit
-        self._agents: dict[str, AgentRecord] = {}
+        self.database = database
         self._connections: dict[str, WebSocket] = {}
-        self._commands: dict[str, CommandRecord] = {}
-        self._commands_by_agent: dict[str, list[str]] = {}
         self._lock = asyncio.Lock()
 
+    async def initialize(self) -> None:
+        await asyncio.to_thread(self.database.init_schema)
+
+    async def check_database(self) -> bool:
+        return await asyncio.to_thread(self.database.ping)
+
     async def register_agent(self, agent_id: str, websocket: WebSocket, remote: str | None) -> None:
-        now = utc_now()
         async with self._lock:
-            record = self._agents.get(agent_id) or AgentRecord(agent_id=agent_id)
-            record.connected = True
-            record.remote = remote
-            record.connected_at = now
-            record.disconnected_at = None
-            record.last_seen_at = now
-            self._agents[agent_id] = record
             self._connections[agent_id] = websocket
+        await asyncio.to_thread(self._register_agent_sync, agent_id, remote)
 
     async def disconnect_agent(self, agent_id: str, websocket: WebSocket | None = None) -> None:
-        now = utc_now()
+        should_persist = False
         async with self._lock:
             active = self._connections.get(agent_id)
             if websocket is not None and active is not websocket:
                 return
 
-            self._connections.pop(agent_id, None)
-            record = self._agents.get(agent_id)
-            if record is not None:
-                record.connected = False
-                record.disconnected_at = now
-                record.last_seen_at = now
+            if agent_id in self._connections:
+                self._connections.pop(agent_id, None)
+                should_persist = True
+
+        if should_persist:
+            await asyncio.to_thread(self._disconnect_agent_sync, agent_id)
 
     async def touch_agent(self, agent_id: str, event_type: str) -> None:
-        now = utc_now()
-        async with self._lock:
-            record = self._agents.get(agent_id) or AgentRecord(agent_id=agent_id)
-            record.last_seen_at = now
-            if event_type == "heartbeat":
-                record.last_heartbeat_at = now
-            elif event_type == "pong":
-                record.last_pong_at = now
-            self._agents[agent_id] = record
+        await asyncio.to_thread(self._touch_agent_sync, agent_id, event_type)
 
     async def get_connection(self, agent_id: str) -> WebSocket | None:
         async with self._lock:
             return self._connections.get(agent_id)
 
-    async def store_command(self, agent_id: str, payload: dict[str, Any]) -> CommandRecord:
-        now = utc_now()
-        request_id = payload["requestId"]
-        record = CommandRecord(
-            request_id=request_id,
-            agent_id=agent_id,
-            payload=payload,
-            status="queued",
-            action=payload["action"],
-            dir=payload["dir"],
-            image=payload.get("image"),
-            created_at=now,
-            updated_at=now,
+    async def store_command(
+        self,
+        agent_id: str,
+        payload: dict[str, Any],
+        *,
+        original_request_id: str | None = None,
+        retry_count: int = 0,
+        requested_by: str | None = None,
+        request_source: str | None = None,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._store_command_sync,
+            agent_id,
+            payload,
+            original_request_id,
+            retry_count,
+            requested_by,
+            request_source,
         )
 
-        async with self._lock:
-            self._commands[request_id] = record
-            agent_commands = self._commands_by_agent.setdefault(agent_id, [])
-            agent_commands.append(request_id)
-            if len(agent_commands) > self.command_history_limit:
-                overflow = agent_commands[:-self.command_history_limit]
-                del agent_commands[:-self.command_history_limit]
-                for old_request_id in overflow:
-                    self._commands.pop(old_request_id, None)
-        return record
+    async def retry_command(
+        self,
+        request_id: str,
+        *,
+        requested_by: str | None = None,
+        request_source: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        return await asyncio.to_thread(self._retry_command_sync, request_id, requested_by, request_source)
 
-    async def mark_ack(self, request_id: str) -> CommandRecord | None:
-        async with self._lock:
-            record = self._commands.get(request_id)
-            if record is None:
-                return None
-            now = utc_now()
-            record.status = "processing"
-            record.ack_at = now
-            record.updated_at = now
-            return record
+    async def mark_ack(self, request_id: str) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self._mark_ack_sync, request_id)
 
     async def mark_result(
         self,
@@ -136,65 +180,373 @@ class HubState:
         output: str | None = None,
         message: str | None = None,
         error: str | None = None,
-    ) -> CommandRecord | None:
+    ) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self._mark_result_sync, request_id, status, output, message, error)
+
+    async def get_command(self, request_id: str) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self._get_command_sync, request_id)
+
+    async def list_commands(
+        self,
+        agent_id: str | None = None,
+        *,
+        status: str | None = None,
+        action: str | None = None,
+        requested_by: str | None = None,
+        request_source: str | None = None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+        sort_by: str = "createdAt",
+        order: str = "desc",
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        effective_limit = limit or self.command_history_limit
+        return await asyncio.to_thread(
+            self._list_commands_sync,
+            agent_id,
+            status,
+            action,
+            requested_by,
+            request_source,
+            created_after,
+            created_before,
+            sort_by,
+            order,
+            effective_limit,
+            offset,
+        )
+
+    async def list_command_events(self, request_id: str) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._list_command_events_sync, request_id)
+
+    async def list_agents(self) -> list[dict[str, Any]]:
+        connection_ids = await self._connection_ids()
+        agents = await asyncio.to_thread(self._list_agents_sync)
+        snapshots = [self._snapshot_agent(agent, connection_ids) for agent in agents]
+        return sorted(snapshots, key=lambda item: item["agent_id"])
+
+    async def get_agent(self, agent_id: str) -> dict[str, Any] | None:
+        connection_ids = await self._connection_ids()
+        record = await asyncio.to_thread(self._get_agent_sync, agent_id)
+        if record is None:
+            return None
+        return self._snapshot_agent(record, connection_ids)
+
+    async def _connection_ids(self) -> set[str]:
         async with self._lock:
-            record = self._commands.get(request_id)
+            return set(self._connections.keys())
+
+    def _snapshot_agent(self, record: dict[str, Any], connection_ids: set[str]) -> dict[str, Any]:
+        last_seen_at = record["last_seen_at"]
+        connected = record["agent_id"] in connection_ids
+        online = bool(
+            connected
+            and last_seen_at is not None
+            and utc_now() - last_seen_at <= timedelta(seconds=self.heartbeat_timeout)
+        )
+        return {
+            "agent_id": record["agent_id"],
+            "connected": connected,
+            "online": online,
+            "remote": record["remote"],
+            "connected_at": record["connected_at"],
+            "disconnected_at": record["disconnected_at"],
+            "last_seen_at": record["last_seen_at"],
+            "last_heartbeat_at": record["last_heartbeat_at"],
+            "last_pong_at": record["last_pong_at"],
+            "stale_after_seconds": self.heartbeat_timeout,
+        }
+
+
+    def _register_agent_sync(self, agent_id: str, remote: str | None) -> None:
+        now = utc_now()
+        with self.database.session_factory() as session:
+            record = session.scalar(select(AgentModel).where(AgentModel.agent_id == agent_id))
+            if record is None:
+                record = AgentModel(agent_id=agent_id, created_at=now, updated_at=now)
+                session.add(record)
+
+            record.status = "online"
+            record.remote_addr = remote
+            record.connected_at = now
+            record.last_disconnect_at = None
+            record.last_seen_at = now
+            record.updated_at = now
+            session.commit()
+
+    def _disconnect_agent_sync(self, agent_id: str) -> None:
+        now = utc_now()
+        with self.database.session_factory() as session:
+            record = session.scalar(select(AgentModel).where(AgentModel.agent_id == agent_id))
+            if record is None:
+                return
+
+            record.status = "offline"
+            record.last_disconnect_at = now
+            record.updated_at = now
+            session.commit()
+
+    def _touch_agent_sync(self, agent_id: str, event_type: str) -> None:
+        now = utc_now()
+        with self.database.session_factory() as session:
+            record = session.scalar(select(AgentModel).where(AgentModel.agent_id == agent_id))
+            if record is None:
+                record = AgentModel(
+                    agent_id=agent_id,
+                    status="online",
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(record)
+
+            record.last_seen_at = now
+            record.updated_at = now
+            if event_type == "heartbeat":
+                record.last_heartbeat_at = now
+            elif event_type == "pong":
+                record.last_pong_at = now
+            session.commit()
+
+    def _store_command_sync(
+        self,
+        agent_id: str,
+        payload: dict[str, Any],
+        original_request_id: str | None,
+        retry_count: int,
+        requested_by: str | None,
+        request_source: str | None,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self.database.session_factory() as session:
+            record = CommandModel(
+                request_id=payload["requestId"],
+                agent_id=agent_id,
+                action=payload["action"],
+                target_dir=payload["dir"],
+                target_image=payload.get("image"),
+                status="queued",
+                original_request_id=original_request_id,
+                retry_count=retry_count,
+                requested_by=requested_by,
+                request_source=request_source,
+                payload_json=json.dumps(payload, ensure_ascii=False),
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(record)
+            session.add(
+                CommandEventModel(
+                    request_id=payload["requestId"],
+                    event_type="created",
+                    payload_json=json.dumps(payload, ensure_ascii=False),
+                    created_at=now,
+                )
+            )
+            session.commit()
+            return command_to_dict(record)
+
+    def _retry_command_sync(
+        self,
+        request_id: str,
+        requested_by: str | None,
+        request_source: str | None,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        now = utc_now()
+        with self.database.session_factory() as session:
+            record = session.scalar(select(CommandModel).where(CommandModel.request_id == request_id))
             if record is None:
                 return None
-            now = utc_now()
+
+            payload = _loads_payload(record.payload_json)
+            new_request_id = str(uuid4())
+            retry_payload = {
+                "type": "command",
+                "requestId": new_request_id,
+                "action": record.action,
+                "dir": record.target_dir,
+            }
+            if record.target_image:
+                retry_payload["image"] = record.target_image
+
+            retry_record = CommandModel(
+                request_id=new_request_id,
+                agent_id=record.agent_id,
+                action=record.action,
+                target_dir=record.target_dir,
+                target_image=record.target_image,
+                status="queued",
+                original_request_id=record.request_id,
+                retry_count=record.retry_count + 1,
+                requested_by=requested_by,
+                request_source=request_source,
+                payload_json=json.dumps(retry_payload, ensure_ascii=False),
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(retry_record)
+            session.add(
+                CommandEventModel(
+                    request_id=new_request_id,
+                    event_type="created",
+                    payload_json=json.dumps(retry_payload, ensure_ascii=False),
+                    created_at=now,
+                )
+            )
+            session.add(
+                CommandEventModel(
+                    request_id=record.request_id,
+                    event_type="retry",
+                    payload_json=json.dumps(
+                        {
+                            "newRequestId": new_request_id,
+                            "requestedBy": requested_by,
+                            "requestSource": request_source,
+                            "retryCount": retry_record.retry_count,
+                            "payload": payload,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    created_at=now,
+                )
+            )
+            session.commit()
+            return command_to_dict(record), command_to_dict(retry_record)
+
+    def _mark_ack_sync(self, request_id: str) -> dict[str, Any] | None:
+        now = utc_now()
+        with self.database.session_factory() as session:
+            record = session.scalar(select(CommandModel).where(CommandModel.request_id == request_id))
+            if record is None:
+                return None
+
+            record.status = "processing"
+            record.ack_at = now
+            record.updated_at = now
+            session.add(
+                CommandEventModel(
+                    request_id=request_id,
+                    event_type="ack",
+                    payload_json=json.dumps({"status": "processing"}, ensure_ascii=False),
+                    created_at=now,
+                )
+            )
+            session.commit()
+            return command_to_dict(record)
+
+    def _mark_result_sync(
+        self,
+        request_id: str,
+        status: str,
+        output: str | None,
+        message: str | None,
+        error: str | None,
+    ) -> dict[str, Any] | None:
+        now = utc_now()
+        with self.database.session_factory() as session:
+            record = session.scalar(select(CommandModel).where(CommandModel.request_id == request_id))
+            if record is None:
+                return None
+
             record.status = status
             record.output = output
             record.message = message
             record.error = error
             record.result_at = now
             record.updated_at = now
-            return record
+            session.add(
+                CommandEventModel(
+                    request_id=request_id,
+                    event_type="result",
+                    payload_json=json.dumps(
+                        {
+                            "status": status,
+                            "output": output,
+                            "message": message,
+                            "error": error,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    created_at=now,
+                )
+            )
+            session.commit()
+            return command_to_dict(record)
 
-    async def get_command(self, request_id: str) -> CommandRecord | None:
-        async with self._lock:
-            return self._commands.get(request_id)
+    def _get_command_sync(self, request_id: str) -> dict[str, Any] | None:
+        with self.database.session_factory() as session:
+            record = session.scalar(select(CommandModel).where(CommandModel.request_id == request_id))
+            return command_to_dict(record) if record is not None else None
 
-    async def list_commands(self, agent_id: str | None = None) -> list[CommandRecord]:
-        async with self._lock:
-            if agent_id is None:
-                records = list(self._commands.values())
-            else:
-                request_ids = self._commands_by_agent.get(agent_id, [])
-                records = [self._commands[request_id] for request_id in request_ids if request_id in self._commands]
-        return sorted(records, key=lambda item: item.created_at, reverse=True)
+    def _list_commands_sync(
+        self,
+        agent_id: str | None,
+        status: str | None,
+        action: str | None,
+        requested_by: str | None,
+        request_source: str | None,
+        created_after: datetime | None,
+        created_before: datetime | None,
+        sort_by: str,
+        order: str,
+        limit: int,
+        offset: int,
+    ) -> dict[str, Any]:
+        with self.database.session_factory() as session:
+            statement = _apply_command_filters(
+                select(CommandModel),
+                agent_id=agent_id,
+                status=status,
+                action=action,
+                requested_by=requested_by,
+                request_source=request_source,
+                created_after=created_after,
+                created_before=created_before,
+            )
+            total_statement = _apply_command_filters(
+                select(func.count()).select_from(CommandModel),
+                agent_id=agent_id,
+                status=status,
+                action=action,
+                requested_by=requested_by,
+                request_source=request_source,
+                created_after=created_after,
+                created_before=created_before,
+            )
 
-    async def list_agents(self) -> list[dict[str, Any]]:
-        async with self._lock:
-            agents = [self._snapshot_agent(record) for record in self._agents.values()]
-        return sorted(agents, key=lambda item: item["agent_id"])
+            total = int(session.scalar(total_statement) or 0)
+            sort_column = CommandModel.updated_at if sort_by == "updatedAt" else CommandModel.created_at
+            sort_method = sort_column.asc if order == "asc" else sort_column.desc
+            tie_breaker = CommandModel.id.asc() if order == "asc" else CommandModel.id.desc()
+            statement = statement.order_by(sort_method(), tie_breaker).offset(offset).limit(limit)
+            records = session.scalars(statement).all()
+            items = [command_to_dict(record) for record in records]
+            return {
+                "items": items,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "has_more": offset + len(items) < total,
+                "sort_by": sort_by,
+                "order": order,
+            }
 
-    async def get_agent(self, agent_id: str) -> dict[str, Any] | None:
-        async with self._lock:
-            record = self._agents.get(agent_id)
-            if record is None:
-                return None
-            return self._snapshot_agent(record)
+    def _list_command_events_sync(self, request_id: str) -> list[dict[str, Any]]:
+        with self.database.session_factory() as session:
+            statement = (
+                select(CommandEventModel)
+                .where(CommandEventModel.request_id == request_id)
+                .order_by(CommandEventModel.created_at.asc(), CommandEventModel.id.asc())
+            )
+            records = session.scalars(statement).all()
+            return [command_event_to_dict(record) for record in records]
 
-    def _snapshot_agent(self, record: AgentRecord) -> dict[str, Any]:
-        last_seen_at = record.last_seen_at
-        online = bool(
-            record.connected
-            and last_seen_at is not None
-            and utc_now() - last_seen_at <= timedelta(seconds=self.heartbeat_timeout)
-        )
-        return {
-            "agent_id": record.agent_id,
-            "connected": record.connected,
-            "online": online,
-            "remote": record.remote,
-            "connected_at": record.connected_at,
-            "disconnected_at": record.disconnected_at,
-            "last_seen_at": record.last_seen_at,
-            "last_heartbeat_at": record.last_heartbeat_at,
-            "last_pong_at": record.last_pong_at,
-            "stale_after_seconds": self.heartbeat_timeout,
-        }
+    def _list_agents_sync(self) -> list[dict[str, Any]]:
+        with self.database.session_factory() as session:
+            records = session.scalars(select(AgentModel).order_by(AgentModel.agent_id.asc())).all()
+            return [_agent_to_dict(record) for record in records]
 
-
-def command_to_dict(record: CommandRecord) -> dict[str, Any]:
-    return asdict(record)
+    def _get_agent_sync(self, agent_id: str) -> dict[str, Any] | None:
+        with self.database.session_factory() as session:
+            record = session.scalar(select(AgentModel).where(AgentModel.agent_id == agent_id))
+            return _agent_to_dict(record) if record is not None else None

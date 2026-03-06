@@ -19,13 +19,29 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements-dev.txt
 
       - name: Compile Python sources
-        run: python -m compileall app
+        run: python -m compileall app migrations scripts
 
       - name: Import smoke test
         run: python -c "import sys; sys.path.insert(0, '.'); import app.main; print('service-hub import ok')"
+
+      - name: Validate Alembic upgrade
+        run: |
+          python - <<'PY'
+          import tempfile
+          from pathlib import Path
+          from app.db import Database
+
+          temp_dir = Path(tempfile.mkdtemp())
+          database = Database(f"sqlite:///{temp_dir / 'ci.db'}")
+          database.init_schema()
+          print("alembic upgrade ok")
+          PY
+
+      - name: Run tests with coverage gate
+        run: pytest --cov=app --cov-report=term-missing --cov-fail-under=97 -q
 
       - name: Build Docker image
         run: docker build -t service-hub:ci .

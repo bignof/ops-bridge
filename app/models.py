@@ -56,6 +56,10 @@ class CommandSnapshot(BaseModel):
     action: str
     dir: str
     image: str | None = None
+    original_request_id: str | None = None
+    retry_count: int = 0
+    requested_by: str | None = None
+    request_source: str | None = None
     payload: dict[str, Any]
     output: str | None = None
     message: str | None = None
@@ -64,6 +68,28 @@ class CommandSnapshot(BaseModel):
     updated_at: datetime
     ack_at: datetime | None = None
     result_at: datetime | None = None
+
+
+class CommandEventSnapshot(BaseModel):
+    model_config = MODEL_CONFIG
+
+    id: int
+    request_id: str
+    event_type: str
+    payload: dict[str, Any]
+    created_at: datetime
+
+
+class CommandListResponse(BaseModel):
+    model_config = MODEL_CONFIG
+
+    items: list[CommandSnapshot]
+    total: int
+    limit: int
+    offset: int
+    has_more: bool
+    sort_by: Literal["createdAt", "updatedAt"]
+    order: Literal["asc", "desc"]
 
 
 class CommandDispatchResponse(BaseModel):

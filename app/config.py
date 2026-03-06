@@ -9,6 +9,7 @@ class Settings:
     auth_token: str = os.getenv("AUTH_TOKEN", "change-me")
     heartbeat_timeout: int = int(os.getenv("HEARTBEAT_TIMEOUT", "90"))
     command_history_limit: int = int(os.getenv("COMMAND_HISTORY_LIMIT", "200"))
+    database_url: str = os.getenv("DATABASE_URL", "sqlite:///./service-hub.db")
 
 
 settings = Settings()
