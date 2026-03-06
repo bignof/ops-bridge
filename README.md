@@ -146,7 +146,7 @@ GET /health
 - `status`: `ok` 或 `degraded`
 - `agentId`: 当前 agent 标识
 - `connected`: 当前是否仍与 service-hub 保持连接
-- `lastConnectTs` / `lastDisconnectTs` / `lastHeartbeatTs` / `lastMessageTs`
+- `lastConnectTs` / `lastDisconnectTs` / `lastHeartbeatTs` / `lastMessageTs`：ISO 8601 中国时间（`+08:00`）
 - `lastError`: 最近一次连接错误
 
 ## 项目结构

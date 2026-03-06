@@ -10,7 +10,7 @@ import pytest
 def _import_health_server(monkeypatch: pytest.MonkeyPatch):
     for key, value in {
         "WS_URL": "ws://localhost:8080/ws/agent",
-        "TOKEN": "token",
+        "AGENT_KEY": "token",
         "AGENT_ID": "agent-health",
         "HEALTH_HOST": "127.0.0.1",
         "HEALTH_PORT": "18081",
@@ -72,7 +72,10 @@ def test_health_handler_returns_degraded_and_ok_payloads(monkeypatch: pytest.Mon
     assert responses == [200]
     assert healthy_payload["status"] == "ok"
     assert healthy_payload["connected"] is True
-    assert healthy_payload["lastConnectTs"] == 1
+    assert healthy_payload["lastConnectTs"] == "1970-01-01T08:00:01+08:00"
+    assert healthy_payload["lastDisconnectTs"] == "1970-01-01T08:00:02+08:00"
+    assert healthy_payload["lastHeartbeatTs"] == "1970-01-01T08:00:03+08:00"
+    assert healthy_payload["lastMessageTs"] == "1970-01-01T08:00:04+08:00"
     assert module._HealthHandler.log_message(healthy, "%s") is None
 
 

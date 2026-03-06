@@ -1,12 +1,19 @@
 import json
 import logging
 import threading
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from config import AGENT_ID, HEALTH_HOST, HEALTH_PORT
+from config import AGENT_ID, CHINA_TZ, HEALTH_HOST, HEALTH_PORT
 from core.ws_client import get_connection_state
 
 logger = logging.getLogger(__name__)
+
+
+def _format_timestamp(value):
+    if value is None:
+        return None
+    return datetime.fromtimestamp(value, CHINA_TZ).isoformat(timespec='seconds')
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -22,10 +29,10 @@ class _HealthHandler(BaseHTTPRequestHandler):
             'status': 'ok' if healthy else 'degraded',
             'agentId': AGENT_ID,
             'connected': healthy,
-            'lastConnectTs': state.get('last_connect_ts'),
-            'lastDisconnectTs': state.get('last_disconnect_ts'),
-            'lastHeartbeatTs': state.get('last_heartbeat_ts'),
-            'lastMessageTs': state.get('last_message_ts'),
+            'lastConnectTs': _format_timestamp(state.get('last_connect_ts')),
+            'lastDisconnectTs': _format_timestamp(state.get('last_disconnect_ts')),
+            'lastHeartbeatTs': _format_timestamp(state.get('last_heartbeat_ts')),
+            'lastMessageTs': _format_timestamp(state.get('last_message_ts')),
             'lastError': state.get('last_error'),
         }
 
