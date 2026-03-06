@@ -8,7 +8,7 @@ load_dotenv()
 
 WS_URL             = os.getenv('WS_URL', '')
 AGENT_ID           = os.getenv('AGENT_ID', socket.gethostname())
-TOKEN              = os.getenv('TOKEN', '')
+AGENT_KEY          = os.getenv('AGENT_KEY', '')
 RECONNECT_DELAY    = int(os.getenv('RECONNECT_DELAY', '5'))
 HEARTBEAT_INTERVAL = int(os.getenv('HEARTBEAT_INTERVAL', '30'))
 HEALTH_HOST        = os.getenv('HEALTH_HOST', '0.0.0.0')
@@ -21,5 +21,5 @@ logging.basicConfig(
 
 if not WS_URL:
     sys.exit("ERROR: WS_URL is not set. Example: ws://192.168.1.100:8080/ws/agent")
-if not TOKEN:
-    sys.exit("ERROR: TOKEN is not set.")
+if not AGENT_KEY:
+    sys.exit("ERROR: AGENT_KEY is not set.")

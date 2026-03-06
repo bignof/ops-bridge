@@ -8,7 +8,7 @@ import pytest
 def _import_ws_client(monkeypatch: pytest.MonkeyPatch, **env_overrides: str):
     defaults = {
         "WS_URL": "ws://hub.example/ws/agent",
-        "TOKEN": "secret-token",
+        "AGENT_KEY": "secret-key",
         "AGENT_ID": "agent-7",
         "HEARTBEAT_INTERVAL": "1",
     }
@@ -123,6 +123,6 @@ def test_connect_builds_websocket_app_and_runs_forever(monkeypatch: pytest.Monke
 
     module.connect()
 
-    assert created["url"] == "ws://hub.example/ws/agent/agent-7?token=secret-token"
+    assert created["url"] == "ws://hub.example/ws/agent/agent-7?key=secret-key"
     assert created["ping_interval"] == 20
     assert created["ping_timeout"] == 10

@@ -5,7 +5,7 @@ import time
 
 import websocket
 
-from config import AGENT_ID, HEARTBEAT_INTERVAL, TOKEN, WS_URL
+from config import AGENT_ID, AGENT_KEY, HEARTBEAT_INTERVAL, WS_URL
 from core.handlers import dispatch, send_message
 
 logger = logging.getLogger(__name__)
@@ -83,7 +83,7 @@ def _start_heartbeat(ws):
 
 
 def connect():
-    url = f"{WS_URL}/{AGENT_ID}?token={TOKEN}"
+    url = f"{WS_URL}/{AGENT_ID}?key={AGENT_KEY}"
     logger.info(f"Connecting to {url}...")
     ws = websocket.WebSocketApp(
         url,

@@ -7,7 +7,7 @@ import pytest
 def _import_config(monkeypatch: pytest.MonkeyPatch, **overrides: str):
     defaults = {
         "WS_URL": "ws://localhost:8080/ws/agent",
-        "TOKEN": "test-token",
+        "AGENT_KEY": "agent-key-1",
         "AGENT_ID": "agent-test",
         "RECONNECT_DELAY": "7",
         "HEARTBEAT_INTERVAL": "11",
@@ -29,7 +29,7 @@ def test_config_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
     config = _import_config(monkeypatch)
 
     assert config.WS_URL == "ws://localhost:8080/ws/agent"
-    assert config.TOKEN == "test-token"
+    assert config.AGENT_KEY == "agent-key-1"
     assert config.AGENT_ID == "agent-test"
     assert config.RECONNECT_DELAY == 7
     assert config.HEARTBEAT_INTERVAL == 11
@@ -42,6 +42,6 @@ def test_config_requires_ws_url(monkeypatch: pytest.MonkeyPatch) -> None:
         _import_config(monkeypatch, WS_URL="")
 
 
-def test_config_requires_token(monkeypatch: pytest.MonkeyPatch) -> None:
-    with pytest.raises(SystemExit, match="TOKEN is not set"):
-        _import_config(monkeypatch, TOKEN="")
+def test_config_requires_agent_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(SystemExit, match="AGENT_KEY is not set"):
+        _import_config(monkeypatch, AGENT_KEY="")

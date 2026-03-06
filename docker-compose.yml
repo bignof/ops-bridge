@@ -10,7 +10,7 @@ services:
     environment:
       WS_URL: ${WS_URL:?WS_URL is required}
       AGENT_ID: ${AGENT_ID:-}
-      TOKEN: ${TOKEN:?TOKEN is required}
+      AGENT_KEY: ${AGENT_KEY:?AGENT_KEY is required}
       RECONNECT_DELAY: ${RECONNECT_DELAY:-5}
       HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL:-30}
       HEALTH_HOST: ${HEALTH_HOST:-0.0.0.0}
