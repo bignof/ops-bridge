@@ -8,6 +8,10 @@ on:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    env:
+      WS_URL: ws://localhost:8080/ws/agent
+      AGENT_KEY: ci-agent-key
+      AGENT_ID: ci-agent
 
     steps:
       - name: Checkout repository
@@ -25,17 +29,9 @@ jobs:
         run: python -m compileall .
 
       - name: Import smoke test
-        env:
-          WS_URL: ws://localhost:8080/ws/agent
-          TOKEN: ci-token
-          AGENT_ID: ci-agent
         run: python -c "import agent; import core.ws_client; import core.health_server; print('service-agent import ok')"
 
       - name: Run tests with coverage gate
-        env:
-          WS_URL: ws://localhost:8080/ws/agent
-          TOKEN: ci-token
-          AGENT_ID: ci-agent
         run: pytest --cov=agent --cov=config --cov=core --cov=services --cov-report=term-missing --cov-fail-under=97 -q
 
       - name: Build Docker image
