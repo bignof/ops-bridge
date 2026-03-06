@@ -1,7 +1,7 @@
 import json
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Header, Path, Query, WebSocket, WebSocketDisconnect, status
@@ -12,7 +12,20 @@ from app.models import AgentCredentialResponse, AgentProvisionRequest, AgentProv
 from app.store import HubState
 
 
+CHINA_TZ = timezone(timedelta(hours=8))
+
+
+class ChinaTimeFormatter(logging.Formatter):
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
+        dt = datetime.fromtimestamp(record.created, CHINA_TZ)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.isoformat(timespec="seconds")
+
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+for handler in logging.getLogger().handlers:
+    handler.setFormatter(ChinaTimeFormatter("%(asctime)s - %(levelname)s - %(message)s"))
 logger = logging.getLogger(__name__)
 
 

@@ -88,15 +88,17 @@ curl -X POST "http://<service-hub-host>:8080/api/agents" \
   "online": true,
   "credentialConfigured": true,
   "remote": "10.0.0.8:51234",
-  "keyIssuedAt": "2026-03-06T09:59:00Z",
-  "connectedAt": "2026-03-06T10:00:00Z",
+  "keyIssuedAt": "2026-03-06T17:59:00+08:00",
+  "connectedAt": "2026-03-06T18:00:00+08:00",
   "disconnectedAt": null,
-  "lastSeenAt": "2026-03-06T10:01:00Z",
-  "lastHeartbeatAt": "2026-03-06T10:01:00Z",
+  "lastSeenAt": "2026-03-06T18:01:00+08:00",
+  "lastHeartbeatAt": "2026-03-06T18:01:00+08:00",
   "lastPongAt": null,
   "staleAfterSeconds": 90
 }
 ```
+
+说明：本文档中的时间字段默认使用中国时区（`+08:00`）。
 
 ### CommandSnapshot
 
@@ -121,10 +123,10 @@ curl -X POST "http://<service-hub-host>:8080/api/agents" \
   "output": null,
   "message": null,
   "error": null,
-  "createdAt": "2026-03-06T10:02:00Z",
-  "updatedAt": "2026-03-06T10:02:03Z",
-  "ackAt": "2026-03-06T10:02:01Z",
-  "resultAt": "2026-03-06T10:02:03Z"
+  "createdAt": "2026-03-06T18:02:00+08:00",
+  "updatedAt": "2026-03-06T18:02:03+08:00",
+  "ackAt": "2026-03-06T18:02:01+08:00",
+  "resultAt": "2026-03-06T18:02:03+08:00"
 }
 ```
 
@@ -188,7 +190,7 @@ Content-Type: application/json
     "online": false,
     "credentialConfigured": true,
     "remote": null,
-    "keyIssuedAt": "2026-03-06T09:59:00Z",
+    "keyIssuedAt": "2026-03-06T17:59:00+08:00",
     "connectedAt": null,
     "disconnectedAt": null,
     "lastSeenAt": null,
@@ -197,7 +199,7 @@ Content-Type: application/json
     "staleAfterSeconds": 90
   },
   "agentKey": "generated-once-only",
-  "issuedAt": "2026-03-06T09:59:00Z"
+  "issuedAt": "2026-03-06T17:59:00+08:00"
 }
 ```
 
@@ -234,7 +236,7 @@ GET /api/agents/{agentId}
 ### 6. 查询某个 Agent 的命令历史
 
 ```http
-GET /api/agents/{agentId}/commands?status=failed&requestedBy=platform-api&requestSource=ops-console&createdAfter=2026-03-01T00:00:00Z&createdBefore=2026-03-06T23:59:59Z&sortBy=updatedAt&order=desc&limit=20&offset=0
+GET /api/agents/{agentId}/commands?status=failed&requestedBy=platform-api&requestSource=ops-console&createdAfter=2026-03-01T00:00:00%2B08:00&createdBefore=2026-03-06T23:59:59%2B08:00&sortBy=updatedAt&order=desc&limit=20&offset=0
 ```
 
 查询参数：
@@ -243,8 +245,8 @@ GET /api/agents/{agentId}/commands?status=failed&requestedBy=platform-api&reques
 - `action`：可选，`update` 或 `restart`
 - `requestedBy`：可选，审计调用方
 - `requestSource`：可选，审计来源
-- `createdAfter`：可选，ISO 8601 时间
-- `createdBefore`：可选，ISO 8601 时间
+- `createdAfter`：可选，ISO 8601 时间，默认按中国时区理解和返回
+- `createdBefore`：可选，ISO 8601 时间，默认按中国时区理解和返回
 - `sortBy`：可选，`createdAt` 或 `updatedAt`
 - `order`：可选，`asc` 或 `desc`
 - `limit`：可选，默认 `100`，最大 `500`
@@ -255,7 +257,7 @@ GET /api/agents/{agentId}/commands?status=failed&requestedBy=platform-api&reques
 ### 7. 查询全局命令列表
 
 ```http
-GET /api/commands?agentId=prod-server-01&status=success&action=restart&requestedBy=platform-api&requestSource=ops-console&createdAfter=2026-03-01T00:00:00Z&createdBefore=2026-03-06T23:59:59Z&sortBy=updatedAt&order=desc&limit=50&offset=0
+GET /api/commands?agentId=prod-server-01&status=success&action=restart&requestedBy=platform-api&requestSource=ops-console&createdAfter=2026-03-01T00:00:00%2B08:00&createdBefore=2026-03-06T23:59:59%2B08:00&sortBy=updatedAt&order=desc&limit=50&offset=0
 ```
 
 返回：`CommandListResponse`

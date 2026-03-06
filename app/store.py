@@ -13,11 +13,22 @@ from sqlalchemy import func, select
 from app.db import Database
 from app.db_models import AgentModel, CommandEventModel, CommandModel
 
+
+CHINA_TZ = timezone(timedelta(hours=8))
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _as_utc(value: datetime | None) -> datetime | None:
+def _as_china_time(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(CHINA_TZ)
+
+
+def _as_storage_utc(value: datetime | None) -> datetime | None:
     if value is None:
         return None
     if value.tzinfo is None:
@@ -35,12 +46,12 @@ def _agent_to_dict(record: AgentModel) -> dict[str, Any]:
         "status": record.status,
         "credential_configured": bool(record.agent_key_hash),
         "remote": record.remote_addr,
-        "key_issued_at": _as_utc(record.key_issued_at),
-        "connected_at": _as_utc(record.connected_at),
-        "disconnected_at": _as_utc(record.last_disconnect_at),
-        "last_seen_at": _as_utc(record.last_seen_at),
-        "last_heartbeat_at": _as_utc(record.last_heartbeat_at),
-        "last_pong_at": _as_utc(record.last_pong_at),
+        "key_issued_at": _as_china_time(record.key_issued_at),
+        "connected_at": _as_china_time(record.connected_at),
+        "disconnected_at": _as_china_time(record.last_disconnect_at),
+        "last_seen_at": _as_china_time(record.last_seen_at),
+        "last_heartbeat_at": _as_china_time(record.last_heartbeat_at),
+        "last_pong_at": _as_china_time(record.last_pong_at),
     }
 
 
@@ -68,10 +79,10 @@ def command_to_dict(record: CommandModel) -> dict[str, Any]:
         "output": record.output,
         "message": record.message,
         "error": record.error,
-        "created_at": _as_utc(record.created_at),
-        "updated_at": _as_utc(record.updated_at),
-        "ack_at": _as_utc(record.ack_at),
-        "result_at": _as_utc(record.result_at),
+        "created_at": _as_china_time(record.created_at),
+        "updated_at": _as_china_time(record.updated_at),
+        "ack_at": _as_china_time(record.ack_at),
+        "result_at": _as_china_time(record.result_at),
     }
 
 
@@ -81,7 +92,7 @@ def command_event_to_dict(record: CommandEventModel) -> dict[str, Any]:
         "request_id": record.request_id,
         "event_type": record.event_type,
         "payload": _loads_payload(record.payload_json),
-        "created_at": _as_utc(record.created_at),
+        "created_at": _as_china_time(record.created_at),
     }
 
 
@@ -96,6 +107,9 @@ def _apply_command_filters(
     created_after: datetime | None,
     created_before: datetime | None,
 ) -> Any:
+    created_after = _as_storage_utc(created_after)
+    created_before = _as_storage_utc(created_before)
+
     if agent_id:
         statement = statement.where(CommandModel.agent_id == agent_id)
     if status:

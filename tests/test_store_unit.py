@@ -6,7 +6,7 @@ from sqlalchemy import select
 
 from app.db import Database
 from app.db_models import AgentModel
-from app.store import HubState, _as_utc, _loads_payload, utc_now
+from app.store import CHINA_TZ, HubState, _as_china_time, _loads_payload, utc_now
 
 
 def _create_state(tmp_path: Path, history_limit: int = 2) -> tuple[HubState, Database]:
@@ -20,9 +20,9 @@ def test_store_helpers_normalize_payload_and_time() -> None:
 
     assert _loads_payload("") == {}
     assert _loads_payload('{"value": 1}') == {"value": 1}
-    assert _as_utc(None) is None
-    assert _as_utc(now.replace(tzinfo=None)) == now.replace(tzinfo=None).replace(tzinfo=now.tzinfo)
-    assert _as_utc(now) == now
+    assert _as_china_time(None) is None
+    assert _as_china_time(now.replace(tzinfo=None)) == now.replace(tzinfo=None).replace(tzinfo=now.tzinfo).astimezone(CHINA_TZ)
+    assert _as_china_time(now) == now.astimezone(CHINA_TZ)
 
 
 def test_hub_state_agent_lifecycle_and_database_ops(tmp_path: Path) -> None:
@@ -168,5 +168,21 @@ def test_agent_key_does_not_expire_by_issued_timestamp(tmp_path: Path) -> None:
         session.commit()
 
     assert asyncio.run(state.authenticate_agent("agent-a", credential["agent_key"])) is True
+
+    database.engine.dispose()
+
+
+def test_command_timestamps_are_serialized_in_china_timezone(tmp_path: Path) -> None:
+    state, database = _create_state(tmp_path)
+
+    command = asyncio.run(
+        state.store_command(
+            "agent-a",
+            {"type": "command", "requestId": "req-cn", "action": "restart", "dir": "/srv/a"},
+        )
+    )
+
+    assert command["created_at"].utcoffset() == timedelta(hours=8)
+    assert command["updated_at"].utcoffset() == timedelta(hours=8)
 
     database.engine.dispose()
