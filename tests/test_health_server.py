@@ -21,8 +21,9 @@ def _import_health_server(monkeypatch: pytest.MonkeyPatch):
     return importlib.import_module("core.health_server")
 
 
-def _make_handler(module, path: str, state: dict):
+def _make_handler(module, path: str, state: dict, execution_state: dict | None = None):
     module.get_connection_state = lambda: state
+    module.get_command_execution_state = lambda: execution_state or {"activeCommands": 0, "queuedCommands": 0, "projects": []}
     handler = module._HealthHandler.__new__(module._HealthHandler)
     handler.path = path
     handler.wfile = io.BytesIO()
@@ -76,7 +77,45 @@ def test_health_handler_returns_degraded_and_ok_payloads(monkeypatch: pytest.Mon
     assert healthy_payload["lastDisconnectTs"] == "1970-01-01T08:00:02+08:00"
     assert healthy_payload["lastHeartbeatTs"] == "1970-01-01T08:00:03+08:00"
     assert healthy_payload["lastMessageTs"] == "1970-01-01T08:00:04+08:00"
+    assert healthy_payload["commandExecution"] == {"activeCommands": 0, "queuedCommands": 0, "projects": []}
     assert module._HealthHandler.log_message(healthy, "%s") is None
+
+
+def test_health_handler_includes_project_lock_execution_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _import_health_server(monkeypatch)
+    handler, responses, _ = _make_handler(
+        module,
+        "/health",
+        {"connected": True},
+        {
+            "activeCommands": 1,
+            "queuedCommands": 2,
+            "projects": [
+                {
+                    "projectDir": "/srv/app",
+                    "activeRequestId": "req-1",
+                    "activeAction": "update",
+                    "activeSinceTs": 3,
+                    "queuedCount": 2,
+                }
+            ],
+        },
+    )
+    handler.do_GET()
+    payload = json.loads(handler.wfile.getvalue().decode("utf-8"))
+
+    assert responses == [200]
+    assert payload["commandExecution"]["activeCommands"] == 1
+    assert payload["commandExecution"]["queuedCommands"] == 2
+    assert payload["commandExecution"]["projects"] == [
+        {
+            "projectDir": "/srv/app",
+            "activeRequestId": "req-1",
+            "activeAction": "update",
+            "activeSinceTs": "1970-01-01T08:00:03+08:00",
+            "queuedCount": 2,
+        }
+    ]
 
 
 def test_start_health_server_creates_background_thread(monkeypatch: pytest.MonkeyPatch) -> None:

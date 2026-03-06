@@ -30,6 +30,7 @@ service-agent（容器）
 - 支持 `update` 和 `restart` 两类平台命令
 - 统一使用 `docker compose`（v2 插件）执行 Compose 命令
 - 命令在独立线程中执行，不阻塞心跳和其他消息处理
+- 相同 `dir` 的命令严格串行，不同目录的命令可并行执行
 - 提供独立 HTTP 健康检查端点，暴露当前 WebSocket 连接状态
 
 ## 快速开始
@@ -107,6 +108,8 @@ INFO - Health server listening on http://0.0.0.0:18081/health
 | `update`  | ① 找到与目标镜像同仓库的服务并更新 `image` → ② `docker compose pull` 成功后才执行切换 → ③ `docker compose down` → ④ `docker compose up -d`；若拉取或启动失败，会恢复原 compose 并尝试拉起旧版本 |
 | `restart` | `docker compose restart`                                                                                                                                                                        |
 
+并发约束：如果同一个 Agent 在短时间内收到多条命令，Agent 会按 `dir` 做互斥控制。同一目录上的 `update` / `restart` 会排队串行执行，避免 compose 文件和 Docker 操作互相冲突；不同目录仍允许并行。
+
 ### Agent → 服务端（回复）
 
 **ACK（处理中）：**
@@ -148,6 +151,9 @@ GET /health
 - `connected`: 当前是否仍与 service-hub 保持连接
 - `lastConnectTs` / `lastDisconnectTs` / `lastHeartbeatTs` / `lastMessageTs`：ISO 8601 中国时间（`+08:00`）
 - `lastError`: 最近一次连接错误
+- `commandExecution.activeCommands`: 当前正在执行的目录锁任务数
+- `commandExecution.queuedCommands`: 正在等待目录锁的命令数
+- `commandExecution.projects`: 按目录展开的执行状态，包含 `projectDir`、`activeRequestId`、`activeAction`、`activeSinceTs`、`queuedCount`
 
 ## 项目结构
 

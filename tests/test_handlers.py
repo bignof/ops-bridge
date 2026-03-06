@@ -1,5 +1,7 @@
 import json
 import subprocess
+import threading
+import time
 
 import pytest
 
@@ -233,3 +235,131 @@ def test_handle_restart_paths(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None
     monkeypatch.setattr(handlers, "run_compose", lambda *args: (True, "restart ok"))
     handlers.handle_restart(ws, {}, "req-4", str(tmp_path))
     assert _decode_messages(ws)[-1]["status"] == "success"
+
+
+def test_dispatch_serializes_commands_for_same_directory(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+    call_order: list[str] = []
+    observed_states: list[dict] = []
+
+    def fake_restart(ws, data, request_id, project_dir):
+        call_order.append(request_id)
+        observed_states.append(handlers.get_command_execution_state())
+        if request_id == "req-1":
+            first_entered.set()
+            assert not second_entered.is_set()
+            assert release_first.wait(timeout=1)
+        else:
+            second_entered.set()
+
+    monkeypatch.setitem(handlers.HANDLERS, "restart", fake_restart)
+
+    first = threading.Thread(
+        target=handlers.dispatch,
+        args=(FakeWebSocket(), {"requestId": "req-1", "action": "restart", "dir": str(shared_dir)}),
+    )
+    second = threading.Thread(
+        target=handlers.dispatch,
+        args=(FakeWebSocket(), {"requestId": "req-2", "action": "restart", "dir": str(shared_dir)}),
+    )
+
+    first.start()
+    assert first_entered.wait(timeout=1)
+
+    second.start()
+    time.sleep(0.05)
+    assert not second_entered.is_set()
+
+    release_first.set()
+    first.join(timeout=1)
+    second.join(timeout=1)
+
+    assert call_order == ["req-1", "req-2"]
+    assert second_entered.is_set()
+    assert observed_states[0]["activeCommands"] == 1
+    assert observed_states[0]["queuedCommands"] == 0
+    assert observed_states[0]["projects"][0]["activeRequestId"] == "req-1"
+    assert handlers.get_command_execution_state() == {"activeCommands": 0, "queuedCommands": 0, "projects": []}
+
+
+def test_dispatch_allows_parallel_commands_for_different_directories(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    entered = threading.Barrier(2)
+    release = threading.Event()
+    started: list[str] = []
+
+    def fake_restart(ws, data, request_id, project_dir):
+        started.append(request_id)
+        entered.wait(timeout=1)
+        assert release.wait(timeout=1)
+
+    monkeypatch.setitem(handlers.HANDLERS, "restart", fake_restart)
+
+    first = threading.Thread(
+        target=handlers.dispatch,
+        args=(FakeWebSocket(), {"requestId": "req-a", "action": "restart", "dir": str(dir_a)}),
+    )
+    second = threading.Thread(
+        target=handlers.dispatch,
+        args=(FakeWebSocket(), {"requestId": "req-b", "action": "restart", "dir": str(dir_b)}),
+    )
+
+    first.start()
+    second.start()
+
+    deadline = time.time() + 1
+    while len(started) < 2 and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert sorted(started) == ["req-a", "req-b"]
+
+    release.set()
+    first.join(timeout=1)
+    second.join(timeout=1)
+
+    assert handlers.get_command_execution_state() == {"activeCommands": 0, "queuedCommands": 0, "projects": []}
+
+
+def test_dispatch_logs_when_command_waits_for_project_lock(monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture) -> None:
+    shared_dir = tmp_path / "shared-log"
+    shared_dir.mkdir()
+    first_entered = threading.Event()
+    release_first = threading.Event()
+
+    def fake_restart(ws, data, request_id, project_dir):
+        if request_id == "req-1":
+            first_entered.set()
+            assert release_first.wait(timeout=1)
+
+    monkeypatch.setitem(handlers.HANDLERS, "restart", fake_restart)
+    caplog.set_level("INFO")
+
+    first = threading.Thread(
+        target=handlers.dispatch,
+        args=(FakeWebSocket(), {"requestId": "req-1", "action": "restart", "dir": str(shared_dir)}),
+    )
+    second = threading.Thread(
+        target=handlers.dispatch,
+        args=(FakeWebSocket(), {"requestId": "req-2", "action": "restart", "dir": str(shared_dir)}),
+    )
+
+    first.start()
+    assert first_entered.wait(timeout=1)
+    second.start()
+    time.sleep(0.05)
+    release_first.set()
+    first.join(timeout=1)
+    second.join(timeout=1)
+
+    assert "Command queued on project lock: request_id=req-2" in caplog.text
+    assert "Command acquired project lock: request_id=req-1" in caplog.text
+    assert "Command released project lock: request_id=req-2" in caplog.text

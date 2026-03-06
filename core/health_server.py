@@ -5,6 +5,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from config import AGENT_ID, CHINA_TZ, HEALTH_HOST, HEALTH_PORT
+from core.handlers import get_command_execution_state
 from core.ws_client import get_connection_state
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             return
 
         state = get_connection_state()
+        execution_state = get_command_execution_state()
         healthy = bool(state.get('connected'))
         payload = {
             'status': 'ok' if healthy else 'degraded',
@@ -34,6 +36,20 @@ class _HealthHandler(BaseHTTPRequestHandler):
             'lastHeartbeatTs': _format_timestamp(state.get('last_heartbeat_ts')),
             'lastMessageTs': _format_timestamp(state.get('last_message_ts')),
             'lastError': state.get('last_error'),
+            'commandExecution': {
+                'activeCommands': execution_state['activeCommands'],
+                'queuedCommands': execution_state['queuedCommands'],
+                'projects': [
+                    {
+                        'projectDir': item['projectDir'],
+                        'activeRequestId': item['activeRequestId'],
+                        'activeAction': item['activeAction'],
+                        'activeSinceTs': _format_timestamp(item['activeSinceTs']),
+                        'queuedCount': item['queuedCount'],
+                    }
+                    for item in execution_state['projects']
+                ],
+            },
         }
 
         body = json.dumps(payload).encode('utf-8')
