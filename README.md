@@ -1,0 +1,180 @@
+# service-hub
+
+service-hub 是面向平台侧的控制服务，负责接收 service-agent 的 WebSocket 连接，维护 agent 在线状态，并向 agent 下发 Docker Compose 操作指令。
+
+## 能力
+
+- 提供 `/ws/agent/{agentId}` WebSocket 接入点，兼容现有 agent 协议
+- 记录 agent 的连接时间、最后心跳时间、最后一次 pong 时间和在线状态
+- 提供 HTTP API 给其他服务查询 agent 存活情况
+- 提供 HTTP API 给其他服务向指定 agent 下发 `update` / `restart` 指令
+- 跟踪每个 `requestId` 的处理状态：`queued`、`processing`、`success`、`failed`
+
+## 启动方式
+
+### Docker Compose
+
+1. 复制配置文件
+
+```bash
+cp .env.example .env
+```
+
+2. 修改 `.env` 中的 `AUTH_TOKEN`
+3. 修改 `.env` 中的 `SERVICE_HUB_IMAGE`
+4. 拉取镜像并启动
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+### 本地运行
+
+```bash
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8080
+```
+
+## 环境变量
+
+| 变量                    | 说明                           | 默认值               |
+| ----------------------- | ------------------------------ | -------------------- |
+| `HOST`                  | 服务监听地址                   | `0.0.0.0`            |
+| `PORT`                  | 服务监听端口                   | `8080`               |
+| `SERVICE_HUB_IMAGE`     | 运行时拉取的镜像地址           | `service-hub:latest` |
+| `SERVICE_HUB_BIND_PORT` | 宿主机暴露端口                 | `8080`               |
+| `AUTH_TOKEN`            | Agent 连接认证令牌             | `change-me`          |
+| `HEARTBEAT_TIMEOUT`     | 超过该秒数未收到消息则视为离线 | `90`                 |
+| `COMMAND_HISTORY_LIMIT` | 每个 agent 保留的命令历史条数  | `200`                |
+
+## Agent 接入地址
+
+Agent 使用如下地址连接：
+
+```text
+ws://<SERVICE_HUB_HOST>:8080/ws/agent/<AGENT_ID>?token=<AUTH_TOKEN>
+```
+
+agent 侧可以将 `WS_URL` 配置为：
+
+```text
+ws://<SERVICE_HUB_HOST>:8080/ws/agent
+```
+
+## API
+
+### 健康检查
+
+```http
+GET /health
+```
+
+### 查询全部 agent
+
+```http
+GET /api/agents
+```
+
+返回示例：
+
+```json
+[
+  {
+    "agentId": "prod-server-01",
+    "connected": true,
+    "online": true,
+    "remote": "10.0.0.8:51234",
+    "connectedAt": "2026-03-06T10:00:00Z",
+    "disconnectedAt": null,
+    "lastSeenAt": "2026-03-06T10:01:00Z",
+    "lastHeartbeatAt": "2026-03-06T10:01:00Z",
+    "lastPongAt": null,
+    "staleAfterSeconds": 90
+  }
+]
+```
+
+### 查询单个 agent 状态
+
+```http
+GET /api/agents/{agentId}
+```
+
+### 查询指定 agent 的命令历史
+
+```http
+GET /api/agents/{agentId}/commands
+```
+
+### 查询单条命令状态
+
+```http
+GET /api/commands/{requestId}
+```
+
+### 下发命令
+
+```http
+POST /api/agents/{agentId}/commands
+Content-Type: application/json
+
+{
+  "action": "update",
+  "dir": "/data/dev/admin",
+  "image": "hello-world:latest"
+}
+```
+
+`restart` 示例：
+
+```http
+POST /api/agents/{agentId}/commands
+Content-Type: application/json
+
+{
+  "action": "restart",
+  "dir": "/data/dev/admin"
+}
+```
+
+返回示例：
+
+```json
+{
+  "accepted": true,
+  "command": {
+    "requestId": "c7d99f80-b88e-45fc-a6df-7fe1d9eab1f5",
+    "agentId": "prod-server-01",
+    "status": "queued",
+    "action": "update",
+    "dir": "/data/dev/admin",
+    "image": "hello-world:latest",
+    "payload": {
+      "type": "command",
+      "requestId": "c7d99f80-b88e-45fc-a6df-7fe1d9eab1f5",
+      "action": "update",
+      "dir": "/data/dev/admin",
+      "image": "hello-world:latest"
+    },
+    "output": null,
+    "message": null,
+    "error": null,
+    "createdAt": "2026-03-06T10:02:00Z",
+    "updatedAt": "2026-03-06T10:02:00Z",
+    "ackAt": null,
+    "resultAt": null
+  }
+}
+```
+
+## 说明
+
+- 当前实现使用内存保存 agent 状态和命令历史，服务重启后状态会丢失
+- 如果后续需要多实例部署或持久化命令记录，建议把 agent/command 状态迁移到 Redis 或数据库
+- Agent 的在线判定依据是连接未断开且最近一次消息时间未超过 `HEARTBEAT_TIMEOUT`
+- `docker-compose.yml` 已改为拉取镜像部署，并内置 `/health` 容器健康检查
+
+## V2 规划
+
+- 持久化、审计和数据库支持的规划见 `docs/V2_PLAN.md`
