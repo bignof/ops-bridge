@@ -25,6 +25,12 @@ jobs:
           username: ${{ secrets.REGISTRY_USERNAME }}
           password: ${{ secrets.REGISTRY_PASSWORD }}
 
+      - name: Set timestamp tag
+        run: |
+          # UTC timestamp compact format YYYYMMDD-HHMMSS
+          echo "TS=$(date -u +'%Y%m%d-%H%M%S')" >> $GITHUB_ENV
+          echo "BRANCH=${GITHUB_REF#refs/heads/}" >> $GITHUB_ENV
+
       - name: Build and push
         uses: docker/build-push-action@v4
         with:
@@ -32,4 +38,4 @@ jobs:
           push: true
           tags: |
             ${{ secrets.REGISTRY_URL }}/${{ secrets.IMAGE_NAME }}:latest
-            ${{ secrets.REGISTRY_URL }}/${{ secrets.IMAGE_NAME }}:${{ github.sha }}
+            ${{ secrets.REGISTRY_URL }}/${{ secrets.IMAGE_NAME }}:${{ env.BRANCH }}-${{ env.TS }}
