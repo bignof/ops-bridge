@@ -38,13 +38,38 @@ class AgentSnapshot(BaseModel):
     agent_id: str
     connected: bool
     online: bool
+    credential_configured: bool
     remote: str | None = None
+    key_issued_at: datetime | None = None
     connected_at: datetime | None = None
     disconnected_at: datetime | None = None
     last_seen_at: datetime | None = None
     last_heartbeat_at: datetime | None = None
     last_pong_at: datetime | None = None
     stale_after_seconds: int
+
+
+class AgentCredentialResponse(BaseModel):
+    model_config = MODEL_CONFIG
+
+    agent_id: str
+    agent_key: str
+    issued_at: datetime
+    created: bool
+
+
+class AgentProvisionRequest(BaseModel):
+    model_config = MODEL_CONFIG
+
+    agent_id: str
+
+
+class AgentProvisionResponse(BaseModel):
+    model_config = MODEL_CONFIG
+
+    agent: AgentSnapshot
+    agent_key: str
+    issued_at: datetime
 
 
 class CommandSnapshot(BaseModel):

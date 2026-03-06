@@ -1,5 +1,8 @@
 import asyncio
+import hashlib
+import hmac
 import json
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
@@ -30,13 +33,23 @@ def _agent_to_dict(record: AgentModel) -> dict[str, Any]:
     return {
         "agent_id": record.agent_id,
         "status": record.status,
+        "credential_configured": bool(record.agent_key_hash),
         "remote": record.remote_addr,
+        "key_issued_at": _as_utc(record.key_issued_at),
         "connected_at": _as_utc(record.connected_at),
         "disconnected_at": _as_utc(record.last_disconnect_at),
         "last_seen_at": _as_utc(record.last_seen_at),
         "last_heartbeat_at": _as_utc(record.last_heartbeat_at),
         "last_pong_at": _as_utc(record.last_pong_at),
     }
+
+
+def _hash_agent_key(agent_key: str) -> str:
+    return hashlib.sha256(agent_key.encode("utf-8")).hexdigest()
+
+
+def _generate_agent_key() -> str:
+    return secrets.token_urlsafe(32)
 
 
 def command_to_dict(record: CommandModel) -> dict[str, Any]:
@@ -220,6 +233,15 @@ class HubState:
     async def list_command_events(self, request_id: str) -> list[dict[str, Any]]:
         return await asyncio.to_thread(self._list_command_events_sync, request_id)
 
+    async def rotate_agent_key(self, agent_id: str) -> dict[str, Any]:
+        return await asyncio.to_thread(self._rotate_agent_key_sync, agent_id)
+
+    async def authenticate_agent(self, agent_id: str, presented_key: str) -> bool:
+        return await asyncio.to_thread(self._authenticate_agent_sync, agent_id, presented_key)
+
+    async def provision_agent(self, agent_id: str) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self._provision_agent_sync, agent_id)
+
     async def list_agents(self) -> list[dict[str, Any]]:
         connection_ids = await self._connection_ids()
         agents = await asyncio.to_thread(self._list_agents_sync)
@@ -249,7 +271,9 @@ class HubState:
             "agent_id": record["agent_id"],
             "connected": connected,
             "online": online,
+            "credential_configured": record["credential_configured"],
             "remote": record["remote"],
+            "key_issued_at": record["key_issued_at"],
             "connected_at": record["connected_at"],
             "disconnected_at": record["disconnected_at"],
             "last_seen_at": record["last_seen_at"],
@@ -257,7 +281,6 @@ class HubState:
             "last_pong_at": record["last_pong_at"],
             "stale_after_seconds": self.heartbeat_timeout,
         }
-
 
     def _register_agent_sync(self, agent_id: str, remote: str | None) -> None:
         now = utc_now()
@@ -274,6 +297,85 @@ class HubState:
             record.last_seen_at = now
             record.updated_at = now
             session.commit()
+
+    def _rotate_agent_key_sync(self, agent_id: str) -> dict[str, Any]:
+        now = utc_now()
+        agent_key = _generate_agent_key()
+        agent_key_hash = _hash_agent_key(agent_key)
+        created = False
+        with self.database.session_factory() as session:
+            record = session.scalar(select(AgentModel).where(AgentModel.agent_id == agent_id))
+            if record is None:
+                record = AgentModel(
+                    agent_id=agent_id,
+                    status="offline",
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(record)
+                created = True
+
+            record.agent_key_hash = agent_key_hash
+            record.key_issued_at = now
+            record.updated_at = now
+            session.commit()
+
+        return {
+            "agent_id": agent_id,
+            "agent_key": agent_key,
+            "issued_at": now,
+            "created": created,
+        }
+
+    def _provision_agent_sync(self, agent_id: str) -> dict[str, Any] | None:
+        now = utc_now()
+        agent_key = _generate_agent_key()
+        agent_key_hash = _hash_agent_key(agent_key)
+
+        with self.database.session_factory() as session:
+            existing = session.scalar(select(AgentModel).where(AgentModel.agent_id == agent_id))
+            if existing is not None:
+                return None
+
+            record = AgentModel(
+                agent_id=agent_id,
+                status="offline",
+                agent_key_hash=agent_key_hash,
+                key_issued_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(record)
+            session.commit()
+
+        return {
+            "agent": {
+                "agent_id": agent_id,
+                "connected": False,
+                "online": False,
+                "credential_configured": True,
+                "remote": None,
+                "key_issued_at": now,
+                "connected_at": None,
+                "disconnected_at": None,
+                "last_seen_at": None,
+                "last_heartbeat_at": None,
+                "last_pong_at": None,
+                "stale_after_seconds": self.heartbeat_timeout,
+            },
+            "agent_key": agent_key,
+            "issued_at": now,
+        }
+
+    def _authenticate_agent_sync(self, agent_id: str, presented_key: str) -> bool:
+        if not presented_key:
+            return False
+
+        with self.database.session_factory() as session:
+            record = session.scalar(select(AgentModel).where(AgentModel.agent_id == agent_id))
+            if record is None or not record.agent_key_hash:
+                return False
+            return hmac.compare_digest(record.agent_key_hash, _hash_agent_key(presented_key))
 
     def _disconnect_agent_sync(self, agent_id: str) -> None:
         now = utc_now()

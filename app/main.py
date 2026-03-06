@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, Header, Query, WebSocket, WebSocketD
 
 from app.config import settings
 from app.db import Database
-from app.models import AgentSnapshot, CommandDispatchRequest, CommandDispatchResponse, CommandEventSnapshot, CommandListResponse, CommandSnapshot
+from app.models import AgentCredentialResponse, AgentProvisionRequest, AgentProvisionResponse, AgentSnapshot, CommandDispatchRequest, CommandDispatchResponse, CommandEventSnapshot, CommandListResponse, CommandSnapshot
 from app.store import HubState
 
 
@@ -34,6 +34,11 @@ def _remote_address(websocket: WebSocket) -> str | None:
     if websocket.client is None:
         return None
     return f"{websocket.client.host}:{websocket.client.port}"
+
+
+def _require_admin_token(admin_token: str | None) -> None:
+    if admin_token != settings.admin_token:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid admin token")
 
 
 async def _build_command_list_response(
@@ -134,6 +139,33 @@ async def get_agent(agent_id: str) -> AgentSnapshot:
     if agent is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
     return AgentSnapshot.model_validate(agent)
+
+
+@app.post("/api/agents", response_model=AgentProvisionResponse, status_code=status.HTTP_201_CREATED)
+async def provision_agent(
+    request: AgentProvisionRequest,
+    admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+) -> AgentProvisionResponse:
+    _require_admin_token(admin_token)
+    provisioned = await hub_state.provision_agent(request.agent_id)
+    if provisioned is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Agent already exists")
+
+    return AgentProvisionResponse(
+        agent=AgentSnapshot.model_validate(provisioned["agent"]),
+        agent_key=provisioned["agent_key"],
+        issued_at=provisioned["issued_at"],
+    )
+
+
+@app.post("/api/agents/{agent_id}/credentials/rotate", response_model=AgentCredentialResponse)
+async def rotate_agent_credentials(
+    agent_id: str,
+    admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+) -> AgentCredentialResponse:
+    _require_admin_token(admin_token)
+    credential = await hub_state.rotate_agent_key(agent_id)
+    return AgentCredentialResponse.model_validate(credential)
 
 
 @app.get("/api/agents/{agent_id}/commands", response_model=CommandListResponse)
@@ -300,10 +332,10 @@ async def retry_command(
 
 @app.websocket("/ws/agent/{agent_id}")
 async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
-    token = websocket.query_params.get("token", "")
-    if token != settings.auth_token:
+    presented_key = websocket.query_params.get("key", "")
+    if not await hub_state.authenticate_agent(agent_id, presented_key):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        logger.warning("Rejected agent %s due to invalid token", agent_id)
+        logger.warning("Rejected agent %s due to invalid credentials", agent_id)
         return
 
     await websocket.accept()

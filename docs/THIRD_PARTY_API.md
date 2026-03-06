@@ -6,7 +6,7 @@
 
 - 第三方系统应只使用 HTTP API
 - Agent 与 Hub 的 WebSocket 协议不属于第三方开放接口范围
-- 本文档覆盖查询、下发命令、重试失败命令和审计查询
+- 本文档覆盖 Agent 管理、查询、下发命令、重试失败命令和审计查询
 
 ## 基础信息
 
@@ -23,6 +23,10 @@
 - `X-Requested-Source`：调用来源，例如 `manual-operation`、`scheduler-job`
 
 这两个头会被持久化到命令记录中，用于后续审计。
+
+以下 Agent 管理接口额外要求：
+
+- `X-Admin-Token`：Hub 管理令牌，用于创建 agent 和签发/轮换 agent key
 
 ## 返回约定
 
@@ -55,7 +59,9 @@
   "agentId": "prod-server-01",
   "connected": true,
   "online": true,
+  "credentialConfigured": true,
   "remote": "10.0.0.8:51234",
+  "keyIssuedAt": "2026-03-06T09:59:00Z",
   "connectedAt": "2026-03-06T10:00:00Z",
   "disconnectedAt": null,
   "lastSeenAt": "2026-03-06T10:01:00Z",
@@ -133,13 +139,59 @@ GET /api/agents
 
 返回：`AgentSnapshot[]`
 
-### 3. 查询单个 Agent
+### 3. 创建 Agent 并签发初始 key
+
+```http
+POST /api/agents
+X-Admin-Token: <ADMIN_TOKEN>
+Content-Type: application/json
+
+{
+  "agentId": "prod-server-01"
+}
+```
+
+返回示例：
+
+```json
+{
+  "agent": {
+    "agentId": "prod-server-01",
+    "connected": false,
+    "online": false,
+    "credentialConfigured": true,
+    "remote": null,
+    "keyIssuedAt": "2026-03-06T09:59:00Z",
+    "connectedAt": null,
+    "disconnectedAt": null,
+    "lastSeenAt": null,
+    "lastHeartbeatAt": null,
+    "lastPongAt": null,
+    "staleAfterSeconds": 90
+  },
+  "agentKey": "generated-once-only",
+  "issuedAt": "2026-03-06T09:59:00Z"
+}
+```
+
+已存在的 agent 会返回 `409 Agent already exists`。
+
+### 4. 为已有 Agent 轮换 key
+
+```http
+POST /api/agents/{agentId}/credentials/rotate
+X-Admin-Token: <ADMIN_TOKEN>
+```
+
+返回：包含新的 `agentKey`。该明文只会在响应里出现一次。
+
+### 5. 查询单个 Agent
 
 ```http
 GET /api/agents/{agentId}
 ```
 
-### 4. 查询某个 Agent 的命令历史
+### 6. 查询某个 Agent 的命令历史
 
 ```http
 GET /api/agents/{agentId}/commands?status=failed&requestedBy=platform-api&requestSource=ops-console&createdAfter=2026-03-01T00:00:00Z&createdBefore=2026-03-06T23:59:59Z&sortBy=updatedAt&order=desc&limit=20&offset=0
@@ -160,7 +212,7 @@ GET /api/agents/{agentId}/commands?status=failed&requestedBy=platform-api&reques
 
 返回：`CommandListResponse`
 
-### 5. 查询全局命令列表
+### 7. 查询全局命令列表
 
 ```http
 GET /api/commands?agentId=prod-server-01&status=success&action=restart&requestedBy=platform-api&requestSource=ops-console&createdAfter=2026-03-01T00:00:00Z&createdBefore=2026-03-06T23:59:59Z&sortBy=updatedAt&order=desc&limit=50&offset=0
@@ -168,7 +220,7 @@ GET /api/commands?agentId=prod-server-01&status=success&action=restart&requested
 
 返回：`CommandListResponse`
 
-### 6. 查询单条命令
+### 8. 查询单条命令
 
 ```http
 GET /api/commands/{requestId}
@@ -176,7 +228,7 @@ GET /api/commands/{requestId}
 
 返回：`CommandSnapshot`
 
-### 7. 查询命令审计事件
+### 9. 查询命令审计事件
 
 ```http
 GET /api/commands/{requestId}/events
@@ -191,7 +243,7 @@ GET /api/commands/{requestId}/events
 - `result`
 - `retry`
 
-### 8. 下发命令
+### 10. 下发命令
 
 ```http
 POST /api/agents/{agentId}/commands
@@ -250,7 +302,7 @@ Content-Type: application/json
 }
 ```
 
-### 9. 重试失败命令
+### 11. 重试失败命令
 
 ```http
 POST /api/commands/{requestId}/retry

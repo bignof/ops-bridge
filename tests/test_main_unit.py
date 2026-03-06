@@ -1,11 +1,14 @@
 import asyncio
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from fastapi import HTTPException, WebSocketDisconnect
+
+os.environ.setdefault("ADMIN_TOKEN", "test-admin-token")
 
 from app.db import Database
 from app.main import _handle_agent_message, _remote_address, _serialize_command, agent_ws, dispatch_command, retry_command
@@ -23,6 +26,8 @@ class RecordingState:
         self.agent: dict[str, Any] | None = {"agent_id": "agent-a", "online": True}
         self.connection: Any = None
         self.retried: tuple[dict[str, Any], dict[str, Any]] | None = None
+        self.auth_result = True
+        self.auth_calls: list[tuple[str, str]] = []
 
     async def touch_agent(self, agent_id: str, event_type: str) -> None:
         self.touched.append((agent_id, event_type))
@@ -88,6 +93,10 @@ class RecordingState:
     ) -> tuple[dict[str, Any], dict[str, Any]] | None:
         return self.retried
 
+    async def authenticate_agent(self, agent_id: str, presented_key: str) -> bool:
+        self.auth_calls.append((agent_id, presented_key))
+        return self.auth_result
+
     async def register_agent(self, agent_id: str, websocket: Any, remote: str | None) -> None:
         self.command_events.append(f"register:{agent_id}:{remote}")
 
@@ -101,8 +110,8 @@ class FailingSocket:
 
 
 class FakeAgentWebSocket:
-    def __init__(self, token: str, messages: list[Any], client: Any | None = None) -> None:
-        self.query_params = {"token": token}
+    def __init__(self, agent_key: str, messages: list[Any], client: Any | None = None) -> None:
+        self.query_params = {"key": agent_key}
         self._messages = iter(messages)
         self.client = client
         self.accepted = False
@@ -258,16 +267,18 @@ def test_retry_command_error_branches(monkeypatch: pytest.MonkeyPatch) -> None:
     assert recording_state.results[-1][0] == "req-2"
 
 
-def test_agent_ws_rejects_invalid_token(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_agent_ws_rejects_invalid_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     import app.main as main_module
 
     recording_state = RecordingState()
+    recording_state.auth_result = False
     websocket = FakeAgentWebSocket("wrong-token", [])
     monkeypatch.setattr(main_module, "hub_state", recording_state)
 
     asyncio.run(agent_ws(websocket, "agent-a"))
 
     assert websocket.closed_code == 1008
+    assert recording_state.auth_calls == [("agent-a", "wrong-token")]
     assert recording_state.command_events == []
 
 
@@ -281,7 +292,7 @@ def test_agent_ws_handles_messages_and_disconnect(monkeypatch: pytest.MonkeyPatc
         handled_payloads.append(payload)
 
     websocket = FakeAgentWebSocket(
-        main_module.settings.auth_token,
+        "agent-key",
         [
             {"text": json.dumps({"type": "heartbeat"})},
             {"text": json.dumps(["not-a-dict"])},
@@ -295,6 +306,7 @@ def test_agent_ws_handles_messages_and_disconnect(monkeypatch: pytest.MonkeyPatc
     asyncio.run(agent_ws(websocket, "agent-a"))
 
     assert websocket.accepted is True
+    assert recording_state.auth_calls == [("agent-a", "agent-key")]
     assert handled_payloads == [{"type": "heartbeat"}]
     assert recording_state.command_events == ["register:agent-a:10.0.0.8:8765", "disconnect:agent-a"]
 
@@ -308,10 +320,11 @@ def test_agent_ws_handles_decode_disconnect_and_generic_errors(monkeypatch: pyte
         [RuntimeError("socket-failed")],
     ]:
         recording_state = RecordingState()
-        websocket = FakeAgentWebSocket(main_module.settings.auth_token, message)
+        websocket = FakeAgentWebSocket("agent-key", message)
         monkeypatch.setattr(main_module, "hub_state", recording_state)
 
         asyncio.run(agent_ws(websocket, "agent-a"))
 
+        assert recording_state.auth_calls == [("agent-a", "agent-key")]
         assert recording_state.command_events[0].startswith("register:agent-a:")
         assert recording_state.command_events[-1] == "disconnect:agent-a"

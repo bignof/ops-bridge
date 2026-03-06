@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from typing import Any, Iterator
 
 import pytest
 from fastapi.testclient import TestClient
+
+os.environ.setdefault("ADMIN_TOKEN", "test-admin-token")
 
 from app.db import Database
 from app.main import app
@@ -70,11 +73,68 @@ def test_list_agents_and_get_agent_return_expected_shape(client: TestClient) -> 
     assert body[0]["agentId"] == "agent-a"
     assert body[0]["connected"] is True
     assert body[0]["online"] is True
+    assert body[0]["credentialConfigured"] is False
 
     agent_response = client.get("/api/agents/agent-a")
 
     assert agent_response.status_code == 200
     assert agent_response.json()["agentId"] == "agent-a"
+
+
+def test_rotate_agent_credentials_requires_admin_token_and_persists_state(client: TestClient) -> None:
+    forbidden = client.post("/api/agents/agent-a/credentials/rotate")
+
+    assert forbidden.status_code == 403
+    assert forbidden.json() == {"detail": "Invalid admin token"}
+
+    response = client.post(
+        "/api/agents/agent-a/credentials/rotate",
+        headers={"X-Admin-Token": "test-admin-token"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["agentId"] == "agent-a"
+    assert body["agentKey"]
+    assert body["issuedAt"]
+    assert body["created"] is True
+
+    agent_response = client.get("/api/agents/agent-a")
+
+    assert agent_response.status_code == 200
+    assert agent_response.json()["credentialConfigured"] is True
+    assert agent_response.json()["keyIssuedAt"] is not None
+
+
+def test_provision_agent_creates_offline_agent_and_returns_initial_key(client: TestClient) -> None:
+    forbidden = client.post("/api/agents", json={"agentId": "agent-new"})
+
+    assert forbidden.status_code == 403
+    assert forbidden.json() == {"detail": "Invalid admin token"}
+
+    response = client.post(
+        "/api/agents",
+        headers={"X-Admin-Token": "test-admin-token"},
+        json={"agentId": "agent-new"},
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["agentKey"]
+    assert body["issuedAt"]
+    assert body["agent"]["agentId"] == "agent-new"
+    assert body["agent"]["connected"] is False
+    assert body["agent"]["online"] is False
+    assert body["agent"]["credentialConfigured"] is True
+
+    conflict = client.post(
+        "/api/agents",
+        headers={"X-Admin-Token": "test-admin-token"},
+        json={"agentId": "agent-new"},
+    )
+
+    assert conflict.status_code == 409
+    assert conflict.json() == {"detail": "Agent already exists"}
 
 
 def test_get_unknown_agent_returns_404(client: TestClient) -> None:

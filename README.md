@@ -21,7 +21,7 @@ service-hub 是面向平台侧的控制服务，负责接收 service-agent 的 W
 cp .env.example .env
 ```
 
-2. 修改 `.env` 中的 `AUTH_TOKEN`
+2. 修改 `.env` 中的 `ADMIN_TOKEN`
 3. 修改 `.env` 中的 `SERVICE_HUB_IMAGE`
 4. 按需修改 `.env` 中的 `DATABASE_URL`
 5. 拉取镜像并启动
@@ -57,17 +57,38 @@ alembic -c alembic.ini upgrade head
 | `SERVICE_HUB_IMAGE`     | 运行时拉取的镜像地址            | `service-hub:latest`                         |
 | `SERVICE_HUB_BIND_PORT` | 宿主机暴露端口                  | `8080`                                       |
 | `SERVICE_HUB_DATA_DIR`  | SQLite 持久化目录挂载点         | `./data`                                     |
-| `AUTH_TOKEN`            | Agent 连接认证令牌              | `change-me`                                  |
+| `ADMIN_TOKEN`           | Agent 管理接口的管理令牌        | 无默认值，必须显式配置                       |
 | `HEARTBEAT_TIMEOUT`     | 超过该秒数未收到消息则视为离线  | `90`                                         |
 | `COMMAND_HISTORY_LIMIT` | 每个 agent 保留的命令历史条数   | `200`                                        |
 | `DATABASE_URL`          | 数据库连接串，支持 SQLite/MySQL | `sqlite:////data/service-hub/service-hub.db` |
 
 ## Agent 接入地址
 
+先由平台侧创建 agent 并签发首个独立 key：
+
+```http
+POST /api/agents
+X-Admin-Token: <ADMIN_TOKEN>
+Content-Type: application/json
+
+{
+  "agentId": "prod-server-01"
+}
+```
+
+如果是已有 agent 需要换 key，再调用：
+
+```http
+POST /api/agents/{agentId}/credentials/rotate
+X-Admin-Token: <ADMIN_TOKEN>
+```
+
+返回体中的 `agentKey` 只会在签发/轮换时返回一次，应写入 agent 侧环境变量 `AGENT_KEY`。
+
 Agent 使用如下地址连接：
 
 ```text
-ws://<SERVICE_HUB_HOST>:8080/ws/agent/<AGENT_ID>?token=<AUTH_TOKEN>
+ws://<SERVICE_HUB_HOST>:8080/ws/agent/<AGENT_ID>?key=<AGENT_KEY>
 ```
 
 agent 侧可以将 `WS_URL` 配置为：
@@ -102,7 +123,9 @@ GET /api/agents
     "agentId": "prod-server-01",
     "connected": true,
     "online": true,
+    "credentialConfigured": true,
     "remote": "10.0.0.8:51234",
+    "keyIssuedAt": "2026-03-06T09:59:00Z",
     "connectedAt": "2026-03-06T10:00:00Z",
     "disconnectedAt": null,
     "lastSeenAt": "2026-03-06T10:01:00Z",
@@ -254,6 +277,7 @@ Content-Type: application/json
 - Schema 现在通过 Alembic 管理，后续结构变更需要新增迁移脚本
 - WebSocket 连接对象仍然只保存在内存中，因此 Hub 重启后会等待 Agent 自动重连
 - 默认推荐本地开发使用 SQLite，生产环境使用 MySQL
+- Agent 认证已改为“每个 agentId 对应一个独立 key”，不再依赖所有 agent 共用一个固定连接 token
 - Agent 的在线判定依据仍然是连接未断开且最近一次消息时间未超过 `HEARTBEAT_TIMEOUT`
 - 命令查询支持按 `createdAt` / `updatedAt` 排序，并支持失败命令的重试下发
 - `docker-compose.yml` 已改为拉取镜像部署，并内置 `/health` 容器健康检查
