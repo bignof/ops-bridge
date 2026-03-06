@@ -21,8 +21,9 @@ def _decode_messages(ws: FakeWebSocket) -> list[dict]:
     return [json.loads(item) for item in ws.messages]
 
 
-def test_send_message_and_send_error_handle_edge_cases() -> None:
+def test_send_message_and_send_error_handle_edge_cases(caplog: pytest.LogCaptureFixture) -> None:
     ws = FakeWebSocket()
+    caplog.set_level("WARNING")
     handlers.send_message(ws, {"type": "ping"})
     handlers.send_message(None, {"type": "ignored"})
     handlers.send_message(FakeWebSocket(fail=True), {"type": "ignored"})
@@ -32,9 +33,11 @@ def test_send_message_and_send_error_handle_edge_cases() -> None:
     assert decoded[0] == {"type": "ping"}
     assert decoded[1]["status"] == "failed"
     assert decoded[1]["requestId"] == "req-1"
+    assert "Command failed: request_id=req-1, error=boom" in caplog.text
 
 
-def test_validate_base_and_dispatch_errors(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+def test_validate_base_and_dispatch_errors(monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level("INFO")
     ws = FakeWebSocket()
 
     assert handlers._validate_base(ws, {"requestId": "req-1"}) is None
@@ -50,6 +53,7 @@ def test_validate_base_and_dispatch_errors(monkeypatch: pytest.MonkeyPatch, tmp_
     handlers.dispatch(ws, {"requestId": "req-3", "action": "deploy", "dir": "/srv/a"})
 
     assert "Unsupported action 'deploy'" in _decode_messages(ws)[0]["error"]
+    assert "Received command: request_id=req-3, action=deploy, dir=/srv/a" in caplog.text
 
 
 def test_handle_update_validation_and_errors(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:

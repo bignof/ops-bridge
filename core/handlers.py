@@ -28,6 +28,7 @@ def send_message(ws, message_dict):
 
 
 def send_error(ws, request_id, error_msg):
+    logger.warning(f"Command failed: request_id={request_id}, error={error_msg}")
     send_message(ws, {
         'type': 'result',
         'requestId': request_id,
@@ -172,6 +173,13 @@ HANDLERS = {
 
 def dispatch(ws, data):
     """解析命令并分发到对应的 handler。"""
+    logger.info(
+        "Received command: request_id=%s, action=%s, dir=%s",
+        data.get('requestId', 'unknown'),
+        data.get('action'),
+        data.get('dir'),
+    )
+
     validated = _validate_base(ws, data)
     if validated is None:
         return
