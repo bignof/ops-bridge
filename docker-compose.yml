@@ -1,0 +1,30 @@
+version: "3.8"
+
+services:
+  service-agent:
+    build: .
+    container_name: service-agent
+    restart: unless-stopped
+    environment:
+      # ServiceHub WebSocket 地址，格式: ws://<IP>:<PORT>/ws/agent
+      - WS_URL=ws://YOUR_SERVICE_HUB_IP:PORT/ws/agent
+      # Agent 唯一标识（默认使用容器 hostname）
+      - AGENT_ID=my-agent-node-1
+      # 认证 Token，需与服务端一致
+      - TOKEN=your-secret-token
+      # 断线重连间隔（秒）
+      - RECONNECT_DELAY=5
+      # 心跳发送间隔（秒）
+      - HEARTBEAT_INTERVAL=30
+    volumes:
+      # 挂载宿主机 Docker socket，使 Agent 可操控宿主机容器
+      - /var/run/docker.sock:/var/run/docker.sock
+      # 挂载 compose 文件所在目录，路径需与 dir 参数保持一致
+      # 按实际部署路径添加，可挂载多个目录
+      - /data:/data
+    # 可选：限制资源
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: "0.5"
+    #       memory: 256M

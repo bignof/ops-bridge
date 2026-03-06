@@ -1,0 +1,4 @@
+.env
+__pycache__/
+*.pyc
+SERVICE_HUB_INTEGRATION.md
