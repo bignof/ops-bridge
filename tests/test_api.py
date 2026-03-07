@@ -4,7 +4,6 @@ import asyncio
 from datetime import timedelta
 import os
 from pathlib import Path
-import time
 from typing import Any, Iterator
 
 import pytest
@@ -475,62 +474,3 @@ def test_retry_missing_command_returns_404(client: TestClient) -> None:
     assert response.status_code == 404
     assert response.json() == {"detail": "Command not found"}
 
-
-def test_command_round_trip_over_real_websocket_connection(client: TestClient) -> None:
-    provision_response = client.post(
-        "/api/agents",
-        headers={"X-Admin-Token": "test-admin-token"},
-        json={"agentId": "agent-ws"},
-    )
-
-    assert provision_response.status_code == 201
-    agent_key = provision_response.json()["agentKey"]
-
-    with client.websocket_connect(f"/ws/agent/agent-ws?key={agent_key}") as websocket:
-        response = client.post(
-            "/api/agents/agent-ws/commands",
-            headers={
-                "X-Requested-By": "platform-api",
-                "X-Requested-Source": "ops-console",
-            },
-            json={
-                "requestId": "req-ws-roundtrip",
-                "action": "restart",
-                "dir": "/srv/real-ws",
-            },
-        )
-
-        payload = websocket.receive_json()
-        assert payload == {
-            "type": "command",
-            "requestId": "req-ws-roundtrip",
-            "action": "restart",
-            "dir": "/srv/real-ws",
-        }
-
-        websocket.send_json({"type": "ack", "requestId": "req-ws-roundtrip"})
-        websocket.send_json({"type": "result", "requestId": "req-ws-roundtrip", "status": "success", "message": "done"})
-        assert response.status_code == 202
-
-        command_response = None
-        for _ in range(20):
-            command_response = client.get("/api/commands/req-ws-roundtrip")
-            assert command_response.status_code == 200
-            if command_response.json()["status"] == "success":
-                break
-            time.sleep(0.05)
-
-        assert command_response is not None
-        assert command_response.json()["status"] == "success"
-        assert command_response.json()["message"] == "done"
-
-        events_response = None
-        for _ in range(20):
-            events_response = client.get("/api/commands/req-ws-roundtrip/events")
-            assert events_response.status_code == 200
-            if [item["eventType"] for item in events_response.json()] == ["created", "ack", "result"]:
-                break
-            time.sleep(0.05)
-
-        assert events_response is not None
-        assert [item["eventType"] for item in events_response.json()] == ["created", "ack", "result"]

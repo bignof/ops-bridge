@@ -8,6 +8,7 @@ on:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       ADMIN_TOKEN: ci-admin-token
 
@@ -21,7 +22,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install -r requirements-dev.txt
+        run: python -m pip install -r requirements-dev.txt
 
       - name: Compile Python sources
         run: python -m compileall app migrations scripts
@@ -43,7 +44,9 @@ jobs:
           PY
 
       - name: Run tests
-        run: pytest -q
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+        run: python -m pytest -q
 
       - name: Build Docker image
         run: docker build -t service-hub:ci .
