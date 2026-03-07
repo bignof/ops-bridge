@@ -4,7 +4,6 @@ import asyncio
 from datetime import timedelta
 import os
 from pathlib import Path
-import threading
 import time
 from typing import Any, Iterator
 
@@ -486,30 +485,20 @@ def test_command_round_trip_over_real_websocket_connection(client: TestClient) -
 
     assert provision_response.status_code == 201
     agent_key = provision_response.json()["agentKey"]
-    dispatch_response: dict[str, Any] = {}
-    dispatch_error: dict[str, BaseException] = {}
-
-    def dispatch() -> None:
-        try:
-            with TestClient(app) as dispatch_client:
-                dispatch_response["response"] = dispatch_client.post(
-                    "/api/agents/agent-ws/commands",
-                    headers={
-                        "X-Requested-By": "platform-api",
-                        "X-Requested-Source": "ops-console",
-                    },
-                    json={
-                        "requestId": "req-ws-roundtrip",
-                        "action": "restart",
-                        "dir": "/srv/real-ws",
-                    },
-                )
-        except BaseException as exc:
-            dispatch_error["error"] = exc
 
     with client.websocket_connect(f"/ws/agent/agent-ws?key={agent_key}") as websocket:
-        worker = threading.Thread(target=dispatch, daemon=True)
-        worker.start()
+        response = client.post(
+            "/api/agents/agent-ws/commands",
+            headers={
+                "X-Requested-By": "platform-api",
+                "X-Requested-Source": "ops-console",
+            },
+            json={
+                "requestId": "req-ws-roundtrip",
+                "action": "restart",
+                "dir": "/srv/real-ws",
+            },
+        )
 
         payload = websocket.receive_json()
         assert payload == {
@@ -521,10 +510,6 @@ def test_command_round_trip_over_real_websocket_connection(client: TestClient) -
 
         websocket.send_json({"type": "ack", "requestId": "req-ws-roundtrip"})
         websocket.send_json({"type": "result", "requestId": "req-ws-roundtrip", "status": "success", "message": "done"})
-        worker.join(timeout=5)
-        assert worker.is_alive() is False
-        assert "error" not in dispatch_error
-        response = dispatch_response["response"]
         assert response.status_code == 202
 
         command_response = None
