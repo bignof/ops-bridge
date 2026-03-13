@@ -1,4 +1,5 @@
 import asyncio
+from collections import deque
 import hashlib
 import hmac
 import json
@@ -15,6 +16,7 @@ from app.db_models import AgentModel, CommandEventModel, CommandModel
 
 
 CHINA_TZ = timezone(timedelta(hours=8))
+LOG_STREAM_REPLAY_LIMIT = 2000
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -38,6 +40,15 @@ def _as_storage_utc(value: datetime | None) -> datetime | None:
 
 def _loads_payload(value: str) -> dict[str, Any]:
     return json.loads(value) if value else {}
+
+
+def _log_stream_key(
+    agent_id: str,
+    project_dir: str,
+    service: str | None,
+    timestamps: bool,
+) -> tuple[str, str, str | None, bool]:
+    return (agent_id, project_dir, service, timestamps)
 
 
 def _agent_to_dict(record: AgentModel) -> dict[str, Any]:
@@ -133,6 +144,9 @@ class HubState:
         self.command_history_limit = command_history_limit
         self.database = database
         self._connections: dict[str, WebSocket] = {}
+        self._log_streams_by_session: dict[str, dict[str, Any]] = {}
+        self._log_streams_by_key: dict[tuple[str, str, str | None, bool], str] = {}
+        self._log_subscribers: dict[str, str] = {}
         self._lock = asyncio.Lock()
 
     async def initialize(self) -> None:
@@ -148,6 +162,7 @@ class HubState:
 
     async def disconnect_agent(self, agent_id: str, websocket: WebSocket | None = None) -> None:
         should_persist = False
+        log_session_queues: list[asyncio.Queue[dict[str, Any]]] = []
         async with self._lock:
             active = self._connections.get(agent_id)
             if websocket is not None and active is not websocket:
@@ -156,6 +171,22 @@ class HubState:
             if agent_id in self._connections:
                 self._connections.pop(agent_id, None)
                 should_persist = True
+
+            stale_session_ids = [
+                session_id
+                for session_id, session in self._log_streams_by_session.items()
+                if session["agent_id"] == agent_id
+            ]
+            for session_id in stale_session_ids:
+                session = self._log_streams_by_session.pop(session_id, None)
+                if session is not None:
+                    self._log_streams_by_key.pop(session["stream_key"], None)
+                    for subscriber_id, queue in session["subscribers"].items():
+                        self._log_subscribers.pop(subscriber_id, None)
+                        log_session_queues.append(queue)
+
+        for queue in log_session_queues:
+            await queue.put({"event": "error", "error": "Agent disconnected"})
 
         if should_persist:
             await asyncio.to_thread(self._disconnect_agent_sync, agent_id)
@@ -166,6 +197,140 @@ class HubState:
     async def get_connection(self, agent_id: str) -> WebSocket | None:
         async with self._lock:
             return self._connections.get(agent_id)
+
+    async def subscribe_log_stream(
+        self,
+        *,
+        agent_id: str,
+        project_dir: str,
+        service: str | None,
+        tail: int,
+        timestamps: bool,
+        requested_by: str | None = None,
+        request_source: str | None = None,
+    ) -> tuple[str, str, asyncio.Queue[dict[str, Any]], dict[str, Any] | None]:
+        session_id: str | None = None
+        stream_key = _log_stream_key(agent_id, project_dir, service, timestamps)
+        subscriber_id = str(uuid4())
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        start_payload: dict[str, Any] | None = None
+        replay_messages: list[dict[str, Any]] = []
+
+        async with self._lock:
+            existing_session_id = self._log_streams_by_key.get(stream_key)
+            stream = self._log_streams_by_session.get(existing_session_id) if existing_session_id else None
+
+            if stream is None:
+                if existing_session_id is not None:
+                    self._log_streams_by_key.pop(stream_key, None)
+                session_id = str(uuid4())
+                stream = {
+                    "agent_id": agent_id,
+                    "stream_key": stream_key,
+                    "project_dir": project_dir,
+                    "service": service,
+                    "timestamps": timestamps,
+                    "started_event": None,
+                    "recent_chunks": deque(maxlen=LOG_STREAM_REPLAY_LIMIT),
+                    "subscribers": {},
+                    "stop_requested": False,
+                }
+                self._log_streams_by_key[stream_key] = session_id
+                self._log_streams_by_session[session_id] = stream
+                start_payload = {
+                    "type": "logs_start",
+                    "sessionId": session_id,
+                    "dir": project_dir,
+                    "tail": tail,
+                    "timestamps": timestamps,
+                }
+                if service:
+                    start_payload["service"] = service
+                if requested_by:
+                    start_payload["requestedBy"] = requested_by
+                if request_source:
+                    start_payload["requestSource"] = request_source
+            else:
+                session_id = existing_session_id
+                started_event = stream.get("started_event")
+                if started_event is not None:
+                    replay_messages.append({"event": "started", **started_event})
+                recent_chunks = list(stream["recent_chunks"])
+                for chunk in recent_chunks[-tail:]:
+                    replay_messages.append({"event": "chunk", **chunk})
+
+            stream["subscribers"][subscriber_id] = queue
+            self._log_subscribers[subscriber_id] = session_id
+
+        for message in replay_messages:
+            await queue.put(message)
+
+        return session_id, subscriber_id, queue, start_payload
+
+    async def cancel_log_subscription(self, subscriber_id: str) -> None:
+        async with self._lock:
+            session_id = self._log_subscribers.pop(subscriber_id, None)
+            if session_id is None:
+                return
+
+            stream = self._log_streams_by_session.get(session_id)
+            if stream is None:
+                return
+
+            stream["subscribers"].pop(subscriber_id, None)
+            if stream["subscribers"]:
+                return
+
+            self._log_streams_by_session.pop(session_id, None)
+            self._log_streams_by_key.pop(stream["stream_key"], None)
+
+    async def unsubscribe_log_stream(self, subscriber_id: str) -> dict[str, Any] | None:
+        async with self._lock:
+            session_id = self._log_subscribers.pop(subscriber_id, None)
+            if session_id is None:
+                return None
+
+            stream = self._log_streams_by_session.get(session_id)
+            if stream is None:
+                return None
+
+            stream["subscribers"].pop(subscriber_id, None)
+            if stream["subscribers"] or stream["stop_requested"]:
+                return None
+
+            stream["stop_requested"] = True
+            self._log_streams_by_key.pop(stream["stream_key"], None)
+            return {
+                "agent_id": stream["agent_id"],
+                "session_id": session_id,
+            }
+
+    async def publish_log_session_event(self, session_id: str, event: str, payload: dict[str, Any] | None = None) -> bool:
+        subscriber_queues: list[asyncio.Queue[dict[str, Any]]] = []
+        message = {"event": event}
+        if payload:
+            message.update(payload)
+
+        async with self._lock:
+            stream = self._log_streams_by_session.get(session_id)
+            if stream is None:
+                return False
+
+            if event == "started":
+                stream["started_event"] = dict(payload or {})
+            elif event == "chunk" and payload:
+                stream["recent_chunks"].append(dict(payload))
+
+            subscriber_queues = list(stream["subscribers"].values())
+            if event in {"finished", "error"}:
+                self._log_streams_by_session.pop(session_id, None)
+                self._log_streams_by_key.pop(stream["stream_key"], None)
+                for subscriber_id in list(stream["subscribers"].keys()):
+                    self._log_subscribers.pop(subscriber_id, None)
+
+        for queue in subscriber_queues:
+            await queue.put(message)
+        return True
 
     async def store_command(
         self,

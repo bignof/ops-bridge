@@ -6,13 +6,13 @@
 
 - 第三方系统应只使用 HTTP API
 - Agent 与 Hub 的 WebSocket 协议不属于第三方开放接口范围
-- 本文档覆盖 Agent 管理、查询、下发命令、重试失败命令和审计查询
+- 本文档覆盖 Agent 管理、查询、下发命令、实时日志流、重试失败命令和审计查询
 - Hub 的职责边界与 API 扩展规则见 `docs/API_GOVERNANCE.md`
 
 ## 基础信息
 
 - Base URL：`http://<service-hub-host>:8080`
-- Content-Type：`application/json`
+- Content-Type：除日志流接口外均为 `application/json`
 - 在线文档：`GET /docs`
 - OpenAPI：`GET /openapi.json`
 
@@ -60,6 +60,7 @@ curl -X POST "http://<service-hub-host>:8080/api/agents" \
 ### 成功状态码
 
 - `200 OK`：普通查询成功
+- `200 OK`：日志流建立成功，响应体为 `text/event-stream`
 - `202 Accepted`：命令已接收并进入队列
 
 ### 常见错误状态码
@@ -153,6 +154,24 @@ curl -X POST "http://<service-hub-host>:8080/api/agents" \
   "order": "desc"
 }
 ```
+
+### LogStreamRequest
+
+```json
+{
+  "dir": "/data/dev/admin",
+  "service": "web",
+  "tail": 200,
+  "timestamps": false
+}
+```
+
+说明：
+
+- `dir`：compose 文件所在目录的宿主机绝对路径
+- `service`：可选，指定单个 compose service；不传则输出整个项目日志
+- `tail`：启动时先补发的最近日志行数，范围 `1` 到 `2000`
+- `timestamps`：是否追加 `docker compose logs --timestamps`
 
 ## API 清单
 
@@ -335,7 +354,73 @@ Content-Type: application/json
 }
 ```
 
-### 10. 重试失败命令
+### 10. 打开实时日志流
+
+```http
+POST /api/agents/{agentId}/logs/stream
+X-Requested-By: ops-console
+X-Requested-Source: manual-operation
+Content-Type: application/json
+Accept: text/event-stream
+
+{
+  "dir": "/data/dev/admin",
+  "service": "web",
+  "tail": 200,
+  "timestamps": true
+}
+```
+
+返回头：
+
+- `Content-Type: text/event-stream`
+- `X-Log-Session-Id: <sessionId>`
+
+并发行为：
+
+- 相同 `agentId + dir + service + timestamps` 的并发请求会共享一条上游日志流
+- 新加入的订阅者会收到当前共享流的 `started` 事件，以及该共享流在内存里保留的最近一段日志块
+- 只有最后一个订阅者断开时，Hub 才会向 Agent 发送 `logs_stop`
+
+SSE 事件：
+
+`started`
+
+```text
+event: started
+data: {"sessionId":"1d8f...","agentId":"prod-server-01","service":"web","tail":200,"timestamps":true}
+```
+
+`chunk`
+
+```text
+event: chunk
+data: {"sessionId":"1d8f...","agentId":"prod-server-01","chunk":"web-1  | service started\n"}
+```
+
+`finished`
+
+```text
+event: finished
+data: {"sessionId":"1d8f...","agentId":"prod-server-01","exitCode":0,"stopped":false,"chunks":32}
+```
+
+`error`
+
+```text
+event: error
+data: {"sessionId":"1d8f...","agentId":"prod-server-01","error":"Directory not found: /data/dev/admin"}
+```
+
+说明：
+
+- 这是一个长连接接口，Hub 会把 Agent 返回的日志块原样透传为 SSE `chunk`
+- 客户端主动断开连接时，如果它是最后一个订阅者，Hub 会向 Agent 发送 `logs_stop`，结束对应 `docker compose logs -f`
+- 该日志会话只保存在内存中，不写入命令历史，也不会跨 Hub 重启恢复
+- 若 Agent 离线或连接对象不可用，会返回 `409 Conflict`
+- 若 Hub 已接收请求但向 Agent 发起日志流失败，会返回 `502 Bad Gateway`
+
+### 11. 重试失败命令
 
 ```http
 POST /api/commands/{requestId}/retry

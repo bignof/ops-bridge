@@ -13,6 +13,7 @@ from app.db import Database
 from app.routers.agent_ws import agent_ws, router as agent_ws_router
 from app.routers.agents import get_agent, list_agents, provision_agent, rotate_agent_credentials, router as agents_router
 from app.routers.commands import dispatch_command, get_command, get_command_events, list_commands, retry_command, router as commands_router
+from app.routers.logs import router as logs_router, stream_agent_logs
 from app.routers.system import health, router as system_router
 from app.store import HubState
 
@@ -103,6 +104,7 @@ app = FastAPI(
         {"name": "系统", "description": "系统健康检查接口。"},
         {"name": "Agent 管理", "description": "Agent 查询、创建与密钥管理接口。"},
         {"name": "命令管理", "description": "命令查询、下发、重试与审计接口。"},
+        {"name": "日志流", "description": "通过 Agent 实时查看 docker compose 日志。"},
     ],
 )
 original_openapi = app.openapi
@@ -119,4 +121,5 @@ app.openapi = custom_openapi
 app.include_router(system_router)
 app.include_router(agents_router)
 app.include_router(commands_router)
+app.include_router(logs_router)
 app.include_router(agent_ws_router)

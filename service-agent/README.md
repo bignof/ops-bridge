@@ -10,6 +10,7 @@
 3. 远程平台下发指令：
   - update  →  修改 compose 中匹配服务的 image，然后执行 pull + down + up -d
   - restart →  docker compose restart（重启容器，不重建）
+  - logs    →  docker compose logs -f --tail N（持续查看服务日志）
 ```
 
 ## 架构
@@ -28,6 +29,7 @@ service-agent（容器）
 
 - 通过 WebSocket 与控制台保持长连接，自动断线重连
 - 支持 `update` 和 `restart` 两类平台命令
+- 支持 `logs_start` / `logs_stop` 日志流会话，用于实时查看 `docker compose logs -f --tail N`
 - 统一使用 `docker compose`（v2 插件）执行 Compose 命令
 - 命令在独立线程中执行，不阻塞心跳和其他消息处理
 - 相同 `dir` 的命令严格串行，不同目录的命令可并行执行
@@ -110,6 +112,37 @@ INFO - Health server listening on http://0.0.0.0:18081/health
 
 并发约束：如果同一个 Agent 在短时间内收到多条命令，Agent 会按 `dir` 做互斥控制。同一目录上的 `update` / `restart` 会排队串行执行，避免 compose 文件和 Docker 操作互相冲突；不同目录仍允许并行。
 
+### 服务端 → Agent（日志流）
+
+```json
+{
+  "type": "logs_start",
+  "sessionId": "log-123",
+  "dir": "/data/dev/admin",
+  "service": "web",
+  "tail": 200,
+  "timestamps": true
+}
+```
+
+| 字段         | 类型    | 必填 | 说明 |
+| ------------ | ------- | ---- | ---- |
+| `type`       | string  | ✅   | `logs_start` 或 `logs_stop` |
+| `sessionId`  | string  | ✅   | 日志会话唯一 ID，由 Hub 生成 |
+| `dir`        | string  | ✅   | compose 文件所在目录的宿主机绝对路径 |
+| `service`    | string  | 否   | 可选，指定单个 compose service |
+| `tail`       | integer | 否   | 启动时先输出最近多少行，默认 `200` |
+| `timestamps` | boolean | 否   | 是否追加 `docker compose logs --timestamps` |
+
+`logs_stop` 示例：
+
+```json
+{
+  "type": "logs_stop",
+  "sessionId": "log-123"
+}
+```
+
 ### Agent → 服务端（回复）
 
 **ACK（处理中）：**
@@ -135,6 +168,55 @@ INFO - Health server listening on http://0.0.0.0:18081/health
 ```json
 { "type": "result", "requestId": "req-123", "status": "failed", "error": "..." }
 ```
+
+**日志会话开始：**
+
+```json
+{
+  "type": "logs_started",
+  "sessionId": "log-123",
+  "service": "web",
+  "tail": 200,
+  "timestamps": true
+}
+```
+
+**日志分块：**
+
+```json
+{
+  "type": "logs_chunk",
+  "sessionId": "log-123",
+  "chunk": "web-1  | service started\n"
+}
+```
+
+**日志结束：**
+
+```json
+{
+  "type": "logs_finished",
+  "sessionId": "log-123",
+  "exitCode": 0,
+  "stopped": false,
+  "chunks": 32
+}
+```
+
+**日志错误：**
+
+```json
+{
+  "type": "logs_error",
+  "sessionId": "log-123",
+  "error": "Directory not found: /data/dev/admin"
+}
+```
+
+说明：
+
+- 当前日志能力是单向流式输出，不包含交互式 shell
+- Agent 会直接执行 `docker compose logs -f --tail N`，当 Hub 断开该流时会终止对应进程
 
 ## 健康检查
 
@@ -162,6 +244,9 @@ service-agent/
 ├── agent.py            # Agent 主程序
 ├── config.py           # 环境变量和运行参数
 ├── core/               # WebSocket、命令处理、健康检查
+│   ├── handlers.py
+│   ├── log_sessions.py # 实时日志流会话
+│   └── ws_client.py
 ├── services/           # Compose 操作封装
 ├── requirements.txt    # Python 依赖
 ├── requirements-dev.txt
