@@ -1,0 +1,117 @@
+name: Build and Push Docker Images
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "service-agent/**"
+      - "service-hub/**"
+      - ".github/workflows/docker-publish.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      service-agent: ${{ steps.filter.outputs.service-agent }}
+      service-hub: ${{ steps.filter.outputs.service-hub }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Detect changed services
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            service-agent:
+              - 'service-agent/**'
+              - '.github/workflows/docker-publish.yml'
+            service-hub:
+              - 'service-hub/**'
+              - '.github/workflows/docker-publish.yml'
+
+  service-agent:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.service-agent == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.REGISTRY_URL }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Set image tags
+        shell: bash
+        run: |
+          echo "TS=$(TZ='Asia/Shanghai' date +'%Y%m%d-%H%M%S')" >> "$GITHUB_ENV"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./service-agent
+          file: ./service-agent/Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.REGISTRY_URL }}/${{ secrets.SERVICE_AGENT_IMAGE_NAME }}:latest
+            ${{ secrets.REGISTRY_URL }}/${{ secrets.SERVICE_AGENT_IMAGE_NAME }}:main-${{ env.TS }}
+
+  service-hub:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.service-hub == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.REGISTRY_URL }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Set image tags
+        shell: bash
+        run: |
+          echo "TS=$(TZ='Asia/Shanghai' date +'%Y%m%d-%H%M%S')" >> "$GITHUB_ENV"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./service-hub
+          file: ./service-hub/Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.REGISTRY_URL }}/${{ secrets.SERVICE_HUB_IMAGE_NAME }}:latest
+            ${{ secrets.REGISTRY_URL }}/${{ secrets.SERVICE_HUB_IMAGE_NAME }}:main-${{ env.TS }}

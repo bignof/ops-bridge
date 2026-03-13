@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  service-agent:
+    runs-on: ubuntu-latest
+    env:
+      WS_URL: ws://localhost:8080/ws/agent
+      AGENT_KEY: ci-agent-key
+      AGENT_ID: ci-agent
+    defaults:
+      run:
+        working-directory: service-agent
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Compile Python sources
+        run: python -m compileall .
+
+      - name: Import smoke test
+        run: python -c "import agent; import core.ws_client; import core.health_server; print('service-agent import ok')"
+
+      - name: Run tests with coverage gate
+        run: pytest --cov=agent --cov=config --cov=core --cov=services --cov-report=term-missing --cov-fail-under=97 -q
+
+      - name: Build Docker image
+        run: docker build -t service-agent:ci .
+
+      - name: Validate docker compose v2 in image
+        run: |
+          docker run --rm service-agent:ci python - <<'PY'
+          import shutil
+          import subprocess
+
+          assert shutil.which("docker") is not None, "docker CLI is missing in service-agent image"
+          assert shutil.which("docker-compose") is None, "docker-compose v1 should not be present in service-agent image"
+          subprocess.run(["docker", "compose", "version"], check=True)
+          print("service-agent image has docker compose v2 only")
+          PY
+
+  service-hub:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      ADMIN_TOKEN: ci-admin-token
+    defaults:
+      run:
+        working-directory: service-hub
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Compile Python sources
+        run: python -m compileall app migrations scripts
+
+      - name: Import smoke test
+        run: python -c "import sys; sys.path.insert(0, '.'); import app.main; print('service-hub import ok')"
+
+      - name: Validate Alembic upgrade
+        run: |
+          python - <<'PY'
+          import tempfile
+          from pathlib import Path
+          from app.db import Database
+
+          temp_dir = Path(tempfile.mkdtemp())
+          database = Database(f"sqlite:///{temp_dir / 'ci.db'}")
+          database.init_schema()
+          print("alembic upgrade ok")
+          PY
+
+      - name: Run tests
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: python -m pytest -q
+
+      - name: Build Docker image
+        run: docker build -t service-hub:ci .

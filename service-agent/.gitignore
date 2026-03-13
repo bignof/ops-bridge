@@ -1,11 +1,2 @@
-.env
-.venv/
-.vscode/
-__pycache__/
-*.pyc
-.pytest_cache/
-.mypy_cache/
-.coverage
-.coverage.*
-htmlcov/
+# Local notes for point-to-point integration debugging
 SERVICE_HUB_INTEGRATION.md
