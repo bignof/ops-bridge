@@ -1,0 +1,32 @@
+services:
+  service-hub:
+    image: ${SERVICE_HUB_IMAGE:?SERVICE_HUB_IMAGE is required}
+    pull_policy: always
+    container_name: ${SERVICE_HUB_CONTAINER_NAME:-service-hub}
+    init: true
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-sqlite:////data/service-hub/service-hub.db}
+    ports:
+      - "${SERVICE_HUB_BIND_PORT:-8080}:8080"
+    volumes:
+      - ${SERVICE_HUB_DATA_DIR:-./data}:/data/service-hub
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status == 200 else 1)\"",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
