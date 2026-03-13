@@ -49,6 +49,8 @@ def test_connection_state_and_open_close_error(monkeypatch: pytest.MonkeyPatch) 
 def test_on_message_dispatches_commands_and_ping(monkeypatch: pytest.MonkeyPatch) -> None:
     module = _import_ws_client(monkeypatch)
     dispatch_calls: list[tuple[object, dict]] = []
+    logs_start_calls: list[tuple[object, dict]] = []
+    logs_stop_calls: list[dict] = []
     sent_messages: list[dict] = []
 
     class ImmediateThread:
@@ -61,16 +63,22 @@ def test_on_message_dispatches_commands_and_ping(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr(module.threading, "Thread", ImmediateThread)
     monkeypatch.setattr(module, "dispatch", lambda ws, data: dispatch_calls.append((ws, data)))
+    monkeypatch.setattr(module, "start_log_session", lambda ws, data: logs_start_calls.append((ws, data)))
+    monkeypatch.setattr(module, "stop_log_session", lambda data: logs_stop_calls.append(data))
     monkeypatch.setattr(module, "send_message", lambda ws, payload: sent_messages.append(payload))
     monkeypatch.setattr(module.time, "time", lambda: 456.0)
 
     ws = SimpleNamespace()
     module._on_message(ws, '{"type": "command", "requestId": "req-1"}')
+    module._on_message(ws, '{"type": "logs_start", "sessionId": "logs-1"}')
+    module._on_message(ws, '{"type": "logs_stop", "sessionId": "logs-1"}')
     module._on_message(ws, '{"type": "ping"}')
     module._on_message(ws, 'not-json')
 
     state = module.get_connection_state()
     assert dispatch_calls == [(ws, {"type": "command", "requestId": "req-1"})]
+    assert logs_start_calls == [(ws, {"type": "logs_start", "sessionId": "logs-1"})]
+    assert logs_stop_calls == [{"type": "logs_stop", "sessionId": "logs-1"}]
     assert sent_messages == [{"type": "pong", "timestamp": 456.0}]
     assert state["last_message_ts"] == 456.0
 

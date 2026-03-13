@@ -90,3 +90,20 @@ def test_run_compose_uses_cached_command(monkeypatch: pytest.MonkeyPatch) -> Non
     assert output == "ok"
     assert calls == [(["docker", "compose", "restart"], "/tmp/app")]
     compose._compose_cmd = None
+
+
+def test_open_compose_process_uses_cached_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    compose._compose_cmd = ["docker", "compose"]
+    calls: list[tuple[list[str], str]] = []
+
+    def fake_popen(cmd, stdout, stderr, text, cwd, bufsize):
+        calls.append((cmd, cwd))
+        return SimpleNamespace(stdout=None)
+
+    monkeypatch.setattr(compose.subprocess, "Popen", fake_popen)
+
+    process = compose.open_compose_process("/tmp/app", ["logs", "-f", "--tail", "10", "api"])
+
+    assert process.stdout is None
+    assert calls == [(["docker", "compose", "logs", "-f", "--tail", "10", "api"], "/tmp/app")]
+    compose._compose_cmd = None

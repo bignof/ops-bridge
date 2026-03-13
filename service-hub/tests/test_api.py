@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+import inspect
+import json
 import os
 from pathlib import Path
 from typing import Any, Iterator
@@ -44,16 +46,23 @@ def client(tmp_path: Path) -> Iterator[TestClient]:
 
 
 class FakeSocket:
-    def __init__(self) -> None:
+    def __init__(self, on_send=None) -> None:
         self.messages: list[dict[str, Any]] = []
+        self.on_send = on_send
 
     async def send_json(self, payload: dict[str, Any]) -> None:
         self.messages.append(payload)
+        if self.on_send is None:
+            return
+
+        result = self.on_send(payload)
+        if inspect.isawaitable(result):
+            await result
 
 
-def attach_agent(state: HubState, agent_id: str, remote: str = "127.0.0.1:12345") -> FakeSocket:
+def attach_agent(state: HubState, agent_id: str, remote: str = "127.0.0.1:12345", on_send=None) -> FakeSocket:
     state._register_agent_sync(agent_id, remote)
-    socket = FakeSocket()
+    socket = FakeSocket(on_send=on_send)
     state._connections[agent_id] = socket  # type: ignore[assignment]
     return socket
 
@@ -474,3 +483,183 @@ def test_retry_missing_command_returns_404(client: TestClient) -> None:
     assert response.status_code == 404
     assert response.json() == {"detail": "Command not found"}
 
+
+def test_stream_agent_logs_returns_sse_events(client: TestClient) -> None:
+    import app.main as main_module
+
+    state = main_module.hub_state
+
+    async def on_send(payload: dict[str, Any]) -> None:
+        assert payload["type"] == "logs_start"
+        await state.publish_log_session_event(
+            payload["sessionId"],
+            "started",
+            {"service": payload.get("service"), "tail": payload.get("tail"), "timestamps": payload.get("timestamps")},
+        )
+        await state.publish_log_session_event(
+            payload["sessionId"],
+            "chunk",
+            {"chunk": "line-1\n"},
+        )
+        await state.publish_log_session_event(
+            payload["sessionId"],
+            "finished",
+            {"exitCode": 0, "stopped": False},
+        )
+
+    socket = attach_agent(state, "agent-a", on_send=on_send)
+
+    with client.stream(
+        "POST",
+        "/api/agents/agent-a/logs/stream",
+        headers={
+            "X-Requested-By": "ops-console",
+            "X-Requested-Source": "manual-operation",
+        },
+        json={
+            "dir": "/srv/a",
+            "service": "api",
+            "tail": 20,
+            "timestamps": True,
+        },
+    ) as response:
+        body = "".join(response.iter_text())
+        session_id = response.headers["X-Log-Session-Id"]
+
+    assert response.status_code == 200
+    assert socket.messages == [
+        {
+            "type": "logs_start",
+            "sessionId": session_id,
+            "dir": "/srv/a",
+            "service": "api",
+            "tail": 20,
+            "timestamps": True,
+            "requestedBy": "ops-console",
+            "requestSource": "manual-operation",
+        }
+    ]
+    assert f'"sessionId": "{session_id}"' in body
+    assert "event: started" in body
+    assert "event: chunk" in body
+    assert "event: finished" in body
+    assert '"chunk": "line-1\\n"' in body
+
+
+def test_stream_agent_logs_returns_stream_error_event(client: TestClient) -> None:
+    import app.main as main_module
+
+    state = main_module.hub_state
+
+    async def on_send(payload: dict[str, Any]) -> None:
+        await state.publish_log_session_event(
+            payload["sessionId"],
+            "error",
+            {"error": "No docker-compose.yaml/yml found in /srv/a"},
+        )
+
+    attach_agent(state, "agent-a", on_send=on_send)
+
+    with client.stream(
+        "POST",
+        "/api/agents/agent-a/logs/stream",
+        json={"dir": "/srv/a"},
+    ) as response:
+        body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert "event: error" in body
+    assert '"error": "No docker-compose.yaml/yml found in /srv/a"' in body
+
+
+def test_log_stream_subscriptions_share_upstream_and_stop_on_last_subscriber(client: TestClient) -> None:
+    import app.main as main_module
+
+    state = main_module.hub_state
+
+    session_id, subscriber_one, queue_one, start_payload = asyncio.run(
+        state.subscribe_log_stream(
+            agent_id="agent-a",
+            project_dir="/srv/a",
+            service="api",
+            tail=20,
+            timestamps=True,
+            requested_by="ops-console",
+            request_source="manual-operation",
+        )
+    )
+    shared_session_id, subscriber_two, queue_two, shared_start_payload = asyncio.run(
+        state.subscribe_log_stream(
+            agent_id="agent-a",
+            project_dir="/srv/a",
+            service="api",
+            tail=5,
+            timestamps=True,
+        )
+    )
+
+    assert shared_session_id == session_id
+    assert start_payload == {
+        "type": "logs_start",
+        "sessionId": session_id,
+        "dir": "/srv/a",
+        "service": "api",
+        "tail": 20,
+        "timestamps": True,
+        "requestedBy": "ops-console",
+        "requestSource": "manual-operation",
+    }
+    assert shared_start_payload is None
+
+    asyncio.run(
+        state.publish_log_session_event(
+            session_id,
+            "started",
+            {"service": "api", "tail": 20, "timestamps": True},
+        )
+    )
+    asyncio.run(state.publish_log_session_event(session_id, "chunk", {"chunk": "line-1\n"}))
+    asyncio.run(state.publish_log_session_event(session_id, "chunk", {"chunk": "line-2\n"}))
+
+    replay_session_id, subscriber_three, replay_queue, replay_start_payload = asyncio.run(
+        state.subscribe_log_stream(
+            agent_id="agent-a",
+            project_dir="/srv/a",
+            service="api",
+            tail=1,
+            timestamps=True,
+        )
+    )
+
+    assert replay_session_id == session_id
+    assert replay_start_payload is None
+    assert asyncio.run(queue_one.get()) == {
+        "event": "started",
+        "service": "api",
+        "tail": 20,
+        "timestamps": True,
+    }
+    assert asyncio.run(queue_one.get()) == {"event": "chunk", "chunk": "line-1\n"}
+    assert asyncio.run(queue_one.get()) == {"event": "chunk", "chunk": "line-2\n"}
+    assert asyncio.run(queue_two.get()) == {
+        "event": "started",
+        "service": "api",
+        "tail": 20,
+        "timestamps": True,
+    }
+    assert asyncio.run(queue_two.get()) == {"event": "chunk", "chunk": "line-1\n"}
+    assert asyncio.run(queue_two.get()) == {"event": "chunk", "chunk": "line-2\n"}
+    assert asyncio.run(replay_queue.get()) == {
+        "event": "started",
+        "service": "api",
+        "tail": 20,
+        "timestamps": True,
+    }
+    assert asyncio.run(replay_queue.get()) == {"event": "chunk", "chunk": "line-2\n"}
+
+    assert asyncio.run(state.unsubscribe_log_stream(subscriber_one)) is None
+    assert asyncio.run(state.unsubscribe_log_stream(subscriber_two)) is None
+    assert asyncio.run(state.unsubscribe_log_stream(subscriber_three)) == {
+        "agent_id": "agent-a",
+        "session_id": session_id,
+    }

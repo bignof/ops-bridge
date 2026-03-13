@@ -254,6 +254,57 @@ async def _handle_agent_message(agent_id: str, payload: dict[str, Any]) -> None:
             )
         return
 
+    if msg_type == "logs_started":
+        session_id = payload.get("sessionId")
+        if session_id:
+            await main_module.hub_state.publish_log_session_event(
+                session_id,
+                "started",
+                {
+                    "service": payload.get("service"),
+                    "tail": payload.get("tail"),
+                    "timestamps": payload.get("timestamps"),
+                },
+            )
+        return
+
+    if msg_type == "logs_chunk":
+        session_id = payload.get("sessionId")
+        if session_id:
+            await main_module.hub_state.publish_log_session_event(
+                session_id,
+                "chunk",
+                {
+                    "chunk": payload.get("chunk", ""),
+                },
+            )
+        return
+
+    if msg_type == "logs_finished":
+        session_id = payload.get("sessionId")
+        if session_id:
+            await main_module.hub_state.publish_log_session_event(
+                session_id,
+                "finished",
+                {
+                    "exitCode": payload.get("exitCode"),
+                    "stopped": payload.get("stopped", False),
+                },
+            )
+        return
+
+    if msg_type == "logs_error":
+        session_id = payload.get("sessionId")
+        if session_id:
+            await main_module.hub_state.publish_log_session_event(
+                session_id,
+                "error",
+                {
+                    "error": payload.get("error", "Unknown log stream error"),
+                },
+            )
+        return
+
     if msg_type == "pong":
         return
 

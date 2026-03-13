@@ -81,3 +81,16 @@ def run_compose(project_dir, args):
     cmd = _get_compose_cmd() + args
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, cwd=project_dir)
     return result.returncode == 0, result.stdout + result.stderr
+
+
+def open_compose_process(project_dir, args):
+    """在 project_dir 下启动 compose 子进程，适合持续输出场景。"""
+    cmd = _get_compose_cmd() + args
+    return subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        cwd=project_dir,
+        bufsize=1,
+    )

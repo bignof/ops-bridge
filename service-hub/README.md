@@ -8,6 +8,7 @@ service-hub 是面向平台侧的控制服务，负责接收 service-agent 的 W
 - 记录 agent 的连接时间、最后心跳时间、最后一次 pong 时间和在线状态
 - 提供 HTTP API 给其他服务查询 agent 存活情况
 - 提供 HTTP API 给其他服务向指定 agent 下发 `update` / `restart` 指令
+- 提供 HTTP API 通过指定 agent 打开 `docker compose logs -f --tail N` 的实时日志流
 - 跟踪每个 `requestId` 的处理状态：`queued`、`processing`、`success`、`failed`
 - Agent 状态接口会汇总当前 `queued` / `processing` 命令数，便于观察等待和执行中的任务
 - V2 第一阶段已支持命令、审计事件和 Agent 最新状态持久化
@@ -136,6 +137,12 @@ POST /api/agents/{agentId}/commands
 POST /api/commands/{requestId}/retry
 ```
 
+#### 日志流
+
+```http
+POST /api/agents/{agentId}/logs/stream
+```
+
 当前公开 API 默认只围绕 `agent` 和 `command` 两类资源扩展。若后续需求无法自然归入这两个资源，应先回到 `docs/API_GOVERNANCE.md` 评估，而不是直接增加新顶级接口。
 
 ## 说明
@@ -148,6 +155,8 @@ POST /api/commands/{requestId}/retry
 - Agent 的在线判定依据仍然是连接未断开且最近一次消息时间未超过 `HEARTBEAT_TIMEOUT`
 - Agent 状态快照会返回 `queuedCommands`、`processingCommands` 和 `lastCommandCreatedAt`，用于观测当前控制面负载
 - 命令查询支持按 `createdAt` / `updatedAt` 排序，并支持失败命令的重试下发
+- 日志流接口返回 `text/event-stream`；相同 `agent + dir + service + timestamps` 的并发查看会共享一条上游 `docker compose logs -f`，直到最后一个订阅者断开才停止
+- 日志流会话当前只保存在内存中，不写入命令历史，也不会跨 Hub 重启恢复
 - HTTP 路由已按 `system` / `agent` / `command` / `websocket` 拆分到 `app/routers/`，`app/main.py` 只负责应用装配和导出兼容层
 - `docker-compose.yml` 已改为拉取镜像部署，并内置 `/health` 容器健康检查
 
