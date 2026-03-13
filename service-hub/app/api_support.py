@@ -261,7 +261,6 @@ async def _handle_agent_message(agent_id: str, payload: dict[str, Any]) -> None:
                 session_id,
                 "started",
                 {
-                    "service": payload.get("service"),
                     "tail": payload.get("tail"),
                     "timestamps": payload.get("timestamps"),
                 },

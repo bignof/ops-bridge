@@ -155,7 +155,7 @@ POST /api/agents/{agentId}/logs/stream
 - Agent 的在线判定依据仍然是连接未断开且最近一次消息时间未超过 `HEARTBEAT_TIMEOUT`
 - Agent 状态快照会返回 `queuedCommands`、`processingCommands` 和 `lastCommandCreatedAt`，用于观测当前控制面负载
 - 命令查询支持按 `createdAt` / `updatedAt` 排序，并支持失败命令的重试下发
-- 日志流接口返回 `text/event-stream`；相同 `agent + dir + service + timestamps` 的并发查看会共享一条上游 `docker compose logs -f`，直到最后一个订阅者断开才停止
+- 日志流接口返回 `text/event-stream`；相同 `agent + dir + timestamps` 的并发查看会共享一条上游 `docker compose logs -f`，直到最后一个订阅者断开才停止
 - 日志流会话当前只保存在内存中，不写入命令历史，也不会跨 Hub 重启恢复
 - HTTP 路由已按 `system` / `agent` / `command` / `websocket` 拆分到 `app/routers/`，`app/main.py` 只负责应用装配和导出兼容层
 - `docker-compose.yml` 已改为拉取镜像部署，并内置 `/health` 容器健康检查

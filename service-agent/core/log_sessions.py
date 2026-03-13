@@ -75,12 +75,10 @@ def stop_log_session(data: dict[str, Any]) -> None:
     _stop_process(process)
 
 
-def _stream_logs(ws, *, session_id: str, project_dir: str, service: str | None, tail: int, timestamps: bool) -> None:
+def _stream_logs(ws, *, session_id: str, project_dir: str, tail: int, timestamps: bool) -> None:
     args = ["logs", "-f", "--tail", str(tail)]
     if timestamps:
         args.append("--timestamps")
-    if service:
-        args.append(service)
 
     try:
         process = open_compose_process(project_dir, args)
@@ -95,7 +93,6 @@ def _stream_logs(ws, *, session_id: str, project_dir: str, service: str | None, 
         {
             "type": "logs_started",
             "sessionId": session_id,
-            "service": service,
             "tail": tail,
             "timestamps": timestamps,
         },
@@ -148,7 +145,6 @@ def _stream_logs(ws, *, session_id: str, project_dir: str, service: str | None, 
 def start_log_session(ws, data: dict[str, Any]) -> None:
     session_id = str(data.get("sessionId") or "").strip()
     project_dir = data.get("dir")
-    service = str(data.get("service") or "").strip() or None
     tail = data.get("tail", 200)
     timestamps = bool(data.get("timestamps", False))
 
@@ -174,10 +170,9 @@ def start_log_session(ws, data: dict[str, Any]) -> None:
         return
 
     logger.info(
-        "Starting log session: session_id=%s, dir=%s, service=%s, tail=%s, timestamps=%s",
+        "Starting log session: session_id=%s, dir=%s, tail=%s, timestamps=%s",
         session_id,
         project_dir,
-        service,
         tail_value,
         timestamps,
     )
@@ -187,7 +182,6 @@ def start_log_session(ws, data: dict[str, Any]) -> None:
             "ws": ws,
             "session_id": session_id,
             "project_dir": project_dir,
-            "service": service,
             "tail": tail_value,
             "timestamps": timestamps,
         },

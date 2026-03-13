@@ -134,7 +134,6 @@ def test_start_log_session_streams_chunks_and_finishes(monkeypatch: pytest.Monke
         {
             "sessionId": "logs-4",
             "dir": "/srv/a",
-            "service": "api",
             "tail": 20,
             "timestamps": True,
         },
@@ -144,7 +143,6 @@ def test_start_log_session_streams_chunks_and_finishes(monkeypatch: pytest.Monke
     assert decoded[0] == {
         "type": "logs_started",
         "sessionId": "logs-4",
-        "service": "api",
         "tail": 20,
         "timestamps": True,
     }
@@ -252,7 +250,6 @@ def test_stream_logs_reports_runtime_errors_and_cleans_session(monkeypatch: pyte
         ws,
         session_id="logs-9",
         project_dir="/srv/a",
-        service=None,
         tail=5,
         timestamps=False,
     )
@@ -261,7 +258,6 @@ def test_stream_logs_reports_runtime_errors_and_cleans_session(monkeypatch: pyte
     assert decoded[0] == {
         "type": "logs_started",
         "sessionId": "logs-9",
-        "service": None,
         "tail": 5,
         "timestamps": False,
     }
@@ -284,7 +280,6 @@ def test_stream_logs_breaks_cleanly_when_stdout_returns_empty_like_values(monkey
         ws,
         session_id="logs-10",
         project_dir="/srv/a",
-        service=None,
         tail=3,
         timestamps=False,
     )
@@ -293,7 +288,6 @@ def test_stream_logs_breaks_cleanly_when_stdout_returns_empty_like_values(monkey
     assert decoded[0] == {
         "type": "logs_started",
         "sessionId": "logs-10",
-        "service": None,
         "tail": 3,
         "timestamps": False,
     }

@@ -17,7 +17,6 @@ TEST_ROOT = os.getenv("LOGS_E2E_TEST_ROOT", "/tmp/service-hub-logs-e2e")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "logs-e2e-admin-token")
 AGENT_ID = os.getenv("AGENT_ID", "logs-e2e-agent")
 MANAGED_DIR = "/data/logs-app"
-SERVICE_NAME = "app"
 LOG_MARKER = "log-pulse-"
 REQUESTED_BY = "logs-e2e"
 REQUEST_SOURCE = "logs-stream-validation"
@@ -258,7 +257,6 @@ def stream_logs() -> dict:
     body_json = json.dumps(
         {
             "dir": MANAGED_DIR,
-            "service": SERVICE_NAME,
             "tail": 1,
             "timestamps": False,
         },
@@ -338,8 +336,6 @@ def assert_stream_result(stream_result: dict, agent_logs: str) -> None:
 
     started_event = next((event for event in events if event.get("event") == "started"), None)
     started_payload = started_event["data"] if started_event is not None else {}
-    if started_payload.get("service") != SERVICE_NAME:
-        raise RuntimeError(f"log stream started with an unexpected service: {stream_result}")
     if started_payload.get("tail") != 1:
         raise RuntimeError(f"log stream started with an unexpected tail value: {stream_result}")
 

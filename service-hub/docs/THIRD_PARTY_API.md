@@ -160,7 +160,6 @@ curl -X POST "http://<service-hub-host>:8080/api/agents" \
 ```json
 {
   "dir": "/data/dev/admin",
-  "service": "web",
   "tail": 200,
   "timestamps": false
 }
@@ -169,7 +168,6 @@ curl -X POST "http://<service-hub-host>:8080/api/agents" \
 说明：
 
 - `dir`：compose 文件所在目录的宿主机绝对路径
-- `service`：可选，指定单个 compose service；不传则输出整个项目日志
 - `tail`：启动时先补发的最近日志行数，范围 `1` 到 `2000`
 - `timestamps`：是否追加 `docker compose logs --timestamps`
 
@@ -365,7 +363,6 @@ Accept: text/event-stream
 
 {
   "dir": "/data/dev/admin",
-  "service": "web",
   "tail": 200,
   "timestamps": true
 }
@@ -378,7 +375,7 @@ Accept: text/event-stream
 
 并发行为：
 
-- 相同 `agentId + dir + service + timestamps` 的并发请求会共享一条上游日志流
+- 相同 `agentId + dir + timestamps` 的并发请求会共享一条上游日志流
 - 新加入的订阅者会收到当前共享流的 `started` 事件，以及该共享流在内存里保留的最近一段日志块
 - 只有最后一个订阅者断开时，Hub 才会向 Agent 发送 `logs_stop`
 
@@ -388,7 +385,7 @@ SSE 事件：
 
 ```text
 event: started
-data: {"sessionId":"1d8f...","agentId":"prod-server-01","service":"web","tail":200,"timestamps":true}
+data: {"sessionId":"1d8f...","agentId":"prod-server-01","tail":200,"timestamps":true}
 ```
 
 `chunk`

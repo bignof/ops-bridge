@@ -494,7 +494,7 @@ def test_stream_agent_logs_returns_sse_events(client: TestClient) -> None:
         await state.publish_log_session_event(
             payload["sessionId"],
             "started",
-            {"service": payload.get("service"), "tail": payload.get("tail"), "timestamps": payload.get("timestamps")},
+            {"tail": payload.get("tail"), "timestamps": payload.get("timestamps")},
         )
         await state.publish_log_session_event(
             payload["sessionId"],
@@ -518,7 +518,6 @@ def test_stream_agent_logs_returns_sse_events(client: TestClient) -> None:
         },
         json={
             "dir": "/srv/a",
-            "service": "api",
             "tail": 20,
             "timestamps": True,
         },
@@ -532,7 +531,6 @@ def test_stream_agent_logs_returns_sse_events(client: TestClient) -> None:
             "type": "logs_start",
             "sessionId": session_id,
             "dir": "/srv/a",
-            "service": "api",
             "tail": 20,
             "timestamps": True,
             "requestedBy": "ops-console",
@@ -581,7 +579,6 @@ def test_log_stream_subscriptions_share_upstream_and_stop_on_last_subscriber(cli
         state.subscribe_log_stream(
             agent_id="agent-a",
             project_dir="/srv/a",
-            service="api",
             tail=20,
             timestamps=True,
             requested_by="ops-console",
@@ -592,7 +589,6 @@ def test_log_stream_subscriptions_share_upstream_and_stop_on_last_subscriber(cli
         state.subscribe_log_stream(
             agent_id="agent-a",
             project_dir="/srv/a",
-            service="api",
             tail=5,
             timestamps=True,
         )
@@ -603,7 +599,6 @@ def test_log_stream_subscriptions_share_upstream_and_stop_on_last_subscriber(cli
         "type": "logs_start",
         "sessionId": session_id,
         "dir": "/srv/a",
-        "service": "api",
         "tail": 20,
         "timestamps": True,
         "requestedBy": "ops-console",
@@ -615,7 +610,7 @@ def test_log_stream_subscriptions_share_upstream_and_stop_on_last_subscriber(cli
         state.publish_log_session_event(
             session_id,
             "started",
-            {"service": "api", "tail": 20, "timestamps": True},
+            {"tail": 20, "timestamps": True},
         )
     )
     asyncio.run(state.publish_log_session_event(session_id, "chunk", {"chunk": "line-1\n"}))
@@ -625,7 +620,6 @@ def test_log_stream_subscriptions_share_upstream_and_stop_on_last_subscriber(cli
         state.subscribe_log_stream(
             agent_id="agent-a",
             project_dir="/srv/a",
-            service="api",
             tail=1,
             timestamps=True,
         )
@@ -635,7 +629,6 @@ def test_log_stream_subscriptions_share_upstream_and_stop_on_last_subscriber(cli
     assert replay_start_payload is None
     assert asyncio.run(queue_one.get()) == {
         "event": "started",
-        "service": "api",
         "tail": 20,
         "timestamps": True,
     }
@@ -643,7 +636,6 @@ def test_log_stream_subscriptions_share_upstream_and_stop_on_last_subscriber(cli
     assert asyncio.run(queue_one.get()) == {"event": "chunk", "chunk": "line-2\n"}
     assert asyncio.run(queue_two.get()) == {
         "event": "started",
-        "service": "api",
         "tail": 20,
         "timestamps": True,
     }
@@ -651,7 +643,6 @@ def test_log_stream_subscriptions_share_upstream_and_stop_on_last_subscriber(cli
     assert asyncio.run(queue_two.get()) == {"event": "chunk", "chunk": "line-2\n"}
     assert asyncio.run(replay_queue.get()) == {
         "event": "started",
-        "service": "api",
         "tail": 20,
         "timestamps": True,
     }

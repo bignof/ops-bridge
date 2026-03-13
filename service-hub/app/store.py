@@ -45,10 +45,9 @@ def _loads_payload(value: str) -> dict[str, Any]:
 def _log_stream_key(
     agent_id: str,
     project_dir: str,
-    service: str | None,
     timestamps: bool,
-) -> tuple[str, str, str | None, bool]:
-    return (agent_id, project_dir, service, timestamps)
+) -> tuple[str, str, bool]:
+    return (agent_id, project_dir, timestamps)
 
 
 def _agent_to_dict(record: AgentModel) -> dict[str, Any]:
@@ -145,7 +144,7 @@ class HubState:
         self.database = database
         self._connections: dict[str, WebSocket] = {}
         self._log_streams_by_session: dict[str, dict[str, Any]] = {}
-        self._log_streams_by_key: dict[tuple[str, str, str | None, bool], str] = {}
+        self._log_streams_by_key: dict[tuple[str, str, bool], str] = {}
         self._log_subscribers: dict[str, str] = {}
         self._lock = asyncio.Lock()
 
@@ -203,14 +202,13 @@ class HubState:
         *,
         agent_id: str,
         project_dir: str,
-        service: str | None,
         tail: int,
         timestamps: bool,
         requested_by: str | None = None,
         request_source: str | None = None,
     ) -> tuple[str, str, asyncio.Queue[dict[str, Any]], dict[str, Any] | None]:
         session_id: str | None = None
-        stream_key = _log_stream_key(agent_id, project_dir, service, timestamps)
+        stream_key = _log_stream_key(agent_id, project_dir, timestamps)
         subscriber_id = str(uuid4())
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         start_payload: dict[str, Any] | None = None
@@ -228,7 +226,6 @@ class HubState:
                     "agent_id": agent_id,
                     "stream_key": stream_key,
                     "project_dir": project_dir,
-                    "service": service,
                     "timestamps": timestamps,
                     "started_event": None,
                     "recent_chunks": deque(maxlen=LOG_STREAM_REPLAY_LIMIT),
@@ -244,8 +241,6 @@ class HubState:
                     "tail": tail,
                     "timestamps": timestamps,
                 }
-                if service:
-                    start_payload["service"] = service
                 if requested_by:
                     start_payload["requestedBy"] = requested_by
                 if request_source:

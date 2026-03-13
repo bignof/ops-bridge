@@ -43,7 +43,6 @@ async def stream_agent_logs(
     session_id, subscriber_id, queue, start_payload = await main_module.hub_state.subscribe_log_stream(
         agent_id=agent_id,
         project_dir=request.dir,
-        service=request.service,
         tail=request.tail,
         timestamps=request.timestamps,
         requested_by=requested_by,

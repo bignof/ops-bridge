@@ -49,7 +49,6 @@ class AgentLogsStreamRequest(BaseModel):
     model_config = ConfigDict(title="流式日志请求")
 
     dir: str = Field(title="目标目录")
-    service: str | None = Field(default=None, title="服务名")
     tail: int = Field(default=200, ge=1, le=2000, title="最近日志行数")
     timestamps: bool = Field(default=False, title="是否包含时间戳")
 

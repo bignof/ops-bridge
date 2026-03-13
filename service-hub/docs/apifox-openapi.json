@@ -727,6 +727,95 @@
           }
         }
       }
+    },
+    "/api/agents/{agent_id}/logs/stream": {
+      "post": {
+        "tags": [
+          "日志流"
+        ],
+        "summary": "流式查看服务日志",
+        "description": "通过指定 Agent 打开 docker compose logs -f --tail N 的实时日志流。",
+        "operationId": "stream_agent_logs_api_agents__agent_id__logs_stream_post",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Agent 标识",
+              "description": "要查看日志的 Agent 唯一标识。"
+            },
+            "description": "要查看日志的 Agent 唯一标识。"
+          },
+          {
+            "name": "X-Requested-By",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "请求发起方",
+              "description": "调用该接口的系统或用户标识。"
+            },
+            "description": "调用该接口的系统或用户标识。"
+          },
+          {
+            "name": "X-Requested-Source",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "请求来源",
+              "description": "调用来源，例如控制台、调度器。"
+            },
+            "description": "调用来源，例如控制台、调度器。"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentLogsStreamRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "请求成功",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "请求校验失败",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -760,6 +849,31 @@
           "created"
         ],
         "title": "Agent 凭据响应"
+      },
+      "AgentLogsStreamRequest": {
+        "properties": {
+          "dir": {
+            "type": "string",
+            "title": "目标目录"
+          },
+          "tail": {
+            "type": "integer",
+            "maximum": 2000.0,
+            "minimum": 1.0,
+            "title": "最近日志行数",
+            "default": 200
+          },
+          "timestamps": {
+            "type": "boolean",
+            "title": "是否包含时间戳",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "dir"
+        ],
+        "title": "流式日志请求"
       },
       "AgentProvisionRequest": {
         "properties": {
@@ -1299,6 +1413,10 @@
     {
       "name": "命令管理",
       "description": "命令查询、下发、重试与审计接口。"
+    },
+    {
+      "name": "日志流",
+      "description": "通过 Agent 实时查看 docker compose 日志。"
     }
   ]
 }

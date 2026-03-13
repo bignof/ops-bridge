@@ -119,7 +119,6 @@ INFO - Health server listening on http://0.0.0.0:18081/health
   "type": "logs_start",
   "sessionId": "log-123",
   "dir": "/data/dev/admin",
-  "service": "web",
   "tail": 200,
   "timestamps": true
 }
@@ -130,7 +129,6 @@ INFO - Health server listening on http://0.0.0.0:18081/health
 | `type`       | string  | ✅   | `logs_start` 或 `logs_stop` |
 | `sessionId`  | string  | ✅   | 日志会话唯一 ID，由 Hub 生成 |
 | `dir`        | string  | ✅   | compose 文件所在目录的宿主机绝对路径 |
-| `service`    | string  | 否   | 可选，指定单个 compose service |
 | `tail`       | integer | 否   | 启动时先输出最近多少行，默认 `200` |
 | `timestamps` | boolean | 否   | 是否追加 `docker compose logs --timestamps` |
 
@@ -175,7 +173,6 @@ INFO - Health server listening on http://0.0.0.0:18081/health
 {
   "type": "logs_started",
   "sessionId": "log-123",
-  "service": "web",
   "tail": 200,
   "timestamps": true
 }
