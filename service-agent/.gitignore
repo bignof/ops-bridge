@@ -1,0 +1,11 @@
+.env
+.venv/
+.vscode/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+SERVICE_HUB_INTEGRATION.md

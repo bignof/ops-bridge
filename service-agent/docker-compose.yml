@@ -1,0 +1,35 @@
+services:
+  service-agent:
+    image: ${SERVICE_AGENT_IMAGE:?SERVICE_AGENT_IMAGE is required}
+    pull_policy: always
+    container_name: ${SERVICE_AGENT_CONTAINER_NAME:-service-agent}
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      WS_URL: ${WS_URL:?WS_URL is required}
+      AGENT_ID: ${AGENT_ID:-}
+      AGENT_KEY: ${AGENT_KEY:?AGENT_KEY is required}
+      RECONNECT_DELAY: ${RECONNECT_DELAY:-5}
+      HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL:-30}
+      HEALTH_HOST: ${HEALTH_HOST:-0.0.0.0}
+      HEALTH_PORT: ${HEALTH_PORT:-18081}
+    volumes:
+      - ${HOST_DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
+      - ${MANAGED_PROJECTS_ROOT:-/data}:/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:${HEALTH_PORT:-18081}/health', timeout=3).status == 200 else 1)\"",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
