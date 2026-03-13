@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 
 MYSQL_CONTAINER = os.getenv("MYSQL_CONTAINER", "mysql8")
@@ -16,6 +17,7 @@ TEST_ROOT = os.getenv("TEST_ROOT", "/tmp/orchidea-v2-mysql-host")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "local-test-admin-token")
 AGENT_ID = os.getenv("AGENT_ID", "v2-mysql-agent")
 WS_URL = os.getenv("WS_URL", "ws://127.0.0.1:8080/ws/agent")
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -32,6 +34,14 @@ def docker(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
 
 def bash(script: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return wsl("bash", "-lc", script, check=check)
+
+
+def repo_path(path: Path) -> str:
+    drive = path.drive.rstrip(":").lower()
+    if not drive:
+        return str(path).replace("\\", "/")
+    suffix = str(path)[2:].lstrip("\\/").replace("\\", "/")
+    return f"/mnt/{drive}/{suffix}"
 
 
 def docker_exec_python(container: str, source: str) -> str:
@@ -129,8 +139,8 @@ def prepare_target_compose() -> None:
 
 
 def build_images() -> None:
-    hub_root = "/mnt/c/Users/bigno/Documents/work/orchisky/src/orchidea/service-hub"
-    agent_root = "/mnt/c/Users/bigno/Documents/work/orchisky/src/orchidea/service-agent"
+    hub_root = repo_path(REPO_ROOT / "service-hub")
+    agent_root = repo_path(REPO_ROOT / "service-agent")
     bash(
         f"cd {hub_root} && docker build -t service-hub:v2-mysql-e2e . >/tmp/service-hub-v2-mysql-e2e.log && "
         f"cd {agent_root} && docker build -t service-agent:v2-mysql-e2e . >/tmp/service-agent-v2-mysql-e2e.log"

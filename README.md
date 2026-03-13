@@ -73,6 +73,7 @@ docker build -t orchidea/service-agent:local ./service-agent
 
 - [架构说明](docs/ARCHITECTURE.md)
 - [一期范围整理](docs/PHASE1_BASELINE.md)
+- [一期验收清单](docs/PHASE1_ACCEPTANCE.md)
 - [后续路线规划](docs/ROADMAP.md)
 - [Service Hub 操作说明](service-hub/README.md)
 - [Service Hub API 文档](service-hub/docs/THIRD_PARTY_API.md)
@@ -84,4 +85,4 @@ docker build -t orchidea/service-agent:local ./service-agent
 
 1. 抽一层共享协议模型，减少 Agent / Hub 对消息结构的重复维护。
 2. 把发布流程里的镜像命名和环境变量约定固化下来。
-3. 补齐一期验收清单和跨服务联调脚本。
+3. 把命令失败结果整理得更清楚，减少排障时依赖字符串搜索日志。
