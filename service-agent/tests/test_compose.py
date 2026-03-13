@@ -23,6 +23,15 @@ def test_get_compose_cmd_raises_when_v2_unavailable(monkeypatch: pytest.MonkeyPa
         compose.get_compose_cmd()
 
 
+def test_get_cached_compose_cmd_populates_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    compose._compose_cmd = None
+    monkeypatch.setattr(compose, "get_compose_cmd", lambda: ["docker", "compose"])
+
+    assert compose._get_compose_cmd() == ["docker", "compose"]
+    assert compose._compose_cmd == ["docker", "compose"]
+    compose._compose_cmd = None
+
+
 def test_find_compose_file_and_update_image(tmp_path: Path) -> None:
     compose_file = tmp_path / "docker-compose.yml"
     compose_file.write_text(
@@ -49,6 +58,10 @@ def test_find_compose_file_and_update_image(tmp_path: Path) -> None:
     assert content["services"]["api"]["image"] == "repo/app:9.9"
     assert content["services"]["worker"]["image"] == "repo/app:9.9"
     assert content["services"]["other"]["image"] == "another/image:1"
+
+
+def test_find_compose_file_returns_none_when_absent(tmp_path: Path) -> None:
+    assert compose.find_compose_file(str(tmp_path)) is None
 
 
 def test_read_and_restore_compose_file_round_trip(tmp_path: Path) -> None:
