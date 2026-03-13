@@ -1,5 +1,6 @@
 import importlib
 import sys
+from datetime import datetime
 
 import pytest
 
@@ -45,3 +46,20 @@ def test_config_requires_ws_url(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_config_requires_agent_key(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(SystemExit, match="AGENT_KEY is not set"):
         _import_config(monkeypatch, AGENT_KEY="")
+
+
+def test_china_time_formatter_respects_datefmt(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _import_config(monkeypatch)
+    formatter = config.ChinaTimeFormatter("%(asctime)s", "%Y-%m-%d %H:%M:%S")
+    record = pytest.importorskip("logging").LogRecord(
+        name="test",
+        level=20,
+        pathname=__file__,
+        lineno=1,
+        msg="hello",
+        args=(),
+        exc_info=None,
+    )
+    record.created = datetime(2026, 3, 13, 7, 30, 0, tzinfo=config.timezone.utc).timestamp()
+
+    assert formatter.formatTime(record, "%Y-%m-%d %H:%M:%S") == "2026-03-13 15:30:00"
