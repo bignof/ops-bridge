@@ -63,3 +63,17 @@ def test_china_time_formatter_respects_datefmt(monkeypatch: pytest.MonkeyPatch) 
     record.created = datetime(2026, 3, 13, 7, 30, 0, tzinfo=config.timezone.utc).timestamp()
 
     assert formatter.formatTime(record, "%Y-%m-%d %H:%M:%S") == "2026-03-13 15:30:00"
+
+
+def test_nacos_defaults(monkeypatch):
+    monkeypatch.setenv("WS_URL", "ws://x")
+    monkeypatch.setenv("AGENT_KEY", "k")
+    for v in ("NACOS_SERVER", "NACOS_NAMESPACE", "NACOS_USERNAME", "NACOS_PASSWORD"):
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.delenv("NACOS_GROUP", raising=False)
+    monkeypatch.delenv("NACOS_CONTEXT_PATH", raising=False)
+    import importlib, config
+    importlib.reload(config)
+    assert config.NACOS_SERVER == ""
+    assert config.NACOS_GROUP == "DEFAULT_GROUP"
+    assert config.NACOS_CONTEXT_PATH == "/nacos"

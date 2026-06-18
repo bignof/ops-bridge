@@ -12,7 +12,7 @@ def test_init_schema_stamps_fully_initialized_legacy_schema(monkeypatch: pytest.
 
     class Inspector:
         def get_table_names(self) -> list[str]:
-            return ["agents", "commands", "command_events"]
+            return ["agents", "commands", "command_events", "rolling_tasks"]
 
     monkeypatch.setattr("app.db.inspect", lambda engine: Inspector())
     monkeypatch.setattr("app.db.command.stamp", lambda config, revision: stamp_calls.append((config, revision)))

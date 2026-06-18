@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 from datetime import datetime
@@ -170,7 +171,8 @@ def _require_admin_token(admin_token: str | None) -> None:
 
     if not main_module.settings.admin_token:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Admin token is not configured")
-    if admin_token != main_module.settings.admin_token:
+    # 常量时间比较防时序侧信道;not admin_token 短路必要(compare_digest 收 None 会 TypeError)
+    if not admin_token or not hmac.compare_digest(admin_token, main_module.settings.admin_token):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid admin token")
 
 
@@ -252,6 +254,12 @@ async def _handle_agent_message(agent_id: str, payload: dict[str, Any]) -> None:
                 message=payload.get("message"),
                 error=payload.get("error"),
             )
+        return
+
+    if msg_type in ("list-instances-result", "graceful-restart-result"):
+        request_id = payload.get("requestId")
+        if request_id:
+            await main_module.hub_state.resolve_pending(request_id, payload)
         return
 
     if msg_type == "logs_started":

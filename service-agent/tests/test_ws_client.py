@@ -83,6 +83,33 @@ def test_on_message_dispatches_commands_and_ping(monkeypatch: pytest.MonkeyPatch
     assert state["last_message_ts"] == 456.0
 
 
+def test_on_message_routes_rolling(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _import_ws_client(monkeypatch)
+    calls: list[tuple[str, dict]] = []
+
+    # ws_client 通过 `from core.rolling import ...` 绑定了本地名,monkeypatch 必须打在
+    # ws_client 模块上(打 core.rolling 改不到已绑定引用)。
+    monkeypatch.setattr(module, "handle_list_instances", lambda ws, data: calls.append(("list", data)))
+    monkeypatch.setattr(module, "handle_graceful_restart", lambda ws, data: calls.append(("gr", data)))
+
+    class ImmediateThread:
+        def __init__(self, target, args, daemon):
+            self.target = target
+            self.args = args
+
+        def start(self) -> None:
+            self.target(*self.args)
+
+    monkeypatch.setattr(module.threading, "Thread", ImmediateThread)
+
+    module._on_message(None, '{"type":"list-instances","requestId":"r1","serviceName":"s"}')
+    module._on_message(None, '{"type":"graceful-restart","requestId":"g1","containerId":"c"}')
+
+    assert [c[0] for c in calls] == ["list", "gr"]
+    assert calls[0][1]["serviceName"] == "s"
+    assert calls[1][1]["containerId"] == "c"
+
+
 def test_start_heartbeat_sends_periodic_messages(monkeypatch: pytest.MonkeyPatch) -> None:
     module = _import_ws_client(monkeypatch)
     sent_messages: list[dict] = []

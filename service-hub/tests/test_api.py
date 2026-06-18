@@ -225,6 +225,7 @@ def test_dispatch_command_creates_record_and_returns_expected_payload(client: Te
     response = client.post(
         "/api/agents/agent-a/commands",
         headers={
+            "X-Admin-Token": "test-admin-token",
             "X-Requested-By": "platform-api",
             "X-Requested-Source": "ops-console",
         },
@@ -246,6 +247,20 @@ def test_dispatch_command_creates_record_and_returns_expected_payload(client: Te
     get_response = client.get("/api/commands/req-dispatch-1")
     assert get_response.status_code == 200
     assert get_response.json()["requestId"] == "req-dispatch-1"
+
+
+def test_dispatch_requires_admin_token(client: TestClient) -> None:
+    response = client.post(
+        "/api/agents/agent-a/commands",
+        json={
+            "requestId": "req-no-token",
+            "action": "restart",
+            "dir": "/srv/a",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid admin token"
 
 
 def test_dispatch_update_without_image_returns_422(client: TestClient) -> None:
@@ -274,6 +289,7 @@ def test_dispatch_command_to_offline_agent_returns_409(client: TestClient) -> No
 
     response = client.post(
         "/api/agents/agent-a/commands",
+        headers={"X-Admin-Token": "test-admin-token"},
         json={
             "requestId": "req-offline-1",
             "action": "restart",
@@ -446,6 +462,7 @@ def test_retry_failed_command_creates_new_command_and_audit_event(client: TestCl
     response = client.post(
         "/api/commands/req-1/retry",
         headers={
+            "X-Admin-Token": "test-admin-token",
             "X-Requested-By": "platform-api",
             "X-Requested-Source": "ops-console",
         },
@@ -471,14 +488,20 @@ def test_retry_non_failed_command_returns_409(client: TestClient) -> None:
     asyncio.run(state.store_command("agent-a", {"type": "command", "requestId": "req-ok", "action": "restart", "dir": "/srv/a"}))
     asyncio.run(state.mark_result("req-ok", "success", message="done"))
 
-    response = client.post("/api/commands/req-ok/retry")
+    response = client.post(
+        "/api/commands/req-ok/retry",
+        headers={"X-Admin-Token": "test-admin-token"},
+    )
 
     assert response.status_code == 409
     assert response.json() == {"detail": "Only failed commands can be retried"}
 
 
 def test_retry_missing_command_returns_404(client: TestClient) -> None:
-    response = client.post("/api/commands/missing/retry")
+    response = client.post(
+        "/api/commands/missing/retry",
+        headers={"X-Admin-Token": "test-admin-token"},
+    )
 
     assert response.status_code == 404
     assert response.json() == {"detail": "Command not found"}
@@ -568,6 +591,106 @@ def test_stream_agent_logs_returns_stream_error_event(client: TestClient) -> Non
     assert response.status_code == 200
     assert "event: error" in body
     assert '"error": "No docker-compose.yaml/yml found in /srv/a"' in body
+
+
+def test_rolling_router_mounted(client: TestClient) -> None:
+    # 未带 token 返回 403 而非 404,证明路由已注册
+    resp = client.post("/api/rolling-restart", json={"agentId": "a", "serviceName": "s"})
+    assert resp.status_code == 403
+
+
+def test_rolling_restart_returns_task_id(client: TestClient) -> None:
+    resp = client.post(
+        "/api/rolling-restart",
+        json={"agentId": "a", "serviceName": "s"},
+        headers={"X-Admin-Token": "test-admin-token"},
+    )
+    assert resp.status_code == 200
+    assert "taskId" in resp.json()
+    # 后台编排会因无在线 agent 很快 finish,此处只验端点契约
+
+
+def test_rolling_status_404_unknown(client: TestClient) -> None:
+    resp = client.get("/api/rolling-restart/nope", headers={"X-Admin-Token": "test-admin-token"})
+    assert resp.status_code == 404
+
+
+def test_rolling_restart_conflict_returns_409(client: TestClient) -> None:
+    # L3: 先占锁(running),再对同 (agent,service) 发滚动 → 409
+    # (冲突在 create_rolling_task 抛出,早于后台任务,天然规避 flaky)
+    import app.main as main_module
+
+    state = main_module.hub_state
+    asyncio.run(state.create_rolling_task("task-occupied", "agent-a", "svc", False))
+
+    resp = client.post(
+        "/api/rolling-restart",
+        json={"agentId": "agent-a", "serviceName": "svc"},
+        headers={"X-Admin-Token": "test-admin-token"},
+    )
+    assert resp.status_code == 409
+
+
+def test_rolling_acknowledge_requires_admin_token(client: TestClient) -> None:
+    # 不带 token → 403(鉴权在端点首行)
+    resp = client.post("/api/rolling-restart/whatever/acknowledge")
+    assert resp.status_code == 403
+    assert resp.json() == {"detail": "Invalid admin token"}
+
+
+def test_rolling_acknowledge_unknown_task_returns_404(client: TestClient) -> None:
+    resp = client.post(
+        "/api/rolling-restart/nope/acknowledge",
+        headers={"X-Admin-Token": "test-admin-token"},
+    )
+    assert resp.status_code == 404
+
+
+def test_rolling_acknowledge_releases_lock_end_to_end(client: TestClient) -> None:
+    # 端到端:占锁 → 中断标 interrupted(锁仍在,409)→ acknowledge 释放 → 可再占锁
+    import app.main as main_module
+
+    state = main_module.hub_state
+    asyncio.run(state.create_rolling_task("task-ack", "agent-a", "svc-ack", False))
+    asyncio.run(state.interrupt_running_rolling())
+
+    # 锁仍在:同 key 再发滚动 → 409
+    conflict = client.post(
+        "/api/rolling-restart",
+        json={"agentId": "agent-a", "serviceName": "svc-ack"},
+        headers={"X-Admin-Token": "test-admin-token"},
+    )
+    assert conflict.status_code == 409
+
+    # 非 interrupted 任务(此处用同一个 interrupted 任务的相反场景由 store 测试覆盖)
+    ack = client.post(
+        "/api/rolling-restart/task-ack/acknowledge",
+        headers={"X-Admin-Token": "test-admin-token"},
+    )
+    assert ack.status_code == 200
+    assert ack.json() == {"acknowledged": True}
+
+    # 释放后可再占锁
+    again = client.post(
+        "/api/rolling-restart",
+        json={"agentId": "agent-a", "serviceName": "svc-ack"},
+        headers={"X-Admin-Token": "test-admin-token"},
+    )
+    assert again.status_code == 200
+
+
+def test_rolling_acknowledge_non_interrupted_returns_409(client: TestClient) -> None:
+    # 任务存在但非 interrupted(running)→ 409
+    import app.main as main_module
+
+    state = main_module.hub_state
+    asyncio.run(state.create_rolling_task("task-running", "agent-b", "svc-b", False))
+
+    resp = client.post(
+        "/api/rolling-restart/task-running/acknowledge",
+        headers={"X-Admin-Token": "test-admin-token"},
+    )
+    assert resp.status_code == 409
 
 
 def test_log_stream_subscriptions_share_upstream_and_stop_on_last_subscriber(client: TestClient) -> None:

@@ -10,9 +10,10 @@ from uuid import uuid4
 
 from fastapi import WebSocket
 from sqlalchemy import case, func, select
+from sqlalchemy.exc import IntegrityError
 
 from app.db import Database
-from app.db_models import AgentModel, CommandEventModel, CommandModel
+from app.db_models import AgentModel, CommandEventModel, CommandModel, RollingTaskModel
 
 
 CHINA_TZ = timezone(timedelta(hours=8))
@@ -106,6 +107,25 @@ def command_event_to_dict(record: CommandEventModel) -> dict[str, Any]:
     }
 
 
+class RollingConflict(Exception):
+    """同一 (agent, service) 已有滚动在进行。"""
+
+
+def _rolling_to_dict(record) -> dict:
+    return {
+        "taskId": record.task_id,
+        "agentId": record.agent_id,
+        "serviceName": record.service_name,
+        "status": record.status,
+        "degraded": record.degraded,
+        "nodes": json.loads(record.nodes_json or "[]"),
+        "error": record.error,
+        "createdAt": _as_china_time(record.created_at),
+        "updatedAt": _as_china_time(record.updated_at),
+        "finishedAt": _as_china_time(record.finished_at) if record.finished_at else None,
+    }
+
+
 def _apply_command_filters(
     statement: Any,
     *,
@@ -146,6 +166,7 @@ class HubState:
         self._log_streams_by_session: dict[str, dict[str, Any]] = {}
         self._log_streams_by_key: dict[tuple[str, str, bool], str] = {}
         self._log_subscribers: dict[str, str] = {}
+        self._pending: dict[str, asyncio.Future] = {}
         self._lock = asyncio.Lock()
 
     async def initialize(self) -> None:
@@ -196,6 +217,28 @@ class HubState:
     async def get_connection(self, agent_id: str) -> WebSocket | None:
         async with self._lock:
             return self._connections.get(agent_id)
+
+    async def call_agent(self, agent_id: str, message: dict, timeout: float) -> dict:
+        request_id = message["requestId"]
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        async with self._lock:
+            self._pending[request_id] = future
+        try:
+            websocket = await self.get_connection(agent_id)
+            if websocket is None:
+                raise RuntimeError(f"agent {agent_id} 连接不可用")
+            await websocket.send_json(message)
+            return await asyncio.wait_for(future, timeout)
+        finally:
+            async with self._lock:
+                self._pending.pop(request_id, None)
+
+    async def resolve_pending(self, request_id: str, payload: dict) -> None:
+        async with self._lock:
+            future = self._pending.get(request_id)
+        if future is not None and not future.done():
+            future.set_result(payload)
 
     async def subscribe_log_stream(
         self,
@@ -862,3 +905,95 @@ class HubState:
         with self.database.session_factory() as session:
             record = session.scalar(select(AgentModel).where(AgentModel.agent_id == agent_id))
             return _agent_to_dict(record) if record is not None else None
+
+    async def create_rolling_task(self, task_id, agent_id, service_name, force):
+        return await asyncio.to_thread(self._create_rolling_task_sync, task_id, agent_id, service_name, force)
+
+    def _create_rolling_task_sync(self, task_id, agent_id, service_name, force):
+        now = utc_now()
+        with self.database.session_factory() as session:
+            record = RollingTaskModel(
+                task_id=task_id, agent_id=agent_id, service_name=service_name,
+                status="running", degraded=False,  # degraded 终态由 finish_rolling 据实际结果置;创建恒 False
+                active_key=f"{agent_id}:{service_name}",
+                nodes_json="[]", created_at=now, updated_at=now)
+            session.add(record)
+            try:
+                session.commit()
+            except IntegrityError as exc:
+                session.rollback()
+                raise RollingConflict(f"{agent_id}:{service_name} 已有滚动在进行") from exc
+            session.refresh(record)
+            return _rolling_to_dict(record)
+
+    async def update_rolling_nodes(self, task_id, nodes):
+        await asyncio.to_thread(self._update_rolling_nodes_sync, task_id, nodes)
+
+    def _update_rolling_nodes_sync(self, task_id, nodes):
+        with self.database.session_factory() as session:
+            record = session.query(RollingTaskModel).filter_by(task_id=task_id).first()
+            if record is None:
+                return
+            record.nodes_json = json.dumps(nodes, ensure_ascii=False)
+            record.updated_at = utc_now()
+            session.commit()
+
+    async def finish_rolling(self, task_id, status, *, nodes=None, error=None, degraded=False):
+        await asyncio.to_thread(self._finish_rolling_sync, task_id, status, nodes, error, degraded)
+
+    def _finish_rolling_sync(self, task_id, status, nodes, error, degraded):
+        now = utc_now()
+        with self.database.session_factory() as session:
+            record = session.query(RollingTaskModel).filter_by(task_id=task_id).first()
+            if record is None:
+                return
+            record.status = status
+            record.error = error
+            record.active_key = None                 # 释放并发锁
+            record.degraded = bool(degraded)         # 以编排实际结果为准(force 但健康≥2 完成时不标 degraded)
+            if nodes is not None:
+                record.nodes_json = json.dumps(nodes, ensure_ascii=False)
+            record.updated_at = now
+            record.finished_at = now
+            session.commit()
+
+    async def get_rolling_task(self, task_id):
+        return await asyncio.to_thread(self._get_rolling_task_sync, task_id)
+
+    def _get_rolling_task_sync(self, task_id):
+        with self.database.session_factory() as session:
+            record = session.query(RollingTaskModel).filter_by(task_id=task_id).first()
+            return _rolling_to_dict(record) if record else None
+
+    async def interrupt_running_rolling(self):
+        return await asyncio.to_thread(self._interrupt_running_rolling_sync)
+
+    def _interrupt_running_rolling_sync(self):
+        now = utc_now()
+        with self.database.session_factory() as session:
+            rows = session.query(RollingTaskModel).filter_by(status="running").all()
+            for r in rows:
+                r.status = "interrupted"
+                # 故意不释放 active_key:让唯一约束继续挡住同 (agent,service) 的新滚动,
+                # 直到人工调 acknowledge_rolling 确认后才释放锁(spec §4.3/§7)
+                r.error = "hub 重启,滚动被中断,需人工确认"
+                r.updated_at = now
+                r.finished_at = now
+            session.commit()
+            return len(rows)
+
+    async def acknowledge_rolling(self, task_id):
+        return await asyncio.to_thread(self._acknowledge_rolling_sync, task_id)
+
+    def _acknowledge_rolling_sync(self, task_id):
+        # 人工确认:仅当 task 处于 interrupted 时释放 active_key(放行后续同 key 滚动);
+        # task 不存在或非 interrupted 返回 False 且不改动。
+        now = utc_now()
+        with self.database.session_factory() as session:
+            record = session.query(RollingTaskModel).filter_by(task_id=task_id).first()
+            if record is None or record.status != "interrupted":
+                return False
+            record.active_key = None
+            record.updated_at = now
+            session.commit()
+            return True

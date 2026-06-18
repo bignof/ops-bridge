@@ -26,6 +26,14 @@ HEARTBEAT_INTERVAL = int(os.getenv('HEARTBEAT_INTERVAL', '30'))
 HEALTH_HOST        = os.getenv('HEALTH_HOST', '0.0.0.0')
 HEALTH_PORT        = int(os.getenv('HEALTH_PORT', '18081'))
 
+# --- nacos（滚动重启用，可选能力，勿加 sys.exit 强校验）---
+NACOS_SERVER       = os.getenv('NACOS_SERVER', '')          # 形如 192.168.0.30:8848
+NACOS_NAMESPACE    = os.getenv('NACOS_NAMESPACE', '')       # 空=public
+NACOS_GROUP        = os.getenv('NACOS_GROUP', 'DEFAULT_GROUP')
+NACOS_CONTEXT_PATH = os.getenv('NACOS_CONTEXT_PATH', '/nacos')
+NACOS_USERNAME     = os.getenv('NACOS_USERNAME', '')
+NACOS_PASSWORD     = os.getenv('NACOS_PASSWORD', '')
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'

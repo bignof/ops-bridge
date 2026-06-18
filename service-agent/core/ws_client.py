@@ -8,6 +8,7 @@ import websocket
 from config import AGENT_ID, AGENT_KEY, HEARTBEAT_INTERVAL, WS_URL
 from core.handlers import dispatch, send_message
 from core.log_sessions import start_log_session, stop_log_session
+from core.rolling import handle_graceful_restart, handle_list_instances
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,12 @@ def _on_message(ws, message):
             start_log_session(ws, data)
         elif msg_type == 'logs_stop':
             stop_log_session(data)
+        elif msg_type == 'list-instances':
+            # 在独立线程中执行，避免阻塞 WebSocket 接收循环
+            threading.Thread(target=handle_list_instances, args=(ws, data), daemon=True).start()
+        elif msg_type == 'graceful-restart':
+            # 在独立线程中执行，避免阻塞 WebSocket 接收循环
+            threading.Thread(target=handle_graceful_restart, args=(ws, data), daemon=True).start()
         elif msg_type == 'ping':
             send_message(ws, {'type': 'pong', 'timestamp': time.time()})
     except Exception as e:

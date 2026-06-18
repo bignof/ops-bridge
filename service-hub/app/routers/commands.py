@@ -4,7 +4,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, status
 
-from app.api_support import _build_command_list_response, _command_list_query_dependency, _serialize_command, get_command_events_response
+from app.api_support import _build_command_list_response, _command_list_query_dependency, _require_admin_token, _serialize_command, get_command_events_response
 from app.models import CommandDispatchRequest, CommandDispatchResponse, CommandEventSnapshot, CommandListResponse, CommandSnapshot
 
 
@@ -30,11 +30,13 @@ async def get_command_events(request_id: str = Path(title="请求 ID", descripti
 async def dispatch_command(
     request: CommandDispatchRequest,
     agent_id: str = Path(title="Agent 标识", description="要接收命令的 Agent 唯一标识。"),
+    admin_token: str | None = Header(default=None, alias="X-Admin-Token", title="管理令牌", description="管理操作鉴权令牌。"),
     requested_by: str | None = Header(default=None, alias="X-Requested-By", title="请求发起方", description="调用该接口的系统或用户标识。"),
     request_source: str | None = Header(default=None, alias="X-Requested-Source", title="请求来源", description="调用来源，例如控制台、调度器。"),
 ) -> CommandDispatchResponse:
     import app.main as main_module
 
+    _require_admin_token(admin_token)
     agent = await main_module.hub_state.get_agent(agent_id)
     if agent is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
@@ -77,11 +79,13 @@ async def dispatch_command(
 @router.post("/api/commands/{request_id}/retry", response_model=CommandDispatchResponse, status_code=status.HTTP_202_ACCEPTED, summary="重试失败命令", description="重新下发一条失败命令，并生成新的请求 ID。")
 async def retry_command(
     request_id: str = Path(title="请求 ID", description="要重试的失败命令请求 ID。"),
+    admin_token: str | None = Header(default=None, alias="X-Admin-Token", title="管理令牌", description="管理操作鉴权令牌。"),
     requested_by: str | None = Header(default=None, alias="X-Requested-By", title="请求发起方", description="调用该接口的系统或用户标识。"),
     request_source: str | None = Header(default=None, alias="X-Requested-Source", title="请求来源", description="调用来源，例如控制台、调度器。"),
 ) -> CommandDispatchResponse:
     import app.main as main_module
 
+    _require_admin_token(admin_token)
     original = await main_module.hub_state.get_command(request_id)
     if original is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Command not found")
