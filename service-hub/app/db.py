@@ -12,7 +12,7 @@ class Base(DeclarativeBase):
 
 
 class Database:
-    _managed_tables = {"agents", "commands", "command_events"}
+    _managed_tables = {"agents", "commands", "command_events", "rolling_tasks"}
 
     def __init__(self, database_url: str) -> None:
         self.database_url = database_url
