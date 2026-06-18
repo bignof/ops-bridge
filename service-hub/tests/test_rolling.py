@@ -87,3 +87,25 @@ def test_call_agent_no_connection(tmp_path):
     state = _state(tmp_path)
     with pytest.raises(RuntimeError):
         asyncio.run(state.call_agent("missing", {"type": "x", "requestId": "r"}, timeout=1))
+
+def test_handle_agent_message_resolves_rolling(tmp_path, monkeypatch):
+    import app.main as main_module
+    import app.api_support as api_support
+    state = _state(tmp_path)
+    monkeypatch.setattr(main_module, "hub_state", state)
+    ws = FakeWS()
+    state._connections["agent-a"] = ws
+
+    async def scenario():
+        async def feeder():
+            await asyncio.sleep(0)
+            await api_support._handle_agent_message("agent-a", {
+                "type": "list-instances-result", "requestId": "req-1",
+                "status": "success", "instances": []})
+        task = asyncio.create_task(feeder())
+        res = await state.call_agent("agent-a", {"type": "list-instances", "requestId": "req-1"}, timeout=5)
+        await task
+        return res
+
+    res = asyncio.run(scenario())
+    assert res["type"] == "list-instances-result" and res["status"] == "success"

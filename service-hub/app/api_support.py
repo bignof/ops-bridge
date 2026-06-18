@@ -254,6 +254,12 @@ async def _handle_agent_message(agent_id: str, payload: dict[str, Any]) -> None:
             )
         return
 
+    if msg_type in ("list-instances-result", "graceful-restart-result"):
+        request_id = payload.get("requestId")
+        if request_id:
+            await main_module.hub_state.resolve_pending(request_id, payload)
+        return
+
     if msg_type == "logs_started":
         session_id = payload.get("sessionId")
         if session_id:
