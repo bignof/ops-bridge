@@ -51,3 +51,39 @@ def test_interrupt_running(tmp_path):
     n = asyncio.run(state.interrupt_running_rolling())
     assert n == 1
     assert asyncio.run(state.get_rolling_task("task-1"))["status"] == "interrupted"
+
+class FakeWS:
+    def __init__(self):
+        self.sent = []
+    async def send_json(self, payload):
+        self.sent.append(payload)
+
+def test_call_agent_resolves(tmp_path):
+    state = _state(tmp_path)
+    ws = FakeWS()
+    state._connections["agent-a"] = ws
+
+    async def scenario():
+        async def replier():
+            # 模拟 agent 回包
+            await asyncio.sleep(0)
+            await state.resolve_pending("req-1", {"type": "x-result", "requestId": "req-1", "status": "success"})
+        task = asyncio.create_task(replier())
+        res = await state.call_agent("agent-a", {"type": "x", "requestId": "req-1"}, timeout=5)
+        await task
+        return res
+
+    res = asyncio.run(scenario())
+    assert res["status"] == "success"
+    assert ws.sent[0]["requestId"] == "req-1"
+
+def test_call_agent_timeout(tmp_path):
+    state = _state(tmp_path)
+    state._connections["agent-a"] = FakeWS()
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(state.call_agent("agent-a", {"type": "x", "requestId": "req-x"}, timeout=0.05))
+
+def test_call_agent_no_connection(tmp_path):
+    state = _state(tmp_path)
+    with pytest.raises(RuntimeError):
+        asyncio.run(state.call_agent("missing", {"type": "x", "requestId": "r"}, timeout=1))

@@ -166,6 +166,7 @@ class HubState:
         self._log_streams_by_session: dict[str, dict[str, Any]] = {}
         self._log_streams_by_key: dict[tuple[str, str, bool], str] = {}
         self._log_subscribers: dict[str, str] = {}
+        self._pending: dict[str, asyncio.Future] = {}
         self._lock = asyncio.Lock()
 
     async def initialize(self) -> None:
@@ -216,6 +217,28 @@ class HubState:
     async def get_connection(self, agent_id: str) -> WebSocket | None:
         async with self._lock:
             return self._connections.get(agent_id)
+
+    async def call_agent(self, agent_id, message, timeout):
+        request_id = message["requestId"]
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        async with self._lock:
+            self._pending[request_id] = future
+        try:
+            websocket = self._connections.get(agent_id)
+            if websocket is None:
+                raise RuntimeError(f"agent {agent_id} 连接不可用")
+            await websocket.send_json(message)
+            return await asyncio.wait_for(future, timeout)
+        finally:
+            async with self._lock:
+                self._pending.pop(request_id, None)
+
+    async def resolve_pending(self, request_id, payload):
+        async with self._lock:
+            future = self._pending.get(request_id)
+        if future is not None and not future.done():
+            future.set_result(payload)
 
     async def subscribe_log_stream(
         self,
