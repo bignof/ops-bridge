@@ -109,3 +109,71 @@ def test_handle_agent_message_resolves_rolling(tmp_path, monkeypatch):
 
     res = asyncio.run(scenario())
     assert res["type"] == "list-instances-result" and res["status"] == "success"
+
+
+from app.routers import rolling as rolling_router
+
+class FakeSettings:
+    rolling_settle_sec = 1
+    rolling_shutdown_timeout = 60
+    rolling_ready_timeout = 10
+    rolling_cmd_timeout = 30
+
+class FakeHubState:
+    def __init__(self, scripted):
+        self.scripted = scripted        # list of dicts to return from call_agent in order
+        self.calls = []
+        self.node_updates = []
+        self.finished = None
+    async def call_agent(self, agent_id, message, timeout):
+        self.calls.append(message)
+        return self.scripted.pop(0)
+    async def update_rolling_nodes(self, task_id, nodes):
+        self.node_updates.append([dict(n) for n in nodes])
+    async def finish_rolling(self, task_id, status, *, nodes=None, error=None, degraded=False):
+        self.finished = {"status": status, "nodes": nodes, "error": error, "degraded": degraded}
+
+def _inst(addr, cid, matched=True, healthy=True):
+    return {"address": addr, "containerId": cid, "healthy": healthy, "matched": matched}
+
+def test_run_rolling_happy_path():
+    hub = FakeHubState([
+        {"status": "success", "instances": [_inst("h:18029", "a"), _inst("h:18030", "b")]},
+        {"status": "success"},  # graceful-restart node a
+        {"status": "success"},  # graceful-restart node b
+    ])
+    asyncio.run(rolling_router._run_rolling("t1", "agent-a", "svc", False, hub, FakeSettings()))
+    assert hub.finished["status"] == "done"
+    # 两次 graceful-restart 按序
+    gr = [c for c in hub.calls if c["type"] == "graceful-restart"]
+    assert [c["containerId"] for c in gr] == ["a", "b"]
+    assert gr[0]["healthBaseUrl"] == "http://h:18029"
+
+def test_run_rolling_unmatched_aborts():
+    hub = FakeHubState([{"status": "success", "instances": [_inst("h:1", None, matched=False)]}])
+    asyncio.run(rolling_router._run_rolling("t1", "agent-a", "svc", False, hub, FakeSettings()))
+    assert hub.finished["status"] == "failed" and "对不上号" in hub.finished["error"]
+    assert not any(c["type"] == "graceful-restart" for c in hub.calls)
+
+def test_run_rolling_single_instance_rejected():
+    hub = FakeHubState([{"status": "success", "instances": [_inst("h:1", "a")]}])
+    asyncio.run(rolling_router._run_rolling("t1", "agent-a", "svc", False, hub, FakeSettings()))
+    assert hub.finished["status"] == "failed" and "健康实例" in hub.finished["error"]
+
+def test_run_rolling_single_instance_force_degraded():
+    hub = FakeHubState([
+        {"status": "success", "instances": [_inst("h:1", "a")]},
+        {"status": "success"},
+    ])
+    asyncio.run(rolling_router._run_rolling("t1", "agent-a", "svc", True, hub, FakeSettings()))
+    assert hub.finished["status"] == "degraded"
+
+def test_run_rolling_fail_stop():
+    hub = FakeHubState([
+        {"status": "success", "instances": [_inst("h:1", "a"), _inst("h:2", "b")]},
+        {"status": "failed", "error": "boom"},   # node a fails
+    ])
+    asyncio.run(rolling_router._run_rolling("t1", "agent-a", "svc", False, hub, FakeSettings()))
+    assert hub.finished["status"] == "failed"
+    gr = [c for c in hub.calls if c["type"] == "graceful-restart"]
+    assert len(gr) == 1   # 失败即停,不发第二个
