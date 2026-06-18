@@ -225,6 +225,7 @@ def test_dispatch_command_creates_record_and_returns_expected_payload(client: Te
     response = client.post(
         "/api/agents/agent-a/commands",
         headers={
+            "X-Admin-Token": "test-admin-token",
             "X-Requested-By": "platform-api",
             "X-Requested-Source": "ops-console",
         },
@@ -246,6 +247,20 @@ def test_dispatch_command_creates_record_and_returns_expected_payload(client: Te
     get_response = client.get("/api/commands/req-dispatch-1")
     assert get_response.status_code == 200
     assert get_response.json()["requestId"] == "req-dispatch-1"
+
+
+def test_dispatch_requires_admin_token(client: TestClient) -> None:
+    response = client.post(
+        "/api/agents/agent-a/commands",
+        json={
+            "requestId": "req-no-token",
+            "action": "restart",
+            "dir": "/srv/a",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid admin token"
 
 
 def test_dispatch_update_without_image_returns_422(client: TestClient) -> None:
@@ -274,6 +289,7 @@ def test_dispatch_command_to_offline_agent_returns_409(client: TestClient) -> No
 
     response = client.post(
         "/api/agents/agent-a/commands",
+        headers={"X-Admin-Token": "test-admin-token"},
         json={
             "requestId": "req-offline-1",
             "action": "restart",
@@ -446,6 +462,7 @@ def test_retry_failed_command_creates_new_command_and_audit_event(client: TestCl
     response = client.post(
         "/api/commands/req-1/retry",
         headers={
+            "X-Admin-Token": "test-admin-token",
             "X-Requested-By": "platform-api",
             "X-Requested-Source": "ops-console",
         },
@@ -471,14 +488,20 @@ def test_retry_non_failed_command_returns_409(client: TestClient) -> None:
     asyncio.run(state.store_command("agent-a", {"type": "command", "requestId": "req-ok", "action": "restart", "dir": "/srv/a"}))
     asyncio.run(state.mark_result("req-ok", "success", message="done"))
 
-    response = client.post("/api/commands/req-ok/retry")
+    response = client.post(
+        "/api/commands/req-ok/retry",
+        headers={"X-Admin-Token": "test-admin-token"},
+    )
 
     assert response.status_code == 409
     assert response.json() == {"detail": "Only failed commands can be retried"}
 
 
 def test_retry_missing_command_returns_404(client: TestClient) -> None:
-    response = client.post("/api/commands/missing/retry")
+    response = client.post(
+        "/api/commands/missing/retry",
+        headers={"X-Admin-Token": "test-admin-token"},
+    )
 
     assert response.status_code == 404
     assert response.json() == {"detail": "Command not found"}
