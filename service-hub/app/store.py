@@ -974,9 +974,26 @@ class HubState:
             rows = session.query(RollingTaskModel).filter_by(status="running").all()
             for r in rows:
                 r.status = "interrupted"
-                r.active_key = None
+                # 故意不释放 active_key:让唯一约束继续挡住同 (agent,service) 的新滚动,
+                # 直到人工调 acknowledge_rolling 确认后才释放锁(spec §4.3/§7)
                 r.error = "hub 重启,滚动被中断,需人工确认"
                 r.updated_at = now
                 r.finished_at = now
             session.commit()
             return len(rows)
+
+    async def acknowledge_rolling(self, task_id):
+        return await asyncio.to_thread(self._acknowledge_rolling_sync, task_id)
+
+    def _acknowledge_rolling_sync(self, task_id):
+        # 人工确认:仅当 task 处于 interrupted 时释放 active_key(放行后续同 key 滚动);
+        # task 不存在或非 interrupted 返回 False 且不改动。
+        now = utc_now()
+        with self.database.session_factory() as session:
+            record = session.query(RollingTaskModel).filter_by(task_id=task_id).first()
+            if record is None or record.status != "interrupted":
+                return False
+            record.active_key = None
+            record.updated_at = now
+            session.commit()
+            return True

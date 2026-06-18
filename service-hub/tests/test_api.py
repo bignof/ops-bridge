@@ -615,6 +615,84 @@ def test_rolling_status_404_unknown(client: TestClient) -> None:
     assert resp.status_code == 404
 
 
+def test_rolling_restart_conflict_returns_409(client: TestClient) -> None:
+    # L3: 先占锁(running),再对同 (agent,service) 发滚动 → 409
+    # (冲突在 create_rolling_task 抛出,早于后台任务,天然规避 flaky)
+    import app.main as main_module
+
+    state = main_module.hub_state
+    asyncio.run(state.create_rolling_task("task-occupied", "agent-a", "svc", False))
+
+    resp = client.post(
+        "/api/rolling-restart",
+        json={"agentId": "agent-a", "serviceName": "svc"},
+        headers={"X-Admin-Token": "test-admin-token"},
+    )
+    assert resp.status_code == 409
+
+
+def test_rolling_acknowledge_requires_admin_token(client: TestClient) -> None:
+    # 不带 token → 403(鉴权在端点首行)
+    resp = client.post("/api/rolling-restart/whatever/acknowledge")
+    assert resp.status_code == 403
+    assert resp.json() == {"detail": "Invalid admin token"}
+
+
+def test_rolling_acknowledge_unknown_task_returns_404(client: TestClient) -> None:
+    resp = client.post(
+        "/api/rolling-restart/nope/acknowledge",
+        headers={"X-Admin-Token": "test-admin-token"},
+    )
+    assert resp.status_code == 404
+
+
+def test_rolling_acknowledge_releases_lock_end_to_end(client: TestClient) -> None:
+    # 端到端:占锁 → 中断标 interrupted(锁仍在,409)→ acknowledge 释放 → 可再占锁
+    import app.main as main_module
+
+    state = main_module.hub_state
+    asyncio.run(state.create_rolling_task("task-ack", "agent-a", "svc-ack", False))
+    asyncio.run(state.interrupt_running_rolling())
+
+    # 锁仍在:同 key 再发滚动 → 409
+    conflict = client.post(
+        "/api/rolling-restart",
+        json={"agentId": "agent-a", "serviceName": "svc-ack"},
+        headers={"X-Admin-Token": "test-admin-token"},
+    )
+    assert conflict.status_code == 409
+
+    # 非 interrupted 任务(此处用同一个 interrupted 任务的相反场景由 store 测试覆盖)
+    ack = client.post(
+        "/api/rolling-restart/task-ack/acknowledge",
+        headers={"X-Admin-Token": "test-admin-token"},
+    )
+    assert ack.status_code == 200
+    assert ack.json() == {"acknowledged": True}
+
+    # 释放后可再占锁
+    again = client.post(
+        "/api/rolling-restart",
+        json={"agentId": "agent-a", "serviceName": "svc-ack"},
+        headers={"X-Admin-Token": "test-admin-token"},
+    )
+    assert again.status_code == 200
+
+
+def test_rolling_acknowledge_non_interrupted_returns_409(client: TestClient) -> None:
+    # 任务存在但非 interrupted(running)→ 409
+    import app.main as main_module
+
+    state = main_module.hub_state
+    asyncio.run(state.create_rolling_task("task-running", "agent-b", "svc-b", False))
+
+    resp = client.post(
+        "/api/rolling-restart/task-running/acknowledge",
+        headers={"X-Admin-Token": "test-admin-token"},
+    )
+    assert resp.status_code == 409
+
+
 def test_log_stream_subscriptions_share_upstream_and_stop_on_last_subscriber(client: TestClient) -> None:
     import app.main as main_module
 
