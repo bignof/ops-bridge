@@ -268,6 +268,15 @@ def test_require_admin_token_handles_missing_and_invalid_configuration(monkeypat
     with pytest.raises(HTTPException, match="Invalid admin token"):
         _require_admin_token("wrong-token")
 
+    # L7: header 缺失(None)必须走 not admin_token 短路 → 403,
+    # 不能落到 hmac.compare_digest(None, ...)(会 TypeError)
+    with pytest.raises(HTTPException, match="Invalid admin token"):
+        _require_admin_token(None)
+
+    # L7: 等长但不同的 token 仍 403(常量时间比较不改变正确性)
+    with pytest.raises(HTTPException, match="Invalid admin token"):
+        _require_admin_token("configured-tokez")
+
     _require_admin_token("configured-token")
     object.__setattr__(main_module.settings, "admin_token", original)
 
