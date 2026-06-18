@@ -24,7 +24,13 @@ def list_healthy_instances(service_name):
         params["namespaceId"] = config.NACOS_NAMESPACE
     if config.NACOS_USERNAME:
         params["accessToken"] = _login()
-    data = http_client.get_json(f"{base}/v1/ns/instance/list", params=params)
+    # H2：HTTPError 的 str() 含完整 URL（带 accessToken），不能外泄到日志/回 hub。
+    # 这里只保留状态码，用 from None 切断含 token 的原异常链。
+    try:
+        data = http_client.get_json(f"{base}/v1/ns/instance/list", params=params)
+    except requests.HTTPError as e:
+        code = e.response.status_code if e.response is not None else "?"
+        raise RuntimeError(f"nacos 实例查询失败: HTTP {code}") from None
     hosts = data.get("hosts") or []
     return [
         {"ip": h["ip"], "port": h["port"]}
