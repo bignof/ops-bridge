@@ -218,14 +218,14 @@ class HubState:
         async with self._lock:
             return self._connections.get(agent_id)
 
-    async def call_agent(self, agent_id, message, timeout):
+    async def call_agent(self, agent_id: str, message: dict, timeout: float) -> dict:
         request_id = message["requestId"]
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         async with self._lock:
             self._pending[request_id] = future
         try:
-            websocket = self._connections.get(agent_id)
+            websocket = await self.get_connection(agent_id)
             if websocket is None:
                 raise RuntimeError(f"agent {agent_id} 连接不可用")
             await websocket.send_json(message)
@@ -234,7 +234,7 @@ class HubState:
             async with self._lock:
                 self._pending.pop(request_id, None)
 
-    async def resolve_pending(self, request_id, payload):
+    async def resolve_pending(self, request_id: str, payload: dict) -> None:
         async with self._lock:
             future = self._pending.get(request_id)
         if future is not None and not future.done():
