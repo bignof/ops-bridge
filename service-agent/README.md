@@ -215,6 +215,81 @@ INFO - Health server listening on http://0.0.0.0:18081/health
 - 当前日志能力是单向流式输出，不包含交互式 shell
 - Agent 会直接执行 `docker compose logs -f --tail N`，当 Hub 断开该流时会终止对应进程
 
+### 服务端 → Agent（滚动重启：实例发现）
+
+用于零中断滚动重启前，先从 Nacos 拉取某服务的健康实例并与本机运行中的容器做匹配。需要配置 `NACOS_*` 环境变量（见下文）。
+
+```json
+{
+  "type": "list-instances",
+  "requestId": "req-123",
+  "serviceName": "memory-share"
+}
+```
+
+| 字段          | 类型   | 必填 | 说明                       |
+| ------------- | ------ | ---- | -------------------------- |
+| `type`        | string | ✅   | 固定为 `"list-instances"`  |
+| `requestId`   | string | ✅   | 请求唯一 ID，原样返回      |
+| `serviceName` | string | ✅   | 要查询的 Nacos 服务名      |
+
+Agent 回复 `list-instances-result`：
+
+```json
+{
+  "type": "list-instances-result",
+  "requestId": "req-123",
+  "status": "success",
+  "instances": [
+    { "address": "192.168.0.30:18029", "containerId": "abcdef123456", "healthy": true, "matched": true }
+  ]
+}
+```
+
+| 字段                    | 类型    | 说明                                                                |
+| ----------------------- | ------- | ------------------------------------------------------------------- |
+| `status`                | string  | `success` 或 `failed`                                               |
+| `instances[].address`   | string  | Nacos 上报的 `ip:port`                                              |
+| `instances[].containerId` | string\|null | 与该实例匹配上的本机容器短 ID；未匹配为 `null`                |
+| `instances[].healthy`   | boolean | Nacos 视角是否健康（已过滤，恒 `true`）                            |
+| `instances[].matched`   | boolean | 是否在本机找到对应的运行中容器                                      |
+
+失败时回 `{ "status": "failed", "error": "..." }`（error 已对 `accessToken` 脱敏）。
+
+### 服务端 → Agent（滚动重启：优雅重启单个容器）
+
+对单个容器执行「先优雅下线 → 重启 → 等待 ready → 静默观察」的零中断重启流程。
+
+```json
+{
+  "type": "graceful-restart",
+  "requestId": "req-123",
+  "containerId": "abcdef123456",
+  "healthBaseUrl": "http://192.168.0.30:18029",
+  "settleSec": 35,
+  "shutdownTimeoutSec": 60,
+  "readyTimeoutSec": 180
+}
+```
+
+| 字段                 | 类型    | 必填 | 默认 | 说明                                                                 |
+| -------------------- | ------- | ---- | ---- | -------------------------------------------------------------------- |
+| `type`               | string  | ✅   | —    | 固定为 `"graceful-restart"`                                          |
+| `requestId`          | string  | ✅   | —    | 请求唯一 ID，原样返回                                                |
+| `containerId`        | string  | ✅   | —    | 要重启的本机容器 ID                                                  |
+| `healthBaseUrl`      | string  | ✅   | —    | 该实例健康/管理接口基址；**必须为内网 IP**（http/https），公网或域名会被拒绝 |
+| `settleSec`          | integer | 否   | 35   | ready 后静默观察秒数（零中断承重步骤，期间不再发流量）              |
+| `shutdownTimeoutSec` | integer | 否   | 60   | 调用 `/api/k8s/shutdown` 的超时                                      |
+| `readyTimeoutSec`    | integer | 否   | 180  | 等待 `/api/health/ready` 返回 200 的超时（至少探一次）             |
+
+Agent 回复 `graceful-restart-result`（**不发 ack，只回最终结果**）：
+
+```json
+{ "type": "graceful-restart-result", "requestId": "req-123", "status": "success" }
+```
+
+失败时：`{ "type": "graceful-restart-result", "requestId": "req-123", "status": "failed", "error": "..." }`（error 已脱敏）。
+
 ## 健康检查
 
 Agent 容器内会启动一个轻量 HTTP 服务：
