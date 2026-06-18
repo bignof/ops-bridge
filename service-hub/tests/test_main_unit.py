@@ -241,6 +241,9 @@ def test_lifespan_initializes_hub_state(monkeypatch: pytest.MonkeyPatch) -> None
         async def initialize(self) -> None:
             initialized["value"] = True
 
+        async def interrupt_running_rolling(self) -> int:
+            return 0
+
     monkeypatch.setattr(main_module, "hub_state", StubState())
 
     async def run_lifespan() -> None:

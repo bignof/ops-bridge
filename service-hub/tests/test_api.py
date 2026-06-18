@@ -593,6 +593,28 @@ def test_stream_agent_logs_returns_stream_error_event(client: TestClient) -> Non
     assert '"error": "No docker-compose.yaml/yml found in /srv/a"' in body
 
 
+def test_rolling_router_mounted(client: TestClient) -> None:
+    # 未带 token 返回 403 而非 404,证明路由已注册
+    resp = client.post("/api/rolling-restart", json={"agentId": "a", "serviceName": "s"})
+    assert resp.status_code == 403
+
+
+def test_rolling_restart_returns_task_id(client: TestClient) -> None:
+    resp = client.post(
+        "/api/rolling-restart",
+        json={"agentId": "a", "serviceName": "s"},
+        headers={"X-Admin-Token": "test-admin-token"},
+    )
+    assert resp.status_code == 200
+    assert "taskId" in resp.json()
+    # 后台编排会因无在线 agent 很快 finish,此处只验端点契约
+
+
+def test_rolling_status_404_unknown(client: TestClient) -> None:
+    resp = client.get("/api/rolling-restart/nope", headers={"X-Admin-Token": "test-admin-token"})
+    assert resp.status_code == 404
+
+
 def test_log_stream_subscriptions_share_upstream_and_stop_on_last_subscriber(client: TestClient) -> None:
     import app.main as main_module
 
