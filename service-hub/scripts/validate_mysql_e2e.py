@@ -258,6 +258,7 @@ def main() -> int:
             method="POST",
             headers={
                 "Content-Type": "application/json",
+                "X-Admin-Token": ADMIN_TOKEN,
                 "X-Requested-By": "copilot-e2e",
                 "X-Requested-Source": "mysql-validation",
             },
