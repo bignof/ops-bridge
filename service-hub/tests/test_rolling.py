@@ -148,6 +148,13 @@ def test_run_rolling_happy_path():
     gr = [c for c in hub.calls if c["type"] == "graceful-restart"]
     assert [c["containerId"] for c in gr] == ["a", "b"]
     assert gr[0]["healthBaseUrl"] == "http://h:18029"
+    # 终态所有节点都 done
+    assert [n["status"] for n in hub.finished["nodes"]] == ["done", "done"]
+    # 状态机推进经过 in-progress(任一 node_updates 快照里出现过某节点 in-progress)
+    assert any(
+        any(n["status"] == "in-progress" for n in snap)
+        for snap in hub.node_updates
+    )
 
 def test_run_rolling_unmatched_aborts():
     hub = FakeHubState([{"status": "success", "instances": [_inst("h:1", None, matched=False)]}])
@@ -167,6 +174,7 @@ def test_run_rolling_single_instance_force_degraded():
     ])
     asyncio.run(rolling_router._run_rolling("t1", "agent-a", "svc", True, hub, FakeSettings()))
     assert hub.finished["status"] == "degraded"
+    assert hub.finished["degraded"] is True
 
 def test_run_rolling_fail_stop():
     hub = FakeHubState([
@@ -177,3 +185,7 @@ def test_run_rolling_fail_stop():
     assert hub.finished["status"] == "failed"
     gr = [c for c in hub.calls if c["type"] == "graceful-restart"]
     assert len(gr) == 1   # 失败即停,不发第二个
+    # 失败节点标 failed 并带原始 error;后续节点标 skipped(便于区分"未动过"与"被中止跳过")
+    assert hub.finished["nodes"][0]["status"] == "failed"
+    assert hub.finished["nodes"][0]["error"] == "boom"
+    assert hub.finished["nodes"][1]["status"] == "skipped"

@@ -54,6 +54,9 @@ async def _run_rolling(task_id, agent_id, service_name, force, hub_state, settin
             if res.get("status") != "success":
                 nodes[idx]["status"] = "failed"
                 nodes[idx]["error"] = res.get("error")
+                # 失败即停:把尚未处理的剩余节点标 skipped,便于运维区分"未动过"与"被中止跳过"
+                for n in nodes[idx + 1:]:
+                    n["status"] = "skipped"
                 await hub_state.finish_rolling(task_id, "failed", nodes=nodes,
                     error=f"节点 {node['address']} 失败,停止滚动")
                 return
