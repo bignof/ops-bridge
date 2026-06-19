@@ -47,10 +47,18 @@ class SessionGuardMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         path = request.url.path
         if path.startswith(API_PREFIX) and not _is_whitelisted(path):
+            # ⚠️ 仅鉴权判定(token 提取 + 校验)包进 try;**call_next 必须在 try 之外**,
+            #    否则会把下游路由的正常异常/HTTPException 吞成 401,掩盖真实 500。
             try:
                 # 复用 require_session 的解析(缺/坏/空-sub → HTTPException 401)。
                 require_session(authorization=request.headers.get("authorization"))
             except HTTPException as exc:
                 # BaseHTTPMiddleware 在 exception handler 链之外,须自行兜底成 JSON 401。
                 return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+            except Exception:
+                # 纵深防御(default-deny):鉴权判定自身抛任何意外异常一律 fail-closed 401,
+                # 绝不意外落到 call_next 放行路径。
+                return JSONResponse(
+                    status_code=401, content={"detail": "unauthorized"}
+                )
         return await call_next(request)

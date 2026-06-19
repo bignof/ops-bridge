@@ -206,6 +206,50 @@ def test_publish_unbound_raises_not_found(client: TestClient) -> None:
         store.publish(123456, 654321, 1)
 
 
+def test_publish_cross_plugin_version_raises_not_found(client: TestClient) -> None:
+    """最终评审修复:plugin_version_id 必须归属于 plugin_id。
+
+    建插件 A(版本 va)、插件 B(版本 vb);对「绑定了插件 A 的 service」publish 传 vb
+    (B 的版本)→ 期望 NotFound(路由层 → 404),拒绝跨插件错配写进台账。
+    并保留一条正常 publish(传本插件 A 的版本 va)仍成功的对照。
+    """
+    svc_a, plg_a, _ = _mk_binding("xpv-ns", "xpv-svc-a", "xpv-plg-a")
+    plg_b = store.create_row(Plugin, {"code": "xpv-plg-b", "name": None}).id
+    va = _mk_version(plg_a, "1.0")  # 属于插件 A
+    vb = _mk_version(plg_b, "9.9")  # 属于插件 B
+
+    # 跨插件错配:绑定的是 A,却传 B 的版本 → NotFound(版本不归属本插件)
+    with pytest.raises(store.NotFound):
+        store.publish(svc_a, plg_a, vb)
+
+    # 对照:传本插件 A 的版本 → 正常成功
+    ok = store.publish(svc_a, plg_a, va)
+    assert ok.is_active is True and ok.plugin_version_id == va
+
+
+def test_publish_endpoint_cross_plugin_version_404(client: TestClient) -> None:
+    """端点层:跨插件错配版本 → 404;同绑定传本插件版本 → 201(对照)。"""
+    h = _h(client)
+    svc_a, plg_a, _ = _mk_binding("xpv2-ns", "xpv2-svc-a", "xpv2-plg-a")
+    plg_b = store.create_row(Plugin, {"code": "xpv2-plg-b", "name": None}).id
+    va = _mk_version(plg_a, "1.0")
+    vb = _mk_version(plg_b, "9.9")
+
+    bad = client.post(
+        "/api/releases/publish",
+        json={"serviceId": svc_a, "pluginId": plg_a, "pluginVersionId": vb},
+        headers=h,
+    )
+    assert bad.status_code == 404, bad.text
+
+    good = client.post(
+        "/api/releases/publish",
+        json={"serviceId": svc_a, "pluginId": plg_a, "pluginVersionId": va},
+        headers=h,
+    )
+    assert good.status_code == 201, good.text
+
+
 # --- 7) 评审 M4:当前 active = 高 PK,回滚/激活到低 PK 历史行(不加 flush 必撞 UNIQUE)---
 
 

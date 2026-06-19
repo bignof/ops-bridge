@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import Iterator
 
 import pytest
+from fastapi import Depends, HTTPException
 from fastapi.testclient import TestClient
 
 
@@ -92,3 +93,54 @@ def test_distribution_prefix_not_blocked_by_middleware(client: TestClient) -> No
 
     r = client.get("/api/distribution/plugins?namespace=x&service=y")
     assert r.status_code == 403, r.text  # 放行到端点,由 pull token 自校验拒绝(非中间件 401)
+
+
+# ④ 最终评审修复:鉴权判定**自身**抛意外异常(非 HTTPException)→ fail-closed 401,
+#    绝不意外落到放行路径(default-deny 纵深)。
+def test_auth_decision_unexpected_exception_fails_closed_401(
+    client_with_probe: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import app.middleware as mw
+
+    def _boom(*args, **kwargs):  # 模拟 token 提取/校验内部意外异常(非 HTTPException)
+        raise RuntimeError("unexpected failure in auth decision")
+
+    monkeypatch.setattr(mw, "require_session", _boom)
+    # 受保护路由 + 合法 token:若异常被吞向放行,会返回 200(失守);fail-closed 应 401。
+    tok = _token(client_with_probe)
+    r = client_with_probe.get("/api/__probe__", headers={"Authorization": f"Bearer {tok}"})
+    assert r.status_code == 401, r.text
+
+
+# ④ 补:call_next **不在** try 内——下游路由抛的非 401 异常须原样透传,不被中间件吞成 401。
+@pytest.fixture()
+def client_with_teapot_probe(client: TestClient) -> Iterator[TestClient]:
+    """临时挂一个带合法 Depends、但下游故意抛 HTTPException(418) 的 /api 路由。
+
+    证明:中间件鉴权通过后,`call_next` 在 try 之外——下游 418 原样透传(非被吞成 401),
+    否则会掩盖真实下游错误/500。
+    """
+    from app.auth import require_session
+
+    app = client.app
+
+    async def _teapot(_: str = Depends(require_session)) -> dict:
+        raise HTTPException(status_code=418, detail="i am a teapot")
+
+    app.add_api_route("/api/__teapot__", _teapot, methods=["GET"])
+    try:
+        yield client
+    finally:
+        app.router.routes[:] = [
+            r for r in app.router.routes if getattr(r, "path", None) != "/api/__teapot__"
+        ]
+
+
+def test_downstream_non_401_passes_through_not_swallowed(
+    client_with_teapot_probe: TestClient,
+) -> None:
+    tok = _token(client_with_teapot_probe)
+    r = client_with_teapot_probe.get(
+        "/api/__teapot__", headers={"Authorization": f"Bearer {tok}"}
+    )
+    assert r.status_code == 418, r.text  # call_next 在 try 外 → 下游异常原样透传

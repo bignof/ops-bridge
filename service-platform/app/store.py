@@ -231,7 +231,7 @@ def _deactivate_all(session: Any, service_id: int, plugin_id: int) -> list[Servi
 def publish(service_id: int, plugin_id: int, plugin_version_id: int) -> ServicePluginVersion:
     """发布:为已绑定的 (service,plugin) 追加一版并置为唯一 active(version_order 自增)。
 
-    绑定不存在 → `NotFound`;并发置活撞 UNIQUE → `Conflict`(路由层 → 409)。
+    绑定不存在 / 版本不归属本插件 → `NotFound`;并发置活撞 UNIQUE → `Conflict`(路由层 → 409)。
     """
     now = _now()
     with _db().session_factory() as session:
@@ -242,6 +242,12 @@ def publish(service_id: int, plugin_id: int, plugin_version_id: int) -> ServiceP
         ).scalar_one_or_none()
         if sp is None:
             raise NotFound("service_plugin 未绑定,请先创建关联")
+
+        # 版本归属校验(最终评审修复):plugin_version_id 必须存在且归属 plugin_id,
+        # 否则可构造跨插件错配写进台账。沿用 NotFound(路由层 → 404),与 reactivate/rollback 一致。
+        pv = session.get(PluginVersion, plugin_version_id)
+        if pv is None or pv.plugin_id != plugin_id:
+            raise NotFound("plugin version not found for this plugin")
 
         # 先全灭活 + 清 key,再 flush(评审 M4),最后 INSERT 带 key 的新行。
         _deactivate_all(session, service_id, plugin_id)
