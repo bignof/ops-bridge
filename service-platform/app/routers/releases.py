@@ -70,22 +70,25 @@ def _to_out(record: ServicePluginVersion) -> ReleaseOut:
     response_model=ReleaseListOut,
     summary="发布列表(主表 / 历史两视图)",
     description=(
-        "评审 H4 两视图(同端点,不新建聚合端点):不传 filter 或 isActive=true → 主表"
+        "评审 H4 两视图(同端点,不新建聚合端点):不传 filter → 主表"
         "(每 (serviceId,pluginId) 一行 active);传 serviceId+pluginId → 该绑定版本历史"
         "(全部版本,versionOrder 升序)。两视图均 LEFT JOIN 回 serviceCode/pluginCode/version"
         "(+namespaceCode),信封分页。"
+        "注:spec H4 只定义「不传 / isActive=true → 主表」;isActive=false 无定义,**不声明该参数**"
+        "(评审 A9:原声明 isActive=false 却落 else 仍返 active-only,语义相反而静默忽略)。"
+        "isActive=true 等历史兼容查询参数即便传入也被忽略,仍落主表逻辑,行为与不传一致。"
     ),
 )
 async def list_releases(
     _: str = Depends(require_session),
     service_id: int | None = Query(default=None, alias="serviceId", title="按服务过滤(配 pluginId 取历史)"),
     plugin_id: int | None = Query(default=None, alias="pluginId", title="按插件过滤(配 serviceId 取历史)"),
-    is_active: bool | None = Query(default=None, alias="isActive", title="主表过滤(true=每绑定一行 active)"),
     page: int = Query(default=1, ge=1, title="页码"),
     page_size: int = Query(default=20, ge=1, le=200, alias="pageSize", title="每页条数"),
 ) -> ReleaseListOut:
     # 视图判定:serviceId+pluginId 同时给 → 历史视图(该绑定全部版本,versionOrder 升序);
-    # 否则 → 主表视图(只取 is_active=True,每绑定一行)。isActive=true 与「不传 filter」均落主表。
+    # 否则 → 主表视图(只取 is_active=True,每绑定一行)。「不传 filter」与历史兼容的 isActive=true
+    # (该参数已不声明 → 被忽略)均落此主表分支。评审 A9:不再声明 isActive=false(避免声明却语义相反)。
     if service_id is not None and plugin_id is not None:
         filters = [
             ServicePluginVersion.service_id == service_id,

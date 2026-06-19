@@ -96,6 +96,28 @@ def _store_payload(plugin_id: int, version_id: int, filename: str, data: bytes) 
     return storage.store_tgz(plugin_id, version_id, filename, data)
 
 
+def _publish_next_version(
+    *, service_id: int, plugin_id: int, plugin_code: str, version: str, payload: bytes
+) -> dict:
+    """在**已存在**的 (service, plugin) 上发布新一版:落新 plugin_version + attachment(真实落盘)
+    并经 `store.publish` 置为唯一 active(自动把同绑定旧版本灭活)。
+
+    用于 A10:同 ns+plugin 先 publish v1 再 publish v2,验证 download 归属链的 `is_active` 子项
+    ——v2 publish 后 v1 的 spv 链已非 active,下载 v1 的 attachment 应 404。
+
+    返回 {pluginVersionId, attachmentId}。
+    """
+    pv = store.create_row(PluginVersion, {"plugin_id": plugin_id, "version": version})
+    storage_path = _store_payload(plugin_id, pv.id, f"{plugin_code.split('/')[-1]}-{version}.tgz", payload)
+    att = store.create_row(
+        PluginAttachment,
+        {"plugin_version_id": pv.id, "filename": f"{version}.tgz", "size": len(payload), "storage_path": storage_path},
+    )
+    # 经状态机发布:置该版本唯一 active,同绑定旧版本自动灭活(is_active=False / key=None)。
+    store.publish(service_id, plugin_id, pv.id)
+    return {"pluginVersionId": pv.id, "attachmentId": att.id}
+
+
 def _bearer(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
@@ -241,3 +263,59 @@ def test_bogus_token_no_matching_hash_rejected(client: TestClient, storage_tmp) 
         headers=_bearer(bogus),
     )
     assert r2.status_code == 404, r2.text
+
+
+# --- A10:download 归属链的 is_active 子项(同 ns+plugin v1→v2,v1 灭活后下 v1 → 404)----------
+
+
+def test_download_inactive_version_attachment_404(client: TestClient, storage_tmp) -> None:
+    """评审 A10(变异删 attachment_in_namespace 的 is_active 过滤仍绿 → 此测试补缺):
+
+    同 ns + 同 plugin 先 publish v1(得 attachment_v1),再 publish v2(v1 的 spv 链被灭活)。
+    本 ns 的 pull token:
+    - 下载 v1 的 attachmentId → **404**(v1 链已非 active;若 attachment_in_namespace 不带
+      `is_active=True` 过滤,会把已灭活版本的包发出 → 此处变 200,红)。
+    - 下载 v2 的 attachmentId → 200(当前唯一 active 链)。
+    """
+    a = _publish_chain("ns-a10", plugin_code="@business/plugin-a10", version="1.0.0", payload=b"V1-BYTES")
+    att_v1 = a["attachmentId"]
+
+    v2 = _publish_next_version(
+        service_id=a["serviceId"],
+        plugin_id=a["pluginId"],
+        plugin_code="@business/plugin-a10",
+        version="2.0.0",
+        payload=b"V2-BYTES",
+    )
+
+    # 下 v1(已被 v2 灭活)→ 404,且不泄漏 v1 字节
+    r_v1 = client.get(f"/api/distribution/download/{att_v1}", headers=_bearer(a["pullToken"]))
+    assert r_v1.status_code == 404, r_v1.text
+    assert r_v1.content != b"V1-BYTES"
+
+    # 下 v2(当前唯一 active)→ 200,返回 v2 字节
+    r_v2 = client.get(f"/api/distribution/download/{v2['attachmentId']}", headers=_bearer(a["pullToken"]))
+    assert r_v2.status_code == 200, r_v2.text
+    assert r_v2.content == b"V2-BYTES"
+
+
+# --- B1:每 plugin_version 至多一附件(plugin_version_id UNIQUE 兜底)----------
+
+
+def test_attachment_unique_per_plugin_version(client: TestClient, storage_tmp) -> None:
+    """评审 B1(方案 B):`plugin_attachment.plugin_version_id` UNIQUE。
+
+    同一 plugin_version 建第二个 attachment → 撞 UNIQUE → store.Conflict(路由层映射 409)。
+    保证下载授权(version 粒度)与清单 func.max(attachment.id) 投放口径在 DB 层即一一对应。
+    """
+    plugin = store.create_row(Plugin, {"code": "@business/plugin-b1"})
+    pv = store.create_row(PluginVersion, {"plugin_id": plugin.id, "version": "1.0.0"})
+    store.create_row(
+        PluginAttachment,
+        {"plugin_version_id": pv.id, "filename": "a.tgz", "size": 3, "storage_path": "x/y/a.tgz"},
+    )
+    with pytest.raises(store.Conflict):
+        store.create_row(
+            PluginAttachment,
+            {"plugin_version_id": pv.id, "filename": "b.tgz", "size": 3, "storage_path": "x/y/b.tgz"},
+        )

@@ -349,18 +349,30 @@ def reactivate(spv_id: int) -> ServicePluginVersion:
     """历史重新激活:把指定历史版本行置为唯一 active(M-6:同时清 is_rolled_back=False)。
 
     spv 不存在 → `NotFound`;并发置活撞 UNIQUE → `Conflict`(路由层 → 409)。
+
+    ⚠️ 评审 C2(并发正确性):**先锁同绑定 service_plugin 父行,锁后再对目标 spv 行
+    locking read 重取最新已提交状态**,杜绝 MySQL RR 下基于锁前陈旧快照决策。锁前的
+    `session.get` 仅用于定位父行 id(不参与任何状态决策)。
     """
     now = _now()
     with _db().session_factory() as session:
-        target = session.get(ServicePluginVersion, spv_id)
-        if target is None:
+        # 锁前先无锁定位父行 id(仅用于拿 service_plugin_id 去锁父行,不据此做决策)。
+        locator = session.get(ServicePluginVersion, spv_id)
+        if locator is None:
             raise NotFound("service_plugin_version 不存在")
-        # 锁同绑定的 service_plugin 行(MySQL8 真行锁;sqlite no-op,见 L1)。
+        service_plugin_id = locator.service_plugin_id
+
+        # 锁同绑定的 service_plugin 行(MySQL8 真行锁;sqlite no-op,见 L1),串行化同绑定写。
         session.execute(
             select(ServicePlugin)
-            .where(ServicePlugin.id == target.service_plugin_id)
+            .where(ServicePlugin.id == service_plugin_id)
             .with_for_update()
         ).scalar_one_or_none()
+
+        # 评审 C2:持父锁后对目标 spv 行 locking read 重取最新已提交状态,后续守卫/状态机均基于此。
+        target = session.get(ServicePluginVersion, spv_id, with_for_update=True)
+        if target is None:  # 极端:定位后被并发删除
+            raise NotFound("service_plugin_version 不存在")
 
         # 全灭活 + 清 key → flush(评审 M4)→ 置目标行 active + 设 key + 清回滚标记(M-6)。
         _deactivate_all(session, target.service_id, target.plugin_id)
@@ -390,18 +402,29 @@ def rollback(spv_id: int) -> ServicePluginVersion:
     """
     now = _now()
     with _db().session_factory() as session:
-        current = session.get(ServicePluginVersion, spv_id)
-        if current is None:
+        # 锁前先无锁定位父行 id(仅用于拿 service_plugin_id 去锁父行,不据此做决策)。
+        locator = session.get(ServicePluginVersion, spv_id)
+        if locator is None:
             raise NotFound("service_plugin_version 不存在")
-        if not current.is_active:
-            raise Conflict("仅能回滚当前 active 版本")
+        service_plugin_id = locator.service_plugin_id
+
+        # 评审 C2(并发正确性):**先锁同绑定 service_plugin 父行**(MySQL8 真行锁;sqlite no-op,见 L1),
+        # 串行化同绑定写,再做后续所有读+决策。
         session.execute(
             select(ServicePlugin)
-            .where(ServicePlugin.id == current.service_plugin_id)
+            .where(ServicePlugin.id == service_plugin_id)
             .with_for_update()
         ).scalar_one_or_none()
 
-        # 候选:同绑定、order 更小、未回滚、非 active 中 order 最大者。
+        # 评审 C2:持父锁后对当前行 locking read 重取最新已提交状态,`is_active` 守卫基于此判定
+        # (锁前快照在 RR 下可能已被并发 publish/rollback 改写 → is_rolled_back 误标/回滚链错乱)。
+        current = session.get(ServicePluginVersion, spv_id, with_for_update=True)
+        if current is None:  # 极端:定位后被并发删除
+            raise NotFound("service_plugin_version 不存在")
+        if not current.is_active:
+            raise Conflict("仅能回滚当前 active 版本")
+
+        # 候选:同绑定、order 更小、未回滚、非 active 中 order 最大者(在父锁内选,基于最新已提交状态)。
         candidate = session.execute(
             select(ServicePluginVersion)
             .where(

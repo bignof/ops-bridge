@@ -78,11 +78,16 @@ class PluginAttachment(Base):
     __tablename__ = "plugin_attachment"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    plugin_version_id: Mapped[int] = mapped_column(Integer, index=True)
+    # 评审 B1(方案 B):每 plugin_version 至多一附件(契合 spec version↔.tgz 一一对应)。
+    # UNIQUE 后下载授权(plugin_version 粒度)与清单 func.max(attachment.id) 投放口径自然一致
+    # (唯一行 → max 退化为该行)。UNIQUE 约束自带唯一索引,不再叠加普通 index。
+    plugin_version_id: Mapped[int] = mapped_column(Integer)
     filename: Mapped[str] = mapped_column(String(512))
     size: Mapped[int | None] = mapped_column(Integer, nullable=True)
     storage_path: Mapped[str] = mapped_column(String(1024))  # 平台生成
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (UniqueConstraint("plugin_version_id", name="uq_pa_plugin_version"),)
 
 
 class ServicePlugin(Base):
@@ -107,8 +112,10 @@ class ServicePluginVersion(Base):
     version_order: Mapped[int] = mapped_column(Integer, default=1)
     is_active: Mapped[bool] = mapped_column(Boolean, default=False)
     is_rolled_back: Mapped[bool] = mapped_column(Boolean, default=False)
-    # 单活:app 维护的 nullable unique 普通列(active 时 = f"{service_id}-{plugin_id}",否则 NULL)
-    spv_active_key: Mapped[str | None] = mapped_column(String(512), nullable=True, unique=True)
+    # 单活:app 维护的 nullable unique 普通列(active 时 = f"{service_id}-{plugin_id}",否则 NULL)。
+    # 评审 C3:形态 `{service_id}-{plugin_id}`(int-int,最长 ~21 字符),收窄到 String(191)——
+    # utf8mb4 下 UNIQUE 索引键长 ≤ 191*4=764 字节,远离 InnoDB 3072 字节上限(512 无必要且逼近上限)。
+    spv_active_key: Mapped[str | None] = mapped_column(String(191), nullable=True, unique=True)
     publish_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

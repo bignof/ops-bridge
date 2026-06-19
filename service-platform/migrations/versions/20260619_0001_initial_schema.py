@@ -89,12 +89,10 @@ def upgrade() -> None:
         sa.Column("storage_path", sa.String(length=1024), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.PrimaryKeyConstraint("id"),
-    )
-    op.create_index(
-        op.f("ix_plugin_attachment_plugin_version_id"),
-        "plugin_attachment",
-        ["plugin_version_id"],
-        unique=False,
+        # 评审 B1(方案 B):每 plugin_version 至多一附件(version↔.tgz 一一对应),
+        # UNIQUE 使下载授权(version 粒度)与清单 func.max(attachment.id) 投放口径一致。
+        # UNIQUE 自带唯一索引,故不再叠加普通 index。
+        sa.UniqueConstraint("plugin_version_id", name="uq_pa_plugin_version"),
     )
 
     op.create_table(
@@ -119,8 +117,9 @@ def upgrade() -> None:
         sa.Column("version_order", sa.Integer(), nullable=False),
         sa.Column("is_active", sa.Boolean(), nullable=False),
         sa.Column("is_rolled_back", sa.Boolean(), nullable=False),
-        # 单活:nullable unique 普通列(active 时 = f"{service_id}-{plugin_id}",否则 NULL)
-        sa.Column("spv_active_key", sa.String(length=512), nullable=True),
+        # 单活:nullable unique 普通列(active 时 = f"{service_id}-{plugin_id}",否则 NULL)。
+        # 评审 C3:int-int 形态最长 ~21 字符,收窄 String(191) 使 utf8mb4 UNIQUE 键长远离 InnoDB 上限。
+        sa.Column("spv_active_key", sa.String(length=191), nullable=True),
         sa.Column("publish_time", sa.DateTime(timezone=True), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
@@ -192,7 +191,7 @@ def downgrade() -> None:
     op.drop_index(op.f("ix_service_plugin_service_id"), table_name="service_plugin")
     op.drop_table("service_plugin")
 
-    op.drop_index(op.f("ix_plugin_attachment_plugin_version_id"), table_name="plugin_attachment")
+    # plugin_attachment 的 plugin_version_id 唯一约束(uq_pa_plugin_version)随 drop_table 一并移除。
     op.drop_table("plugin_attachment")
 
     op.drop_index(op.f("ix_plugin_version_plugin_id"), table_name="plugin_version")

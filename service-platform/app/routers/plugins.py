@@ -47,7 +47,8 @@ async def create_plugin(
     _: str = Depends(require_session),
 ) -> PluginOut:
     try:
-        record = store.create_row(Plugin, body.model_dump())
+        # by_alias=False:按 snake 字段名写 ORM,勿被 camel alias 灌坏多词列(评审 A4,与其余 3 个 CRUD 对齐)。
+        record = store.create_row(Plugin, body.model_dump(by_alias=False))
     except store.Conflict:
         raise HTTPException(status.HTTP_409_CONFLICT, "plugin code already exists")
     return PluginOut.model_validate(record)
@@ -70,7 +71,8 @@ async def update_plugin(
     body: PluginUpdate,
     _: str = Depends(require_session),
 ) -> PluginOut:
-    values = body.model_dump(exclude_unset=True)
+    # by_alias=False:按 snake 字段名取增量,勿被 camel alias 灌坏多词列(评审 A4,与其余 3 个 CRUD 对齐)。
+    values = body.model_dump(exclude_unset=True, by_alias=False)
     try:
         record = store.update_row(Plugin, plugin_id, values)
     except store.Conflict:

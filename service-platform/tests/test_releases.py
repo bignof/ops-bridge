@@ -377,6 +377,37 @@ def test_releases_endpoints_require_auth(client: TestClient) -> None:
     assert client.post("/api/releases/rollback", json={"spvId": 1}).status_code == 401
 
 
+def test_reactivate_endpoint_200_camelcase(client: TestClient) -> None:
+    """评审 A11:reactivate 端点 HTTP 层 200 从未经 HTTP 测试(覆盖率确认 Miss)。
+
+    历史行(被后发布版本灭活)经端点 reactivate → 200,响应 camelCase
+    (isActive=True、spvActiveKey 非空),且**无任何 snake key**。
+    """
+    h = _h(client)
+    svc_id, plg_id, _ = _mk_binding("re-ep-ns", "re-ep-svc", "re-ep-plg")
+    r10 = store.publish(svc_id, plg_id, _mk_version(plg_id, "1.0"))
+    store.publish(svc_id, plg_id, _mk_version(plg_id, "1.1"))  # r10 被灭活,成历史行
+    assert store.get_row(ServicePluginVersion, r10.id).is_active is False
+
+    r = client.post("/api/releases/reactivate", json={"spvId": r10.id}, headers=h)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["id"] == r10.id
+    assert data["isActive"] is True
+    assert data["isRolledBack"] is False
+    assert data["spvActiveKey"] == f"{svc_id}-{plg_id}"
+    # camelCase 往返:响应无 snake key(评审 H2)
+    for snake in ("is_active", "is_rolled_back", "spv_active_key", "service_id", "plugin_id"):
+        assert snake not in data
+
+
+def test_reactivate_endpoint_missing_404(client: TestClient) -> None:
+    """评审 A11:reactivate 不存在的 spvId → 404(端点层错误映射 store.NotFound)。"""
+    h = _h(client)
+    r = client.post("/api/releases/reactivate", json={"spvId": 999999}, headers=h)
+    assert r.status_code == 404, r.text
+
+
 def test_publish_endpoint_camel_roundtrip_no_snake_keys(client: TestClient) -> None:
     # 评审 H2:camelCase 往返 + 响应无 snake key。
     h = _h(client)
