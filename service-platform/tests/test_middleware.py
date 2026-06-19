@@ -144,3 +144,38 @@ def test_downstream_non_401_passes_through_not_swallowed(
         "/api/__teapot__", headers={"Authorization": f"Bearer {tok}"}
     )
     assert r.status_code == 418, r.text  # call_next 在 try 外 → 下游异常原样透传
+
+
+# ④ 精确护栏:上面的 418 用例对「call_next 被误挪进 try」不敏感(418 即便落到
+#    `except HTTPException` 仍照样回 418)。本用例让下游抛**非-HTTPException**
+#    (RuntimeError),只有 call_next 真在 try **外**才会原样冒泡为 500/异常;若被
+#    误挪进 try,`except Exception` 会把它吞成 401——掩盖真实下游 500。故能真正区分。
+@pytest.fixture()
+def client_with_boom_probe(client: TestClient) -> Iterator[TestClient]:
+    """临时挂一个带合法 Depends、但下游故意抛 `RuntimeError`(非 HTTPException)的 /api 路由。"""
+    from app.auth import require_session
+
+    app = client.app
+
+    async def _boom(_: str = Depends(require_session)) -> dict:
+        raise RuntimeError("boom")
+
+    app.add_api_route("/api/__boom__", _boom, methods=["GET"])
+    try:
+        yield client
+    finally:
+        app.router.routes[:] = [
+            r for r in app.router.routes if getattr(r, "path", None) != "/api/__boom__"
+        ]
+
+
+def test_downstream_non_http_exception_not_swallowed_as_401(
+    client_with_boom_probe: TestClient,
+) -> None:
+    tok = _token(client_with_boom_probe)
+    # conftest 的 client 用默认 `TestClient(app)`(raise_server_exceptions=True),
+    # 故下游 RuntimeError 会原样冒泡为 pytest 异常——绝不应被中间件吞成 401。
+    with pytest.raises(RuntimeError, match="boom"):
+        client_with_boom_probe.get(
+            "/api/__boom__", headers={"Authorization": f"Bearer {tok}"}
+        )
