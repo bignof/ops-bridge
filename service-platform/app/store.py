@@ -20,12 +20,18 @@ from typing import Any, Sequence, TypeVar
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
+from app.db_models import ServicePlugin, ServicePluginVersion
+
 
 ModelT = TypeVar("ModelT")
 
 
 class Conflict(Exception):
     """唯一约束冲突(create/update 触发);路由层映射为 HTTP 409。"""
+
+
+class NotFound(Exception):
+    """目标行不存在(发布未绑定 / spv 不存在 / 无可回滚候选);路由层映射为 HTTP 404。"""
 
 
 def _now() -> datetime:
@@ -173,3 +179,177 @@ def delete_row(model: type[ModelT], row_id: int) -> bool:
         session.delete(record)
         session.commit()
         return True
+
+
+# --- 发布/历史激活/回滚:单活 + 事务锁 + 状态机(Task 10) --------------------
+#
+# 单活不变式:每 (service,plugin) 至多一行 is_active=True;由 `spv_active_key`
+# (nullable unique;active 时 = f"{service_id}-{plugin_id}",否则 None)+ DB UNIQUE 兜底。
+#
+# ⚠️ 评审 M4(最易踩、最常见回滚路径必崩):三函数统一「先把同绑定全部灭活 + 清 key」
+#    → **`s.flush()`** → 「再置目标行 active + 设 key」。**必须 flush 分隔**:SQLAlchemy
+#    在 commit 期按主键升序发 UPDATE,回滚/激活到**更低 PK 的历史行**时,低 PK 行的「置 key」
+#    会先于高 PK 当前行的「清 key」发出 → UNIQUE 立即违例(sqlite/MySQL8 均即时检查)。
+#    flush 把「清 key」先刷到 DB,再发「置 key」,避开该排序爆炸。
+#
+# 并发闸:`with_for_update()` 锁 service_plugin 行(评审 L1:sqlite 上是 no-op,MySQL8 才真
+#    行锁);真正跨进程的兜底是 spv_active_key 的 UNIQUE + IntegrityError→Conflict(409)。
+
+
+def _deactivate_all(session: Any, service_id: int, plugin_id: int) -> list[ServicePluginVersion]:
+    """把同 (service,plugin) 下所有版本行 is_active=False + spv_active_key=None。
+
+    返回这些行(供调用方按需取目标行)。**调用方须在置目标 key 前 `session.flush()`**
+    (评审 M4),否则低 PK 历史行的置 key 会先于高 PK 当前行的清 key 发出而撞 UNIQUE。
+    """
+    rows = list(
+        session.execute(
+            select(ServicePluginVersion).where(
+                ServicePluginVersion.service_id == service_id,
+                ServicePluginVersion.plugin_id == plugin_id,
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in rows:
+        row.is_active = False
+        row.spv_active_key = None
+    return rows
+
+
+def publish(service_id: int, plugin_id: int, plugin_version_id: int) -> ServicePluginVersion:
+    """发布:为已绑定的 (service,plugin) 追加一版并置为唯一 active(version_order 自增)。
+
+    绑定不存在 → `NotFound`;并发置活撞 UNIQUE → `Conflict`(路由层 → 409)。
+    """
+    now = _now()
+    with _db().session_factory() as session:
+        sp = session.execute(
+            select(ServicePlugin)
+            .where(ServicePlugin.service_id == service_id, ServicePlugin.plugin_id == plugin_id)
+            .with_for_update()
+        ).scalar_one_or_none()
+        if sp is None:
+            raise NotFound("service_plugin 未绑定,请先创建关联")
+
+        # 先全灭活 + 清 key,再 flush(评审 M4),最后 INSERT 带 key 的新行。
+        _deactivate_all(session, service_id, plugin_id)
+        session.flush()
+
+        max_order = session.execute(
+            select(func.coalesce(func.max(ServicePluginVersion.version_order), 0)).where(
+                ServicePluginVersion.service_plugin_id == sp.id
+            )
+        ).scalar_one()
+        record = ServicePluginVersion(
+            service_plugin_id=sp.id,
+            service_id=service_id,
+            plugin_id=plugin_id,
+            plugin_version_id=plugin_version_id,
+            version_order=max_order + 1,
+            is_active=True,
+            is_rolled_back=False,
+            spv_active_key=f"{service_id}-{plugin_id}",
+            publish_time=now,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(record)
+        try:
+            session.commit()
+        except IntegrityError as exc:
+            session.rollback()
+            raise Conflict(str(exc.orig)) from exc
+        session.refresh(record)
+        return record
+
+
+def reactivate(spv_id: int) -> ServicePluginVersion:
+    """历史重新激活:把指定历史版本行置为唯一 active(M-6:同时清 is_rolled_back=False)。
+
+    spv 不存在 → `NotFound`;并发置活撞 UNIQUE → `Conflict`(路由层 → 409)。
+    """
+    now = _now()
+    with _db().session_factory() as session:
+        target = session.get(ServicePluginVersion, spv_id)
+        if target is None:
+            raise NotFound("service_plugin_version 不存在")
+        # 锁同绑定的 service_plugin 行(MySQL8 真行锁;sqlite no-op,见 L1)。
+        session.execute(
+            select(ServicePlugin)
+            .where(ServicePlugin.id == target.service_plugin_id)
+            .with_for_update()
+        ).scalar_one_or_none()
+
+        # 全灭活 + 清 key → flush(评审 M4)→ 置目标行 active + 设 key + 清回滚标记(M-6)。
+        _deactivate_all(session, target.service_id, target.plugin_id)
+        session.flush()
+
+        target.is_active = True
+        target.is_rolled_back = False
+        target.spv_active_key = f"{target.service_id}-{target.plugin_id}"
+        target.updated_at = now
+        try:
+            session.commit()
+        except IntegrityError as exc:
+            session.rollback()
+            raise Conflict(str(exc.orig)) from exc
+        session.refresh(target)
+        return target
+
+
+def rollback(spv_id: int) -> ServicePluginVersion:
+    """回滚:把当前 active 行标记 is_rolled_back=True,并激活其前一可用历史版本。
+
+    候选谓词:同绑定下 `version_order < 当前 ∧ not is_rolled_back ∧ not is_active`
+    里 version_order 最大者。返回新激活的候选行。
+
+    spv 不存在 → `NotFound`;spv 非当前 active → `Conflict`(只能回滚当前在线版本);
+    无可回滚候选 → `NotFound`;并发置活撞 UNIQUE → `Conflict`。
+    """
+    now = _now()
+    with _db().session_factory() as session:
+        current = session.get(ServicePluginVersion, spv_id)
+        if current is None:
+            raise NotFound("service_plugin_version 不存在")
+        if not current.is_active:
+            raise Conflict("仅能回滚当前 active 版本")
+        session.execute(
+            select(ServicePlugin)
+            .where(ServicePlugin.id == current.service_plugin_id)
+            .with_for_update()
+        ).scalar_one_or_none()
+
+        # 候选:同绑定、order 更小、未回滚、非 active 中 order 最大者。
+        candidate = session.execute(
+            select(ServicePluginVersion)
+            .where(
+                ServicePluginVersion.service_plugin_id == current.service_plugin_id,
+                ServicePluginVersion.version_order < current.version_order,
+                ServicePluginVersion.is_rolled_back.is_(False),
+                ServicePluginVersion.is_active.is_(False),
+            )
+            .order_by(ServicePluginVersion.version_order.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if candidate is None:
+            raise NotFound("无可回滚的历史版本")
+
+        # 全灭活 + 清 key → flush(评审 M4:候选可能是更低 PK 历史行)→ 置候选 active + 设 key;
+        # 当前行标记 is_rolled_back=True(已随 _deactivate_all 置 is_active=False/清 key)。
+        _deactivate_all(session, current.service_id, current.plugin_id)
+        current.is_rolled_back = True
+        current.updated_at = now
+        session.flush()
+
+        candidate.is_active = True
+        candidate.spv_active_key = f"{candidate.service_id}-{candidate.plugin_id}"
+        candidate.updated_at = now
+        try:
+            session.commit()
+        except IntegrityError as exc:
+            session.rollback()
+            raise Conflict(str(exc.orig)) from exc
+        session.refresh(candidate)
+        return candidate

@@ -239,3 +239,53 @@ class PluginUploadOut(BaseModel):
     plugin_version_id: int
     attachment_id: int
     version: str
+
+
+# --- releases 发布/历史激活/回滚(Task 10) ---------------------------------
+
+
+class ReleasePublishIn(BaseModel):
+    """发布请求:为 (serviceId, pluginId) 绑定追加一版并置为唯一 active。"""
+
+    model_config = MODEL_CONFIG
+
+    service_id: int
+    plugin_id: int
+    plugin_version_id: int
+
+
+class ReleaseSpvIn(BaseModel):
+    """reactivate / rollback 请求:仅 spvId(service_plugin_version 行 id)。"""
+
+    model_config = MODEL_CONFIG
+
+    spv_id: int
+
+
+class ReleaseOut(BaseModel):
+    """release(service_plugin_version)响应:本行状态字段 + LEFT JOIN 回
+    `serviceCode` / `pluginCode` / `version`(+ `namespaceCode`)只读名称(评审 H3)。
+
+    `spvActiveKey` 是 app 维护的单活兜底列(active 时非空,否则 None);随响应返回便于
+    前端/审计核验「当前唯一 active」不变式。
+    """
+
+    model_config = MODEL_CONFIG
+
+    id: int
+    service_plugin_id: int
+    service_id: int
+    plugin_id: int
+    plugin_version_id: int
+    version_order: int
+    is_active: bool
+    is_rolled_back: bool
+    spv_active_key: str | None = None
+    namespace_code: str | None = None
+    service_code: str | None = None
+    plugin_code: str | None = None
+    version: str | None = None
+
+
+class ReleaseListOut(ListEnvelope[ReleaseOut]):
+    """release 列表响应(具体子类,避开泛型 response_model 的 Pydantic 警告路径)。"""

@@ -12,6 +12,7 @@ from app.routers.auth import router as auth_router
 from app.routers.namespaces import router as namespaces_router
 from app.routers.plugin_versions import router as plugin_versions_router
 from app.routers.plugins import router as plugins_router
+from app.routers.releases import router as releases_router
 from app.routers.service_plugins import router as service_plugins_router
 from app.routers.services import router as services_router
 from app.routers.system import router as system_router
@@ -46,3 +47,4 @@ app.include_router(plugin_versions_router)
 app.include_router(namespaces_router)
 app.include_router(services_router)
 app.include_router(service_plugins_router)
+app.include_router(releases_router)
