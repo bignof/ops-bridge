@@ -82,8 +82,13 @@ def test_login_reachable_without_token(client: TestClient) -> None:
 
 
 # ③ /api/distribution/** 无 JWT → 不被中间件 401 拦(放行给端点内 pull token)。
-#    P1a 尚无该端点,故落到 404(路由不存在)——关键是**不是 401**。
+#    Task 11 已实现该端点:中间件放行后由端点内 pull token 自校验。关键命题仍是**不是
+#    中间件 401**——带齐 query 参数但不带 token 时,落到端点 pull token 校验 → 403
+#    (而非中间件 JWT 401),证明鉴权确实交给了端点而非中间件。
 def test_distribution_prefix_not_blocked_by_middleware(client: TestClient) -> None:
-    r = client.get("/api/distribution/plugins")
-    assert r.status_code != 401, r.text
-    assert r.status_code == 404, r.text  # 端点未建,放行后路由未命中
+    # 缺 query 参数时仅证明放行(非 401);带齐参数无 token 时落端点 pull token → 403。
+    r_no_params = client.get("/api/distribution/plugins")
+    assert r_no_params.status_code != 401, r_no_params.text  # 中间件放行(缺参 → 422)
+
+    r = client.get("/api/distribution/plugins?namespace=x&service=y")
+    assert r.status_code == 403, r.text  # 放行到端点,由 pull token 自校验拒绝(非中间件 401)

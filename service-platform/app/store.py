@@ -20,7 +20,17 @@ from typing import Any, Sequence, TypeVar
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
-from app.db_models import ServicePlugin, ServicePluginVersion
+from app import tokens
+from app.db_models import (
+    FetchRecord,
+    Namespace,
+    Plugin,
+    PluginAttachment,
+    PluginVersion,
+    Service,
+    ServicePlugin,
+    ServicePluginVersion,
+)
 
 
 ModelT = TypeVar("ModelT")
@@ -353,3 +363,140 @@ def rollback(spv_id: int) -> ServicePluginVersion:
             raise Conflict(str(exc.orig)) from exc
         session.refresh(candidate)
         return candidate
+
+
+# --- 分发(pull token 鉴权 + id 归属式下载 + fetch_record;Task 11) ----------
+#
+# ⚠️ 安全不变式(本任务核心,逐条照做):
+# 1. pull token 解析:**对空明文先短路返回 None**,再遍历有 hash 的 namespace 用
+#    `tokens.verify_token`(常量时间)逐一比对;无匹配 → None。**绝不裸 `==` 比哈希。**
+# 2. download 归属校验:只靠 token→ns + active spv 链,**不靠任何 query 参数**;不符
+#    一律由路由层映射 404(防 IDOR 探测存在性,不是 403)。
+# 3. fetch_record 写入走 snake 字段名(by_alias=False),勿被 camel 键灌坏多词列。
+
+
+def resolve_namespace_by_pull_token(plain: str | None) -> Namespace | None:
+    """按明文 pull token 反解所属 namespace(常量时间逐一比对)。
+
+    安全不变式 #1:
+    - 明文为空/None → 立即返回 None(fail-closed,绝不进入比对)。
+    - 仅取 `pull_token_hash IS NOT NULL` 的 namespace,逐行 `tokens.verify_token`
+      (内部 `hmac.compare_digest` 常量时间);**绝不先 `==` 裸比哈希**。
+    - 无任何匹配 → None。
+    """
+    if not plain:  # None / 空明文先短路(verify_token 也 fail-closed,这里再加一层)
+        return None
+    with _db().session_factory() as session:
+        rows = list(
+            session.execute(
+                select(Namespace).where(Namespace.pull_token_hash.is_not(None))
+            )
+            .scalars()
+            .all()
+        )
+        for ns in rows:
+            if tokens.verify_token(plain, ns.pull_token_hash or ""):
+                return ns
+        return None
+
+
+def query_active_plugins(namespace_code: str, service_code: str) -> list[dict[str, Any]]:
+    """查 (namespace_code, service_code) 下所有 active 版本的可拉取插件(对齐旧 queryPlugin)。
+
+    链(镜像旧 SQL):service_plugin_version(is_active=True)→ service(service_code
+    匹配,namespace_id 指向 namespace_code)→ namespace(code 匹配)→ plugin(取 code
+    = pluginName)→ plugin_version(取 version,NOT NULL 恒非空)→ plugin_attachment
+    (取该 version 下 id 最大的一条作为下载目标)。
+
+    返回每命中插件一个 dict,含返回契约字段(plugin_code/version/attachment_id)+ 写
+    fetch_record 所需的 namespace_id/service_id/plugin_id/plugin_version_id。attachment
+    缺失的行被 INNER JOIN 天然剔除(无包可下,不应出现在分发清单)。
+    """
+    with _db().session_factory() as session:
+        stmt = (
+            select(
+                Namespace.id.label("namespace_id"),
+                Service.id.label("service_id"),
+                Plugin.id.label("plugin_id"),
+                Plugin.code.label("plugin_code"),
+                PluginVersion.id.label("plugin_version_id"),
+                PluginVersion.version.label("version"),
+                func.max(PluginAttachment.id).label("attachment_id"),
+            )
+            .select_from(ServicePluginVersion)
+            .join(Service, Service.id == ServicePluginVersion.service_id)
+            .join(Namespace, Namespace.id == Service.namespace_id)
+            .join(Plugin, Plugin.id == ServicePluginVersion.plugin_id)
+            .join(PluginVersion, PluginVersion.id == ServicePluginVersion.plugin_version_id)
+            .join(PluginAttachment, PluginAttachment.plugin_version_id == PluginVersion.id)
+            .where(
+                ServicePluginVersion.is_active.is_(True),
+                Namespace.code == namespace_code,
+                Service.service_code == service_code,
+            )
+            .group_by(
+                Namespace.id,
+                Service.id,
+                Plugin.id,
+                Plugin.code,
+                PluginVersion.id,
+                PluginVersion.version,
+            )
+            .order_by(Plugin.code.asc())
+        )
+        return [dict(m) for m in session.execute(stmt).mappings().all()]
+
+
+def attachment_in_namespace(attachment_id: int, namespace_id: int) -> PluginAttachment | None:
+    """归属式取 attachment(安全不变式 #2:防 IDOR)。
+
+    仅当存在一条 **active** 的 service_plugin_version,把该 attachment 的
+    plugin_version 关联到「给定 namespace」下的某个 service 时,才返回该 attachment
+    (一个 version 可被多个 service 绑定,只要存在一条 active 链到本 namespace 即放行)。
+    否则返回 None(路由层映射 404,不暴露存在性)。
+
+    **只靠 attachment→plugin_version→spv(active)→service→namespace == 给定 namespace**,
+    不接受任何 query 参数旁路。
+    """
+    with _db().session_factory() as session:
+        att = session.get(PluginAttachment, attachment_id)
+        if att is None:
+            return None
+        linked = session.execute(
+            select(ServicePluginVersion.id)
+            .select_from(ServicePluginVersion)
+            .join(Service, Service.id == ServicePluginVersion.service_id)
+            .where(
+                ServicePluginVersion.plugin_version_id == att.plugin_version_id,
+                ServicePluginVersion.is_active.is_(True),
+                Service.namespace_id == namespace_id,
+            )
+            .limit(1)
+        ).first()
+        return att if linked is not None else None
+
+
+def create_fetch_record(
+    *,
+    namespace_id: int,
+    service_id: int,
+    plugin_id: int,
+    plugin_version_id: int,
+    remark: str | None = None,
+) -> FetchRecord:
+    """写一行拉取审计记录(fetch_date 服务端填当前 UTC)。
+
+    全部 snake 字段名(安全不变式 #3:勿用 camel 键写 ORM,会灌坏 plugin_version_id 等多词列)。
+    """
+    now = _now()
+    return create_row(
+        FetchRecord,
+        {
+            "namespace_id": namespace_id,
+            "service_id": service_id,
+            "plugin_id": plugin_id,
+            "plugin_version_id": plugin_version_id,
+            "fetch_date": now,
+            "remark": remark,
+        },
+    )
