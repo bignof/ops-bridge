@@ -350,9 +350,10 @@ def reactivate(spv_id: int) -> ServicePluginVersion:
 
     spv 不存在 → `NotFound`;并发置活撞 UNIQUE → `Conflict`(路由层 → 409)。
 
-    ⚠️ 评审 C2(并发正确性):**先锁同绑定 service_plugin 父行,锁后再对目标 spv 行
-    locking read 重取最新已提交状态**,杜绝 MySQL RR 下基于锁前陈旧快照决策。锁前的
-    `session.get` 仅用于定位父行 id(不参与任何状态决策)。
+    ⚠️ 评审 C2(并发正确性)+ R1:**先锁同绑定 service_plugin 父行,锁后再对目标 spv 行
+    locking read 重取最新已提交状态(`populate_existing=True` 强制刷新,绕开 identity-map
+    缓存)**,杜绝 MySQL RR 下基于锁前陈旧快照决策。锁前的 `session.get` 仅用于定位父行 id
+    (不参与任何状态决策)。
     """
     now = _now()
     with _db().session_factory() as session:
@@ -369,8 +370,13 @@ def reactivate(spv_id: int) -> ServicePluginVersion:
             .with_for_update()
         ).scalar_one_or_none()
 
-        # 评审 C2:持父锁后对目标 spv 行 locking read 重取最新已提交状态,后续守卫/状态机均基于此。
-        target = session.get(ServicePluginVersion, spv_id, with_for_update=True)
+        # 评审 C2 + R1:持父锁后对目标 spv 行 locking read 重取最新已提交状态,后续守卫/状态机均基于此。
+        # **必须 populate_existing=True**:锁前的 locator 已把该行装进 identity map,不加此参数时
+        # session.get 会命中缓存直接返回**陈旧对象**(不发 SQL、不刷属性),守卫/候选仍消费锁前快照
+        # (复审 R1:实测 again is loc);populate_existing 强制覆盖缓存属性,真正读到锁后最新状态。
+        target = session.get(
+            ServicePluginVersion, spv_id, with_for_update=True, populate_existing=True
+        )
         if target is None:  # 极端:定位后被并发删除
             raise NotFound("service_plugin_version 不存在")
 
@@ -416,9 +422,13 @@ def rollback(spv_id: int) -> ServicePluginVersion:
             .with_for_update()
         ).scalar_one_or_none()
 
-        # 评审 C2:持父锁后对当前行 locking read 重取最新已提交状态,`is_active` 守卫基于此判定
+        # 评审 C2 + R1:持父锁后对当前行 locking read 重取最新已提交状态,`is_active` 守卫基于此判定
         # (锁前快照在 RR 下可能已被并发 publish/rollback 改写 → is_rolled_back 误标/回滚链错乱)。
-        current = session.get(ServicePluginVersion, spv_id, with_for_update=True)
+        # **必须 populate_existing=True**:锁前 locator 已进 identity map,不加则 get 命中缓存返回
+        # 陈旧对象、守卫读到锁前快照(复审 R1);强制覆盖缓存属性方能基于锁后最新状态决策。
+        current = session.get(
+            ServicePluginVersion, spv_id, with_for_update=True, populate_existing=True
+        )
         if current is None:  # 极端:定位后被并发删除
             raise NotFound("service_plugin_version 不存在")
         if not current.is_active:

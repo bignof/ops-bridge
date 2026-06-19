@@ -193,6 +193,48 @@ def test_parse_tgz_package_prefix_preferred_over_decoy() -> None:
     assert meta == {"name": "@business/plugin-x", "version": "1.2.3"}
 
 
+# --- R4(复审,A16 改写副作用):package/ 必须优先于根级(无论物理顺序) ---
+#    A16 把「按 _PKG_JSON_MEMBERS 偏好顺序择优」退化成「物理顺序命中即停」,丢了
+#    「package/ 优先于根级」(B1 不变式 + 节点 sync-plugins.js 的 exists(package/)?package/:root)。
+#    修复后:同含根级 + package/ 两布局时恒取 package/,与物理顺序无关。
+#
+#    变异验证:把 parse_tgz 改回「物理顺序命中即停」,根级在前的布局会取到根级(ROOT-VER)→ 红。
+
+
+def _make_tgz_both_layouts(*, package_first: bool) -> bytes:
+    """构造同时含**根级** package.json(version=ROOT-VER)与 **package/** package.json
+    (version=PKG-VER)的 tgz;`package_first` 控制二者物理先后。"""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as t:
+        root = json.dumps({"name": "@business/plugin-x", "version": "ROOT-VER"}).encode()
+        pkg = json.dumps({"name": "@business/plugin-x", "version": "PKG-VER"}).encode()
+
+        def _add(member_name: str, content: bytes) -> None:
+            info = tarfile.TarInfo(member_name)
+            info.size = len(content)
+            t.addfile(info, io.BytesIO(content))
+
+        if package_first:
+            _add("package/package.json", pkg)
+            _add("package.json", root)
+        else:
+            _add("package.json", root)
+            _add("package/package.json", pkg)
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("package_first", [True, False])
+def test_parse_tgz_package_prefix_preferred_over_root_regardless_of_order(package_first: bool) -> None:
+    """R4:同含根级 + package/ 两布局时,parse_tgz **恒取 package/**(PKG-VER),与物理顺序无关。
+
+    变异验证:实现改回「物理顺序命中即停」,`package_first=False`(根级在前)会取到 ROOT-VER → 红。
+    """
+    meta = storage.parse_tgz(_make_tgz_both_layouts(package_first=package_first))
+    assert meta == {"name": "@business/plugin-x", "version": "PKG-VER"}, (
+        f"package/ 未优先于根级(physical package_first={package_first})"
+    )
+
+
 # --- store_tgz + open_stream 往返 ---
 
 
@@ -264,6 +306,70 @@ def test_open_stream_traversal_guard_does_not_read_outside(tmp_path: Path, monke
 def test_sanitize_strips_traversal() -> None:
     out = storage._sanitize("../../x")
     assert ".." not in out and "/" not in out and "\\" not in out
+
+
+# --- R6(复审,既有边角):store_tgz 写盘中途失败不留半成品孤儿文件 ---
+#    旧实现 `open(abspath,'wb')` 立即创建/截断目标文件后 `f.write(data)`;write 中途 OSError
+#    (磁盘满/IO)时 store_tgz 未 return → 外层 stored_path 仍 None → 补偿 `if stored_path:` 假
+#    → 不调 safe_remove → 盘上留 0~部分字节孤儿。修复:写临时文件成功后 os.replace 到目标;
+#    write 失败则删半成品 temp 再重抛——**目标路径绝不出现部分写入文件**。
+#
+#    变异验证:把落盘改回直接 open(目标)+write(无 temp+replace),本用例目标路径会残留半成品 → 红。
+
+
+def test_store_tgz_mid_write_failure_leaves_no_target_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R6:write 中途抛 OSError → 目标路径盘上**无文件**(不留半成品孤儿)。"""
+    import builtins
+    import types
+
+    root = tmp_path / "plugins"
+    monkeypatch.setattr(storage, "settings", types.SimpleNamespace(plugin_storage_dir=str(root)))
+
+    target_rel = os.path.join("7", "70", "x.tgz")
+    target_abs = os.path.join(str(root), target_rel)
+
+    real_open = builtins.open
+
+    class _FailingWriter:
+        """包装真实文件句柄:真实创建/截断文件(复现磁盘上落地),但 write 抛 OSError。
+
+        如此可忠实复现旧实现「open(目标) 已在盘上建/截断文件 → write 中途失败 → 留孤儿」;
+        修复后写的是 temp 文件,失败时 temp 被清理,目标永不出现。
+        """
+
+        def __init__(self, fh):
+            self._fh = fh
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            self._fh.close()
+            return False
+
+        def write(self, _data):
+            raise OSError("disk full (simulated)")
+
+    def fake_open(file, mode="r", *args, **kwargs):
+        # 仅拦截 store_tgz 的二进制写(无论写到 temp 还是目标);其它(alembic 等)走真实 open。
+        if "w" in mode and "b" in mode:
+            return _FailingWriter(real_open(file, mode, *args, **kwargs))
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+
+    with pytest.raises(OSError):
+        storage.store_tgz(7, 70, "x.tgz", b"PAYLOAD")
+
+    # 还原 open 后检查盘面:目标路径绝不应残留(部分写入的)文件。
+    monkeypatch.setattr(builtins, "open", real_open)
+    assert not os.path.exists(target_abs), "store_tgz 写盘中途失败残留目标孤儿文件"
+    # 目录下也不应有任何遗留(temp 半成品须被清理)。
+    parent = os.path.dirname(target_abs)
+    leftovers = os.listdir(parent) if os.path.isdir(parent) else []
+    assert leftovers == [], f"残留半成品文件: {leftovers}"
 
 
 # --- 根级回退 sanity:真实交付包(评审 B1) ---

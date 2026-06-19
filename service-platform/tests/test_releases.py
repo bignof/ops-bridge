@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import event, text
+from sqlalchemy.orm import Session
 
 from app import store
 from app.db_models import (
@@ -425,3 +427,117 @@ def test_publish_endpoint_camel_roundtrip_no_snake_keys(client: TestClient) -> N
     assert data["spvActiveKey"] == f"{svc_id}-{plg_id}"
     for snake in ("service_id", "plugin_id", "version_order", "is_active", "is_rolled_back", "spv_active_key"):
         assert snake not in data
+
+
+# --- R1(评审 C2 复审):锁后重读必须强制刷新,杜绝 identity-map 缓存击穿 -----------
+#
+# G4 的 C2 改法「锁前 locator=session.get(spv_id) 定位父行 → 锁父行 → target=session.get(
+# spv_id, with_for_update=True) 重读」中,锁前 locator 已把行装进 SQLAlchemy identity map;
+# 若锁后那次 get 不加 populate_existing,会命中缓存直接返回**陈旧对象**(不发 SQL、不刷属性),
+# 守卫/候选仍消费锁前快照。本组用例在「锁前 locator 已加载」与「锁后重读」之间,用**另一连接**
+# 改该行并 commit,断言函数读到**新值**。
+#
+# 注入手法:在函数 session 的父行锁 SELECT(`select(ServicePlugin)...with_for_update()`,
+# 恰位于 locator get 与锁后 reread 之间)处挂 `do_orm_execute` 事件,首次命中 ServicePlugin
+# SELECT 时用 engine 的独立连接执行裸 SQL UPDATE+commit,完成外部提交。
+#
+# 变异验证(报告 R1):锁后 get 去掉 populate_existing → 读到陈旧值 → 这两条用例转红。
+
+
+@pytest.fixture()
+def _external_flip_on_parent_lock():
+    """返回一个 context manager:在函数 session 的「父行锁 SELECT」处注入一次外部裸 SQL 提交。
+
+    用法:`with cm(sql, params):` 内调用 store.reactivate/rollback。事件监听器在首次见到
+    ServicePlugin 的 with_for_update SELECT 时,用 main_module.database.engine 另开连接执行
+    `sql`(对 service_plugin_version 行的 UPDATE)并 commit——即「locator 已进 identity map
+    之后、锁后 reread 之前」发生外部已提交变更。
+    """
+    import contextlib
+
+    import app.main as main_module
+
+    @contextlib.contextmanager
+    def _cm(sql: str, params: dict):
+        fired = {"done": False}
+
+        def _listener(orm_execute_state):
+            if fired["done"]:
+                return
+            stmt = orm_execute_state.statement
+            text_sql = str(stmt)
+            # 仅在「父行锁 SELECT service_plugin ... FOR UPDATE / 或 sqlite no-op SELECT」时触发一次。
+            if "service_plugin" in text_sql and "service_plugin_version" not in text_sql and "SELECT" in text_sql.upper():
+                fired["done"] = True
+                with main_module.database.engine.connect() as conn:
+                    conn.execute(text(sql), params)
+                    conn.commit()
+
+        event.listen(Session, "do_orm_execute", _listener)
+        try:
+            yield fired
+        finally:
+            event.remove(Session, "do_orm_execute", _listener)
+
+    return _cm
+
+
+def test_reactivate_rereads_fresh_state_after_lock(client: TestClient, _external_flip_on_parent_lock) -> None:
+    """R1:reactivate 锁后重读必须看到外部已提交的最新状态(非锁前 identity-map 快照)。
+
+    构造:publish v10→v11(v10 历史、is_rolled_back=False)。在 reactivate(v10) 的父锁处,
+    外部把 v10 标记 is_rolled_back=True 并 commit。锁后强制刷新(populate_existing)后,函数读到
+    的 v10.is_rolled_back 应为 True(随后被 M-6 清回 False);用「执行期读到的快照」直接探测:
+    在 _deactivate_all 入口断言 target 已刷新到外部新值。
+
+    变异验证:锁后 get 去掉 populate_existing → 读到陈旧 False → 探针断言转红。
+    """
+    svc_id, plg_id, _ = _mk_binding("r1re-ns", "r1re-svc", "r1re-plg")
+    r10 = store.publish(svc_id, plg_id, _mk_version(plg_id, "1.0"))
+    store.publish(svc_id, plg_id, _mk_version(plg_id, "1.1"))  # v10 成历史(is_active=False)
+    assert store.get_row(ServicePluginVersion, r10.id).is_rolled_back is False
+
+    # 在 _deactivate_all 入口探测「锁后重读得到的 target 当前内存状态」是否已是外部新值。
+    seen: dict = {}
+    orig_deactivate = store._deactivate_all
+
+    def _probe(session, service_id, plugin_id):
+        # 此刻函数已走过锁后 reread;从 session 的 identity map 取目标行观察其 is_rolled_back。
+        obj = session.get(ServicePluginVersion, r10.id)
+        seen["is_rolled_back"] = obj.is_rolled_back
+        return orig_deactivate(session, service_id, plugin_id)
+
+    store._deactivate_all = _probe
+    try:
+        with _external_flip_on_parent_lock(
+            "UPDATE service_plugin_version SET is_rolled_back = 1 WHERE id = :id", {"id": r10.id}
+        ):
+            again = store.reactivate(r10.id)
+    finally:
+        store._deactivate_all = orig_deactivate
+
+    # 核心断言:锁后重读看到外部提交的新值(True),而非锁前快照(False)。
+    assert seen["is_rolled_back"] is True, "reactivate 锁后未强制刷新,读到 identity-map 陈旧快照"
+    # 收尾仍正确:reactivate 把它清回 False 并置 active(M-6)。
+    assert again.id == r10.id and again.is_active is True and again.is_rolled_back is False
+
+
+def test_rollback_guard_uses_fresh_state_after_lock(client: TestClient, _external_flip_on_parent_lock) -> None:
+    """R1:rollback 的 `is_active` 守卫必须基于锁后最新状态判定。
+
+    构造:publish v10→v11(v11 当前 active)。在 rollback(v11) 的父锁处,外部把 v11 灭活
+    (is_active=0)并 commit。锁后强制刷新后,守卫应读到 is_active=False → 抛 Conflict(仅能回滚
+    当前 active 版本);若读到锁前陈旧快照(True),会错误放行去回滚一个已非 active 的版本。
+
+    变异验证:锁后 get 去掉 populate_existing → 守卫读到陈旧 True → 不抛 Conflict → 本用例转红。
+    """
+    svc_id, plg_id, _ = _mk_binding("r1rb-ns", "r1rb-svc", "r1rb-plg")
+    store.publish(svc_id, plg_id, _mk_version(plg_id, "1.0"))
+    r11 = store.publish(svc_id, plg_id, _mk_version(plg_id, "1.1"))  # 当前 active
+
+    with _external_flip_on_parent_lock(
+        "UPDATE service_plugin_version SET is_active = 0, spv_active_key = NULL WHERE id = :id",
+        {"id": r11.id},
+    ):
+        with pytest.raises(store.Conflict):
+            store.rollback(r11.id)

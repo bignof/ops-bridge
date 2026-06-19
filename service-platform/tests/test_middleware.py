@@ -195,10 +195,17 @@ def test_docs_redoc_disabled_by_default_404(client: TestClient) -> None:
     assert client.get("/redoc").status_code == 404
 
 
-# ── A18:白名单与真实公开路由「一致性」自检 ──
-#    防将来挪端点静默失守:枚举 app.routes,对每个**在 /api/ 前缀下**的 APIRoute,
-#    若它**未挂 require_session**(即公开),则其 path 必须命中中间件白名单前缀;
-#    反向再断言每个 /api/ 白名单前缀都至少覆盖一个真实公开路由(防白名单过宽留口子)。
+# ── A18 / 复审 R5:白名单与真实公开路由「一致性」自检(改为真实可达性判定)──
+#    复审 R5 修正前两处缺陷:① 旧正向把「无 Depends(require_session)」当「匿名可达/失守」,
+#    但真实闸是**中间件**——对仅靠中间件守护的合法路由会误报(删某路由的 Depends,旧测试报 leak,
+#    但匿名请求仍被 middleware 401);② 旧反向用 startswith 公开路由集判定,把过宽 `/api/` 注入白名单
+#    仍 PASS(空洞)。本版一律用**无 token 真实请求**经中间件判定可达性,杜绝误报与空洞。
+#
+#    变异验证(报告 R5):
+#    - 真把某 /api 路由开成匿名可达(如把其 path 前缀塞进 WHITELIST_PREFIXES)→ 正向断言转红。
+#    - 把过宽 `/api/` 注入 WHITELIST_PREFIXES → 反向断言(该前缀下受保护路由返 401)转红。
+
+
 def _route_calls(dependant) -> list:
     """递归收集一条路由 dependant 链上的全部依赖 callable(含嵌套 sub-dependency)。"""
     calls = []
@@ -209,6 +216,21 @@ def _route_calls(dependant) -> list:
     return calls
 
 
+def _dummy_path(path: str) -> str:
+    """把路由模板里的 `{xxx}` 路径参数替换成占位值,得到可真实请求的具体路径。
+
+    占位用 `1`(数值 id 类参数可解析;鉴权在端点逻辑之前,中间件不关心参数语义)。
+    """
+    import re
+
+    return re.sub(r"\{[^}]+\}", "1", path)
+
+
+def _request_without_token(client: TestClient, method: str, path: str):
+    """对给定方法/路径发**无 Authorization**请求,返回响应(用于真实可达性判定)。"""
+    return client.request(method, _dummy_path(path), headers={})
+
+
 def test_whitelist_matches_real_public_api_routes(client: TestClient) -> None:
     from app.auth import require_session
     from app.middleware import API_PREFIX, WHITELIST_PREFIXES
@@ -217,23 +239,37 @@ def test_whitelist_matches_real_public_api_routes(client: TestClient) -> None:
     api_routes = [r for r in app.routes if isinstance(r, APIRoute) and r.path.startswith(API_PREFIX)]
     assert api_routes, "未发现任何 /api/ 路由,断言失去意义(地基异常)"
 
-    # ① 每个未挂 require_session 的公开 /api/ 路由都必须在白名单内(否则匿名可达=失守)。
-    leaks: list[str] = []
-    public_api_paths: set[str] = set()
-    for r in api_routes:
-        protected = require_session in _route_calls(r.dependant)
-        whitelisted = any(r.path.startswith(p) for p in WHITELIST_PREFIXES)
-        if not protected:
-            public_api_paths.add(r.path)
-            if not whitelisted:
-                leaks.append(f"{sorted(r.methods)} {r.path}")
-    assert not leaks, f"公开(无 require_session)且不在白名单的 /api/ 路由(失守口子):{leaks}"
+    def _methods(r: APIRoute) -> list[str]:
+        return sorted(m for m in r.methods if m not in ("HEAD", "OPTIONS"))
 
-    # ② 反向:每个 /api/ 前缀白名单条目都须至少覆盖一个真实公开路由(防白名单过宽,
-    #    误把本应受保护的路由前缀开放)。非 /api/ 的白名单项(/auth/login、/health)只为
-    #    意图清晰,天然不被中间件拦,不在此断言范围。
+    # ① 正向(真实可达性,R5 核心修正):每条**非白名单** /api 路由,无 token 真实请求必须被
+    #    中间件 401 拦下。这是经中间件的**真闸**判定,不再用「有无 Depends(require_session)」近似
+    #    ——杜绝对「仅靠中间件守护的合法路由」误报(旧测试缺陷①:删某路由 Depends 即报 leak,但
+    #    匿名请求其实仍被 middleware 401)。
+    leaks: list[str] = []
+    for r in api_routes:
+        if any(r.path.startswith(p) for p in WHITELIST_PREFIXES):
+            continue  # 白名单路由由②单独核验
+        for method in _methods(r):
+            resp = _request_without_token(client, method, r.path)
+            if resp.status_code != 401:
+                leaks.append(f"{method} {r.path} -> {resp.status_code}")
+    assert not leaks, f"非白名单 /api 路由无 token 未被中间件 401 拦下(匿名可达=失守):{leaks}"
+
+    # ② 反向(防白名单过宽,R5 修正缺陷②的空洞断言):每条落在某 /api 白名单前缀下的真实路由,
+    #    **必须不带** `Depends(require_session)`——白名单意味着「中间件不强制鉴权,改由端点内自鉴权
+    #    (如 distribution 的 pull token)」;若某前缀过宽到覆盖了一条本该靠 require_session 保护的
+    #    路由,就是把它的中间件守护拆掉了。用 dependant 检查精确抓出过宽(旧版用 startswith 公开集
+    #    判定,过宽 `/api/` 注入仍 PASS=空洞)。注:distribution 端点自身无 require_session(自校验
+    #    pull token,缺凭据时端点层返 401),故合法白名单恒通过;过宽 `/api/` 会覆盖带 require_session
+    #    的 namespaces/services 等 → 断言转红。
     api_whitelist = [p for p in WHITELIST_PREFIXES if p.startswith(API_PREFIX)]
     for p in api_whitelist:
-        assert any(path.startswith(p) for path in public_api_paths), (
-            f"白名单前缀 {p!r} 未覆盖任何真实公开路由(过宽/陈旧,应收紧或移除)"
+        covered = [r for r in api_routes if r.path.startswith(p)]
+        assert covered, f"白名单前缀 {p!r} 未覆盖任何真实 /api 路由(陈旧,应移除)"
+        over_broad = [
+            f"{_methods(r)} {r.path}" for r in covered if require_session in _route_calls(r.dependant)
+        ]
+        assert not over_broad, (
+            f"白名单前缀 {p!r} 过宽:覆盖了带 require_session 的受保护路由 {over_broad}(中间件守护被拆),应收紧前缀"
         )

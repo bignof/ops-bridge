@@ -49,17 +49,23 @@ def parse_tgz(data: bytes) -> dict:
     """
     try:
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as t:
-            member = None
-            # 评审 A16:逐成员遍历,累计解压字节超 MAX_DECOMPRESS_BYTES 即拒;**命中首个目标
-            # package.json 即停**(不扫到流尾),把头扫描阶段的解压量也限死。
+            # 评审 A16:逐成员遍历,累计解压字节超 MAX_DECOMPRESS_BYTES 即拒(把头扫描阶段的
+            # 解压量限死);复审 R4:**命中候选不立即 break**——在解压上限内收集所有命中的候选成员,
+            # 循环后按 `_PKG_JSON_MEMBERS` 偏好顺序择优(package/ 恒优先根级,对齐 B1 不变式与
+            # 节点 sync-plugins.js 的 exists(package/)?package/:root)。仅按物理顺序取首个会让两布局
+            # 并存时随归档顺序翻转(A16 引入的行为漂移)。一旦已集齐全部候选名即可提前停,无需扫到流尾。
             decompressed = 0
+            hits: dict[str, tarfile.TarInfo] = {}
             for info in t:
                 decompressed += max(info.size or 0, 0)
                 if decompressed > MAX_DECOMPRESS_BYTES:
                     raise BadPackage("解压总量超上限(疑似解压炸弹)")
-                if info.name in _PKG_JSON_MEMBERS:
-                    member = info
-                    break  # 命中即停,避免继续解压到流尾
+                if info.name in _PKG_JSON_MEMBERS and info.name not in hits:
+                    hits[info.name] = info
+                    if len(hits) == len(_PKG_JSON_MEMBERS):
+                        break  # 已集齐所有候选名,无需继续解压到流尾
+            # 按偏好顺序择优(package/ 优先根级);均未命中 → 缺 package.json。
+            member = next((hits[name] for name in _PKG_JSON_MEMBERS if name in hits), None)
             if member is None:
                 raise BadPackage("缺 package.json(package/ 与根级均无)")
             if member.size is not None and member.size > MAX_PKG_JSON_SIZE:  # L3:防炸弹
@@ -94,12 +100,27 @@ def store_tgz(plugin_id: int, version_id: int, filename: str, data: bytes) -> st
 
     路径段完全由平台生成(plugin_id / version_id / 经 _sanitize 的 basename),
     客户端 filename 仅用于派生安全文件名,不参与目录拼接(评审 H5)。
+
+    复审 R6(落盘原子性):先写**临时文件**再 `os.replace` 到目标——write 中途失败(磁盘满/IO)
+    时目标路径**绝不出现**部分写入文件(os.replace 同目录原子改名),失败分支清掉半成品 temp 再
+    重抛。旧实现 `open(目标,'wb')` 立即创建/截断目标 + write 中途失败会留 0~部分字节孤儿,且外层
+    store_tgz 未 return → 补偿 `if stored_path:` 为假 → 不调 safe_remove(漏清)。
     """
     rel = os.path.join(str(plugin_id), str(version_id), _sanitize(filename))
     abspath = os.path.join(settings.plugin_storage_dir, rel)
     os.makedirs(os.path.dirname(abspath), exist_ok=True)
-    with open(abspath, "wb") as f:
-        f.write(data)
+    # 临时文件与目标同目录(保证 os.replace 是同卷原子改名),用 pid 派生唯一名避免并发互踩。
+    tmp_path = f"{abspath}.{os.getpid()}.tmp"
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(data)
+        os.replace(tmp_path, abspath)  # 同目录原子改名:目标要么完整、要么不存在
+    except BaseException:
+        try:
+            os.remove(tmp_path)  # 清半成品 temp(best-effort);目标因未 replace 而从未出现
+        except OSError:
+            pass
+        raise
     return rel  # 库里存相对路径
 
 

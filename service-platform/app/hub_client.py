@@ -36,6 +36,27 @@ def _headers() -> dict[str, str]:
     return {"Content-Type": "application/json", "X-Admin-Token": settings.hub_admin_token}
 
 
+def _extract_agent_key(r: httpx.Response) -> str:
+    """从已 raise_for_status(2xx)的响应里取 agentKey,**任何异常态归一化为 HubError**。
+
+    复审 R3:hub 返 200 但 body 非 JSON(反代 HTML 错误页 → `r.json()` 抛 `ValueError`/
+    `JSONDecodeError`)或 body 是 JSON 数组/标量(`.get` 抛 `AttributeError`)时,原实现会让这些
+    异常逃出路由层「只捕 HubError/httpx.HTTPError」的窄 except → 裸 500 + 孤儿 namespace(补偿
+    删除不执行)。这里把「非 JSON / 非 dict / 缺 agentKey」三种异常态统一收敛成 HubError,使路由层
+    的 A13(502)映射 + A14(补偿删除)正常生效。敏感串不入异常消息(对齐本模块约定)。
+    """
+    try:
+        data = r.json()
+    except ValueError as exc:  # JSONDecodeError ⊂ ValueError:body 非 JSON
+        raise HubError("hub 响应非 JSON") from exc
+    if not isinstance(data, dict):  # JSON 数组/标量:.get 会抛 AttributeError
+        raise HubError("hub 响应不是 JSON 对象")
+    key = data.get("agentKey")
+    if not key:
+        raise HubError("hub 未返回 agentKey")
+    return key
+
+
 def provision_agent(agent_id: str) -> str:
     """创建 Agent(命名空间)并返回其首次连接密钥 agentKey。
 
@@ -51,10 +72,7 @@ def provision_agent(agent_id: str) -> str:
         timeout=_HUB_TIMEOUT,
     )
     r.raise_for_status()
-    key = r.json().get("agentKey")
-    if not key:
-        raise HubError("hub 未返回 agentKey")
-    return key
+    return _extract_agent_key(r)  # 复审 R3:非 JSON / 非 dict / 缺 key 统一归一化为 HubError
 
 
 def rotate_agent_key(agent_id: str) -> str:
@@ -74,7 +92,4 @@ def rotate_agent_key(agent_id: str) -> str:
         timeout=_HUB_TIMEOUT,
     )
     r.raise_for_status()
-    key = r.json().get("agentKey")
-    if not key:
-        raise HubError("hub 未返回 agentKey")
-    return key
+    return _extract_agent_key(r)  # 复审 R3:非 JSON / 非 dict / 缺 key 统一归一化为 HubError

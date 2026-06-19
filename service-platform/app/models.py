@@ -28,6 +28,19 @@ _NAMESPACE_CODE_RE = re.compile(r"^[A-Za-z0-9._-]{1,255}$")
 _NAMESPACE_CODE_FORBIDDEN = frozenset({".", ".."})
 
 
+def _validate_namespace_code(value: str) -> str:
+    """namespace.code 白名单校验(评审 A3 + 复审 R2,create/PATCH 共用)。
+
+    code(=agentId)会拼进 hub URL 路径段,非法 code 入库即为存储型路径注入隐患;故在入 store
+    之前就挡住路径分隔符/穿越/query/fragment/空格/空串。**create 端必填**(NamespaceIn)与
+    **PATCH 端可选**(NamespaceUpdate,None 由各自 validator 放行后不会调到这里)共用同一规则,
+    避免纵深退化为单闸(R2:此前 PATCH 无校验,可种入 `x/../../dispatch`)。
+    """
+    if not _NAMESPACE_CODE_RE.fullmatch(value) or value in _NAMESPACE_CODE_FORBIDDEN:
+        raise ValueError("code 仅允许字母数字与 . _ -,长度 1~255(不得含 / # ? 空格,亦不得为 . 或 ..)")
+    return value
+
+
 def to_camel(value: str) -> str:
     parts = value.split("_")
     return parts[0] + "".join(part.capitalize() for part in parts[1:])
@@ -111,9 +124,7 @@ class NamespaceIn(BaseModel):
     def _validate_code(cls, value: str) -> str:
         # 评审 A3:code(=agentId)会拼进 hub URL 路径段,非法 code create 即拒(Pydantic → 422),
         # 在入 store 之前就挡住路径分隔符/穿越/query/fragment/空格/空串,杜绝存储型路径注入。
-        if not _NAMESPACE_CODE_RE.fullmatch(value) or value in _NAMESPACE_CODE_FORBIDDEN:
-            raise ValueError("code 仅允许字母数字与 . _ -,长度 1~255(不得含 / # ? 空格,亦不得为 . 或 ..)")
-        return value
+        return _validate_namespace_code(value)
 
 
 class NamespaceUpdate(BaseModel):
@@ -123,6 +134,15 @@ class NamespaceUpdate(BaseModel):
 
     code: str | None = None
     name: str | None = None
+
+    @field_validator("code")
+    @classmethod
+    def _validate_code(cls, value: str | None) -> str | None:
+        # 复审 R2:PATCH 端 code 同样套白名单,杜绝经 PATCH 种入 `x/../../dispatch`(纵深第一道闸
+        # 不退化为单闸)。**None 放行**——PATCH 不传 code 是合法的局部更新,不报错;非 None 才校验。
+        if value is None:
+            return None
+        return _validate_namespace_code(value)
 
 
 class NamespaceOut(BaseModel):

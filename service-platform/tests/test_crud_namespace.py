@@ -157,6 +157,50 @@ def test_namespace_create_accepts_legal_code(client: TestClient, monkeypatch) ->
     assert r.json()["code"] == "ns.legal_code-1"
 
 
+# --- R2(复审):PATCH 端的 NamespaceUpdate.code 也须套白名单(纵深不退化为单闸) ---
+#    A3 白名单原只加在 create 端 NamespaceIn;PATCH 用的 NamespaceUpdate.code 无校验,
+#    PATCH code='x/../../dispatch' 会 200 落库,绕过「非法 code 永不入库」第一道闸。
+#    修复:把 code 白名单抽成共享函数,给 NamespaceUpdate.code 也挂校验(None 放行)。
+
+
+@pytest.mark.parametrize(
+    "bad_code",
+    ["x/../../dispatch", "ns/with/slash", "ns#frag", "ns?query=1", "..", ".", "ns with space", ""],
+)
+def test_namespace_patch_rejects_illegal_code(client: TestClient, monkeypatch, bad_code: str) -> None:
+    # 先建一个合法 namespace,再 PATCH 非法 code → 422 且**不落库**(code 仍是原合法值)。
+    monkeypatch.setattr(hc, "provision_agent", lambda code: "k")
+    h = _h(client)
+    created = client.post("/api/namespaces", json={"code": "patch-legal"}, headers=h)
+    assert created.status_code == 201, created.text
+    nid = created.json()["id"]
+
+    r = client.patch(f"/api/namespaces/{nid}", json={"code": bad_code}, headers=h)
+    assert r.status_code == 422, r.text  # Pydantic 校验失败 → 422
+
+    # 不落库:该行 code 未被改成非法值,仍是原合法值。
+    got = client.get(f"/api/namespaces/{nid}", headers=h).json()
+    assert got["code"] == "patch-legal"
+    rows, _ = store.list_rows(Namespace, page=1, page_size=200)
+    assert all(row.code != bad_code for row in rows)
+
+
+def test_namespace_patch_accepts_legal_code(client: TestClient, monkeypatch) -> None:
+    # PATCH 合法 code → 200 且落库(None 放行不影响,仅非法非 None 才拒)。
+    monkeypatch.setattr(hc, "provision_agent", lambda code: "k")
+    h = _h(client)
+    nid = client.post("/api/namespaces", json={"code": "patch-old"}, headers=h).json()["id"]
+
+    r = client.patch(f"/api/namespaces/{nid}", json={"code": "patch.new_code-2"}, headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["code"] == "patch.new_code-2"
+
+    # 仅传 name(不传 code)→ None 放行,不报错。
+    r2 = client.patch(f"/api/namespaces/{nid}", json={"name": "改个名"}, headers=h)
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["code"] == "patch.new_code-2"  # code 保持原值
+
+
 def test_namespace_create_rolls_back_on_hub_failure(client: TestClient, monkeypatch) -> None:
     # 评审 A14:create 先落库再 provision;hub 失败必须**补偿删除**刚建的行(整体原子失败),
     # 否则遗留无 agentKey 的孤儿 namespace(show-once 永久丢)。
@@ -174,6 +218,61 @@ def test_namespace_create_rolls_back_on_hub_failure(client: TestClient, monkeypa
 
     after, after_count = store.list_rows(Namespace, page=1, page_size=200)
     assert after_count == 0  # 补偿删除生效:无孤儿 namespace 行残留
+
+
+def test_namespace_create_hub_non_dict_body_5xx_no_orphan(client: TestClient, monkeypatch) -> None:
+    """复审 R3:hub 返 200 但 body 非 dict(JSON 数组/标量)→ create 5xx **且无孤儿 namespace**。
+
+    关键:不打桩 `provision_agent`(让真实解析跑),而是打桩底层 `hc.httpx.post` 返 200+`[1,2,3]`。
+    未修复时 `r.json().get('agentKey')` 抛 AttributeError(非 HubError/httpx.HTTPError)→ 逃出路由
+    窄 except → 裸 500 且补偿删除不执行(留 1 孤儿行)。修复后归一化为 HubError → A13 映射 502 +
+    A14 补偿删除 → 行数=0。
+
+    变异验证:去掉 hub_client 的非 dict 归一化,本用例 5xx 仍可能成立但**行数=1**(孤儿)→ 红。
+    """
+    before, before_count = store.list_rows(Namespace, page=1, page_size=200)
+    assert before_count == 0
+
+    # 让真实 provision_agent 跑;置非空 hub url(否则未配置即先 HubError,测不到 200 解析路径)。
+    object.__setattr__(hc.settings, "service_hub_url", "http://hub.local:8080")
+
+    class _Resp200NonDict:
+        def raise_for_status(self):  # 200,不抛
+            return None
+
+        def json(self):
+            return [1, 2, 3]  # 非 dict → .get 抛 AttributeError(未修复)
+
+    monkeypatch.setattr(hc.httpx, "post", lambda *a, **k: _Resp200NonDict())
+    h = _h(client)
+    r = client.post("/api/namespaces", json={"code": "r3-nondict"}, headers=h)
+    assert r.status_code >= 500, r.text  # 归一化 HubError → A13 映射 502
+
+    after, after_count = store.list_rows(Namespace, page=1, page_size=200)
+    assert after_count == 0, "hub 非 dict 响应未触发补偿删除,残留孤儿 namespace"
+
+
+def test_namespace_create_hub_non_json_body_5xx_no_orphan(client: TestClient, monkeypatch) -> None:
+    """复审 R3 姊妹:hub 返 200 但 body 非 JSON(反代 HTML 错误页)→ json() 抛 ValueError。
+
+    未修复时 ValueError 逃出窄 except → 裸 500 + 孤儿;修复后归一化 HubError → 502 + 补偿删除。
+    """
+    _, before_count = store.list_rows(Namespace, page=1, page_size=200)
+    assert before_count == 0
+    object.__setattr__(hc.settings, "service_hub_url", "http://hub.local:8080")
+
+    class _Resp200NonJson:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+    monkeypatch.setattr(hc.httpx, "post", lambda *a, **k: _Resp200NonJson())
+    r = client.post("/api/namespaces", json={"code": "r3-nonjson"}, headers=_h(client))
+    assert r.status_code >= 500, r.text
+    _, after_count = store.list_rows(Namespace, page=1, page_size=200)
+    assert after_count == 0, "hub 非 JSON 响应未触发补偿删除,残留孤儿 namespace"
 
 
 def test_namespace_create_maps_httpx_error_to_503_without_leaking_url(client: TestClient, monkeypatch) -> None:
