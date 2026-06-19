@@ -11,9 +11,10 @@
   (明确文案),避免误绑错插件。
 - **请求体大小上限(评审 L3)**:`MAX_UPLOAD_BYTES`;读入前先看 `Content-Length`,超限
   直接 413(不把超大体读进内存);读入后再按实际字节数兜底(分块上传可能无 Content-Length)。
-- **落地顺序(brief)**:先建 `plugin_version`(拿 id)→ `storage.store_tgz(plugin_id,
-  version_id, filename, data)` 落盘 → 建 `plugin_attachment`(回填 storage_path)。
-  后两步任一失败 → **清理已建的 version 行 + 落盘文件**(失败不留孤儿版本,否则会卡住重传)。
+- **原子落地(评审 B2 + A6)**:`store.create_version_with_attachment` 在**单事务**内建
+  `plugin_version`(flush 拿 id)→ 经回调 `storage.store_tgz` 落盘 → 建 `plugin_attachment`
+  → commit。任一步失败 → 整事务回滚(version+attachment 都不留)+ 删已落盘文件(`storage.
+  safe_remove`),**不留孤儿 version 行,也不留孤儿 .tgz**;回滚后可直接重传同版本。
 - **响应全 camelCase**(评审 H2):经 `*Out` 模型序列化,不手搓 dict。
 - **列表信封**(评审 M2):`{count, rows, page, pageSize, totalPage}` + `?pluginId=` 过滤。
 - **纵深防御**:逐路由 `Depends(require_session)`;`/api/` 前缀下 default-deny 中间件已先挡无/坏 JWT。
@@ -29,7 +30,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Upl
 
 from app import storage, store
 from app.auth import require_session
-from app.db_models import Plugin, PluginAttachment, PluginVersion
+from app.db_models import Plugin, PluginVersion
 from app.models import PluginUploadOut, PluginVersionListOut, PluginVersionOut
 
 
@@ -104,32 +105,23 @@ async def upload_plugin_version(
 
     plugin = _match_plugin(name)
 
-    # 落地:先建 version(拿 id,且 UNIQUE(plugin_id, version) 冲突 → Conflict → 409)。
-    # version 显式取自 package.json;name 顺带记包名便于追溯。
+    # 原子落地(评审 B2 + A6):version + attachment 落库在**单事务**内,落盘 .tgz 经回调夹在
+    # flush 与 attachment 之间。任一步失败 → 整事务回滚(version+attachment 都不留)+ 删已落盘
+    # 文件(无孤儿)。version 显式取自 package.json;name 顺带记包名便于追溯。
+    # UNIQUE(plugin_id, version) 冲突 → Conflict → 409,且回滚后盘上无残留。
     try:
-        version_row = store.create_row(
-            PluginVersion,
-            {"plugin_id": plugin.id, "version": version, "name": name},
+        version_row, attachment = store.create_version_with_attachment(
+            plugin_id=plugin.id,
+            version=version,
+            name=name,
+            filename=storage._sanitize(file.filename),
+            size=len(data),
+            store_file=lambda version_id: storage.store_tgz(plugin.id, version_id, file.filename, data),
         )
     except store.Conflict:
         raise HTTPException(status.HTTP_409_CONFLICT, f"插件 {name} 版本 {version} 已存在")
-
-    # version 已建 → 落盘 + 建附件;任一失败清理 version 行(+ 落盘文件),不留孤儿。
-    try:
-        storage_path = storage.store_tgz(plugin.id, version_row.id, file.filename, data)
-        attachment = store.create_row(
-            PluginAttachment,
-            {
-                "plugin_version_id": version_row.id,
-                "filename": storage._sanitize(file.filename),
-                "size": len(data),
-                "storage_path": storage_path,
-            },
-        )
     except Exception:
-        # 补偿清理:删 version 行(附件若已建会随后续清理/无 FK,此处尽力删文件)。
-        store.delete_row(PluginVersion, version_row.id)
-        logger.exception("插件上传落地失败,已回滚 plugin_version id=%s", version_row.id)
+        logger.exception("插件上传落地失败(已原子回滚 version+attachment 并清落盘文件)")
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "插件包落地失败")
 
     return PluginUploadOut.model_validate(

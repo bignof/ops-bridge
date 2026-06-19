@@ -208,6 +208,93 @@ def test_plugin_versions_list_envelope_and_filter(client: TestClient, storage_tm
     assert filtered_y["rows"][0]["version"] == "2.0.0"
 
 
+def _list_stored_files(tmp_path: Path) -> list[Path]:
+    """枚举 storage 根(tmp_path/plugins)下所有已落盘文件,用于断言无孤儿 .tgz。"""
+    root = tmp_path / "plugins"
+    if not root.exists():
+        return []
+    return [p for p in root.rglob("*") if p.is_file()]
+
+
+def test_upload_attachment_failure_is_atomic_no_orphan(
+    client: TestClient, storage_tmp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """评审 B2 + A6(原子性 + 孤儿文件):落盘成功后**附件入库失败**时,
+    必须整体回滚——**既不留 plugin_version 行,也不留盘上 .tgz**。
+
+    注入:把 store.PluginAttachment 换成构造即抛的类,模拟「version+落盘 OK,attachment 步失败」。
+
+    红(未原子化时):version 行残留(撞 UNIQUE 卡重传)+ 盘上 .tgz 残留(不可回收孤儿)。
+    绿(原子化后):version 不存在 + storage 根下无任何文件。
+    """
+    from app import store
+
+    h = _h(client)
+    _create_plugin(client, h, "@business/plugin-x")
+
+    class _BoomAttachment:
+        def __init__(self, *a, **k):
+            raise RuntimeError("注入:附件入库失败")
+
+    monkeypatch.setattr(store, "PluginAttachment", _BoomAttachment)
+
+    data = _make_tgz("@business/plugin-x", "1.2.3")
+    r = client.post(
+        "/api/plugin-versions/upload",
+        files={"file": ("x.tgz", data, "application/gzip")},
+        headers=h,
+    )
+    # 落地失败对客户端是 500(非法包才是 400);关键在副作用必须被完全回滚。
+    assert r.status_code == 500, r.text
+
+    # 还原注入,以便用真实 ORM 查询验证副作用。
+    monkeypatch.undo()
+
+    # ① 盘上无任何残留文件(A6:孤儿 .tgz 必须被清)。
+    assert _list_stored_files(tmp_path) == [], "落盘文件未被清理,残留孤儿 .tgz"
+
+    # ② version 行不存在(B2:attachment 失败后 version 随事务回滚,不卡重传)。
+    body = client.get("/api/plugin-versions", headers=h).json()
+    assert body["count"] == 0, "plugin_version 残留(撞 UNIQUE 会卡重传)"
+
+
+def test_upload_can_retry_after_atomic_failure(
+    client: TestClient, storage_tmp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """评审 B2(回滚后可重传):第一次落地中途失败完全回滚后,
+    用**同 (plugin, version)** 重传应成功(不被半成品 version 行的 UNIQUE 卡住)。"""
+    from app import store
+
+    h = _h(client)
+    pid = _create_plugin(client, h, "@business/plugin-x")
+
+    class _BoomAttachment:
+        def __init__(self, *a, **k):
+            raise RuntimeError("注入:附件入库失败")
+
+    monkeypatch.setattr(store, "PluginAttachment", _BoomAttachment)
+    data = _make_tgz("@business/plugin-x", "1.2.3")
+    first = client.post(
+        "/api/plugin-versions/upload",
+        files={"file": ("x.tgz", data, "application/gzip")},
+        headers=h,
+    )
+    assert first.status_code == 500, first.text
+
+    # 解除注入后重传同版本:应成功(半成品已回滚,无 UNIQUE 卡阻),且盘上恰一个文件。
+    monkeypatch.undo()
+    retry = client.post(
+        "/api/plugin-versions/upload",
+        files={"file": ("x.tgz", data, "application/gzip")},
+        headers=h,
+    )
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["version"] == "1.2.3"
+    pv = client.get(f"/api/plugin-versions/{retry.json()['pluginVersionId']}", headers=h).json()
+    assert pv["pluginId"] == pid
+    assert len(_list_stored_files(tmp_path)) == 1
+
+
 def test_plugin_versions_get_missing_404(client: TestClient, storage_tmp) -> None:
     h = _h(client)
     assert client.get("/api/plugin-versions/999999", headers=h).status_code == 404

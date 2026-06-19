@@ -30,24 +30,36 @@ class BadPackage(Exception):
 # package.json 上限 1MB,防解压炸弹(评审 L3):压缩比可极高,解压前先看声明大小。
 MAX_PKG_JSON_SIZE = 1 * 1024 * 1024
 
+# 解析 .tgz 时累计解压字节硬上限(评审 A16):`tarfile` 解析 tar 头(遍历/getmember)需把
+# gzip 流解压到目标成员之前的所有内容;member.size 守卫只挡单个 package.json,挡不住
+# 「目标成员之前塞高压缩比巨大成员」的头扫描阶段无界解压(可膨胀数 GB → 单请求 DoS)。
+# 上限取 64MB:足够覆盖真实包内 package.json 之前的合理内容,又远低于内存炸弹规模。
+MAX_DECOMPRESS_BYTES = 64 * 1024 * 1024
+
+# 候选 package.json 成员名(评审 B1:package/ 优先 npm pack,回退根级 build --tar)。
+# 用**精确成员名**而非遍历任意 *package.json,避免误命中 dist/node_modules/<dep>/package.json。
+_PKG_JSON_MEMBERS = ("package/package.json", "./package/package.json", "package.json", "./package.json")
+
 
 def parse_tgz(data: bytes) -> dict:
     """解析 .tgz 内 package.json,返回 {name, version}。
 
     优先 `package/package.json`(npm pack),回退根级 `package.json`(build --tar);
-    非法 tgz / 缺 package.json / 缺 name|version 抛 BadPackage。
+    非法 tgz / 缺 package.json / 非对象 package.json / 缺 name|version 抛 BadPackage。
     """
     try:
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as t:
             member = None
-            # 评审 B1:package/ 优先(npm pack),回退根级(build --tar),与 sync-plugins.js 同源。
-            # 用精确成员名,避免遍历误命中 dist/node_modules/<dep>/package.json。
-            for n in ("package/package.json", "./package/package.json", "package.json", "./package.json"):
-                try:
-                    member = t.getmember(n)
-                    break
-                except KeyError:
-                    continue
+            # 评审 A16:逐成员遍历,累计解压字节超 MAX_DECOMPRESS_BYTES 即拒;**命中首个目标
+            # package.json 即停**(不扫到流尾),把头扫描阶段的解压量也限死。
+            decompressed = 0
+            for info in t:
+                decompressed += max(info.size or 0, 0)
+                if decompressed > MAX_DECOMPRESS_BYTES:
+                    raise BadPackage("解压总量超上限(疑似解压炸弹)")
+                if info.name in _PKG_JSON_MEMBERS:
+                    member = info
+                    break  # 命中即停,避免继续解压到流尾
             if member is None:
                 raise BadPackage("缺 package.json(package/ 与根级均无)")
             if member.size is not None and member.size > MAX_PKG_JSON_SIZE:  # L3:防炸弹
@@ -60,6 +72,10 @@ def parse_tgz(data: bytes) -> dict:
         raise
     except Exception as e:
         raise BadPackage(f"非法 .tgz: {e}") from None
+    # 评审 A5:package.json 可能是合法 JSON 但**非对象**(null/标量/数组),此时 `.get` 会抛
+    # AttributeError 冒泡成 500;归一化成 BadPackage(端点层 → 400,上传是攻击者入口)。
+    if not isinstance(pkg, dict):
+        raise BadPackage("package.json 不是 JSON 对象")
     name, version = pkg.get("name"), pkg.get("version")
     if not name or not version:
         raise BadPackage("package.json 缺 name/version")
@@ -85,6 +101,31 @@ def store_tgz(plugin_id: int, version_id: int, filename: str, data: bytes) -> st
     with open(abspath, "wb") as f:
         f.write(data)
     return rel  # 库里存相对路径
+
+
+def safe_remove(storage_path: str) -> bool:
+    """安全删除 storage 根内的已落盘文件(评审 A6/B2 补偿清理)。
+
+    realpath 归一化后校验目标**落在 storage 根内**(与 `open_stream` 同一道防穿越守卫),
+    再 `os.remove`;文件不存在静默吞(`FileNotFoundError`)。越界路径**绝不删**(返回 False),
+    杜绝补偿逻辑被篡改 storage_path 诱导去删根外文件。
+
+    返回:成功删除 True;文件不存在 / 路径越界 / 其它 OS 错误 False(补偿是 best-effort,
+    绝不让清理自身异常掩盖原始失败)。
+    """
+    if not storage_path:
+        return False
+    root = os.path.realpath(settings.plugin_storage_dir)
+    abspath = os.path.realpath(os.path.join(root, storage_path))
+    if not (abspath == root or abspath.startswith(root + os.sep)):
+        return False  # 越界:绝不删根外文件
+    try:
+        os.remove(abspath)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
 
 
 def open_stream(storage_path: str):

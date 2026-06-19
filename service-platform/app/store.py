@@ -15,12 +15,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Sequence, TypeVar
+from typing import Any, Callable, Sequence, TypeVar
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
-from app import tokens
+from app import storage, tokens
 from app.db_models import (
     FetchRecord,
     Namespace,
@@ -189,6 +189,70 @@ def delete_row(model: type[ModelT], row_id: int) -> bool:
         session.delete(record)
         session.commit()
         return True
+
+
+def create_version_with_attachment(
+    *,
+    plugin_id: int,
+    version: str,
+    name: str | None,
+    filename: str,
+    size: int,
+    store_file: Callable[[int], str],
+) -> tuple[PluginVersion, PluginAttachment]:
+    """**原子**落地一个插件版本 + 其附件(评审 B2 + A6)。
+
+    单事务内:① add `PluginVersion` → `flush()` 拿到 version_id(落盘路径需要它)→
+    ② 回调 `store_file(version_id)` 落盘 .tgz 拿 `storage_path` → ③ add `PluginAttachment`
+    (引用该 storage_path)→ ④ commit。**version + attachment 同生共死**——任一步异常:
+    整事务 rollback(version 与 attachment 都不留)+ 删除**已落盘文件**(`storage.safe_remove`,
+    realpath 校验在根内)+ 重抛。
+
+    去重:重复 (plugin_id, version) 撞 UNIQUE → `IntegrityError` → `Conflict`(路由层 → 409),
+    且**回滚后盘上无残留文件**(若落盘已发生)。
+
+    解决旧三步三事务(version→store_tgz→attachment 各独立 commit)的「有 version 无
+    attachment」半成品:撞 UNIQUE 卡重传 + query INNER JOIN 天然剔除(前端见 version 却不在
+    分发清单)。`store_file` 回调把落盘夹在 flush 与 attachment 之间,落盘失败同样整体回滚。
+    """
+    now = _now()
+    stored_path: str | None = None
+    with _db().session_factory() as session:
+        try:
+            pv = PluginVersion(
+                plugin_id=plugin_id,
+                version=version,
+                name=name,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(pv)
+            session.flush()  # 拿到 pv.id(落盘路径段需要),仍在同一未提交事务内
+
+            stored_path = store_file(pv.id)  # 落盘 .tgz,返回入库相对路径
+
+            att = PluginAttachment(
+                plugin_version_id=pv.id,
+                filename=filename,
+                size=size,
+                storage_path=stored_path,
+                created_at=now,
+            )
+            session.add(att)
+            session.commit()
+        except IntegrityError as exc:
+            session.rollback()
+            if stored_path:  # 回滚后清掉已落盘文件,避免孤儿(A6)
+                storage.safe_remove(stored_path)
+            raise Conflict(str(exc.orig)) from exc
+        except Exception:
+            session.rollback()
+            if stored_path:
+                storage.safe_remove(stored_path)
+            raise
+        session.refresh(pv)
+        session.refresh(att)
+        return pv, att
 
 
 # --- 发布/历史激活/回滚:单活 + 事务锁 + 状态机(Task 10) --------------------
