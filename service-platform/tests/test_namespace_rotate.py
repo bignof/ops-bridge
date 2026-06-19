@@ -99,9 +99,37 @@ def test_rotate_key_passes_code_to_hub(client: TestClient, monkeypatch) -> None:
 
 
 def test_rotate_key_missing_namespace_404(client: TestClient, monkeypatch) -> None:
-    # 即便打桩,namespace 不存在也应 404(且不调 hub)。
-    monkeypatch.setattr(hc, "rotate_agent_key", lambda code: "k")
+    # 即便打桩,namespace 不存在也应 404,且 404 前**不接触 hub**(评审 A12)。
+    # 用记录调用的桩(非 no-op),断言 404 分支 hub 一次都没被调(calls==[])。
+    calls: list[str] = []
+
+    def stub(code: str) -> str:
+        calls.append(code)
+        return "k"
+
+    monkeypatch.setattr(hc, "rotate_agent_key", stub)
     assert client.post("/api/namespaces/999999/rotate-key", headers=_h(client)).status_code == 404
+    assert calls == []  # 不存在的 namespace 在调 hub 之前就 404,绝不触达 hub
+
+
+def test_rotate_pull_token_old_token_invalidated(client: TestClient, monkeypatch) -> None:
+    # 评审 A19:pull token 轮换的安全不变式——旧明文 token 在轮换后立即失效。
+    # 连续 rotate 两次,用**第一个**明文 token 调 distribution/plugins → 403(旧 token 已失效);
+    # 再用第二个(最新)token 调同 URL → 通过 namespace 归属校验(非 403),证明失效仅针对旧 token。
+    nid = _new_ns(client, monkeypatch, code="ns-rot-inval")
+    h = _h(client)
+
+    first = client.post(f"/api/namespaces/{nid}/rotate-pull-token", headers=h).json()["pullToken"]
+    second = client.post(f"/api/namespaces/{nid}/rotate-pull-token", headers=h).json()["pullToken"]
+    assert first != second
+
+    # distribution 端点用 pull token 鉴权(非 session),无插件链时归属通过即空数组 200。
+    url = "/api/distribution/plugins?namespace=ns-rot-inval&service=any-svc"
+    r_old = client.get(url, headers={"Authorization": f"Bearer {first}"})
+    assert r_old.status_code == 403, r_old.text  # 旧 token 已失效
+
+    r_new = client.get(url, headers={"Authorization": f"Bearer {second}"})
+    assert r_new.status_code != 403, r_new.text  # 新 token 仍属该 namespace(归属校验通过)
 
 
 def test_rotate_pull_token_missing_namespace_404(client: TestClient) -> None:

@@ -13,10 +13,19 @@ camel(alias)也接受 snake(字段名)。
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Generic, TypeVar
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
+
+
+# namespace.code 白名单(评审 A3):code 即 agentId,会拼进 hub URL 路径段,严禁路径分隔符
+# / 段穿越 / query / fragment 等。限定字母数字 . _ - 共 1~255 字符;非法 code create 即 422 拒,
+# 杜绝存储型路径注入(code='x/../../dispatch' 实测打到 hub dispatch=全机群 RCE)。
+_NAMESPACE_CODE_RE = re.compile(r"^[A-Za-z0-9._-]{1,255}$")
+# 纯点段(`.` / `..`)虽落在字符集内,却是路径穿越段,必须额外排除(评审 A3 用例显式拒 `..`)。
+_NAMESPACE_CODE_FORBIDDEN = frozenset({".", ".."})
 
 
 def to_camel(value: str) -> str:
@@ -96,6 +105,15 @@ class NamespaceIn(BaseModel):
 
     code: str
     name: str | None = None
+
+    @field_validator("code")
+    @classmethod
+    def _validate_code(cls, value: str) -> str:
+        # 评审 A3:code(=agentId)会拼进 hub URL 路径段,非法 code create 即拒(Pydantic → 422),
+        # 在入 store 之前就挡住路径分隔符/穿越/query/fragment/空格/空串,杜绝存储型路径注入。
+        if not _NAMESPACE_CODE_RE.fullmatch(value) or value in _NAMESPACE_CODE_FORBIDDEN:
+            raise ValueError("code 仅允许字母数字与 . _ -,长度 1~255(不得含 / # ? 空格,亦不得为 . 或 ..)")
+        return value
 
 
 class NamespaceUpdate(BaseModel):

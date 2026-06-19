@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from urllib.parse import quote
+
 import httpx
 
 from app.config import settings
@@ -56,11 +58,17 @@ def provision_agent(agent_id: str) -> str:
 
 
 def rotate_agent_key(agent_id: str) -> str:
-    """轮换指定 Agent 的连接密钥,返回新的 agentKey(旧密钥在 hub 侧立即失效)。"""
+    """轮换指定 Agent 的连接密钥,返回新的 agentKey(旧密钥在 hub 侧立即失效)。
+
+    `agent_id`(= namespace.code)拼进 hub URL 路径段,**必须** `quote(safe="")` 编码,
+    否则含 `/` `..` `#` `?` 的 code 会改变请求路径,造成存储型路径注入(评审 A3:
+    code='x/../../dispatch' 实测打到 hub dispatch=全机群 RCE)。NamespaceIn.code 已加白名单
+    做第一道闸,这里编码是纵深防御第二道闸(双管齐下)。
+    """
     if not settings.service_hub_url:
         raise HubError("SERVICE_HUB_URL 未配置")
     r = httpx.post(
-        f"{settings.service_hub_url}/api/agents/{agent_id}/credentials/rotate",
+        f"{settings.service_hub_url}/api/agents/{quote(agent_id, safe='')}/credentials/rotate",
         headers=_headers(),
         json={},
         timeout=_HUB_TIMEOUT,

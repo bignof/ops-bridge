@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 
 from app import hub_client, store, tokens
@@ -34,6 +35,20 @@ from app.models import (
 
 
 router = APIRouter(prefix="/api/namespaces", tags=["命名空间台账"])
+
+
+def _raise_hub_unavailable(exc: Exception) -> None:
+    """把 hub 调用异常统一映射成稳定的平台错误码(评审 A13,spec L103)。
+
+    - `hub_client.HubError`(配置缺失 / hub 业务性失败,如未返回 agentKey)→ **502 Bad Gateway**。
+    - `httpx.HTTPError`(连接 / 超时 / 非 2xx 等传输层错误)→ **503 Service Unavailable**。
+
+    detail 用**固定中文文案**,绝不回显 hub URL 或底层异常细节(`str(exc)` 可能含
+    内部地址 / token 痕迹);原始异常仅经 `raise ... from exc` 留在服务端堆栈,不出网。
+    """
+    if isinstance(exc, hub_client.HubError):
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "服务编排中心(service-hub)暂不可用,请稍后重试") from exc
+    raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "服务编排中心(service-hub)连接失败,请稍后重试") from exc
 
 
 def _to_out(row: Namespace) -> NamespaceOut:
@@ -69,7 +84,13 @@ async def create_namespace(
     except store.Conflict:
         raise HTTPException(status.HTTP_409_CONFLICT, "namespace code already exists")
     # 经模块引用调用,使测试 monkeypatch.setattr(hub_client, "provision_agent", ...) 生效(评审 H7)。
-    agent_key = hub_client.provision_agent(record.code)
+    # 评审 A14:provision 失败必须**补偿删除**刚建的台账行(整体原子失败),否则遗留无 agentKey
+    # 的孤儿 namespace(show-once 永久丢)。评审 A13:hub 异常统一映射 502/503,不回显内部细节。
+    try:
+        agent_key = hub_client.provision_agent(record.code)
+    except (hub_client.HubError, httpx.HTTPError) as exc:
+        store.delete_row(Namespace, record.id)  # 补偿:回收刚建的孤儿行
+        _raise_hub_unavailable(exc)
     return NamespaceCreateOut(
         id=record.id,
         code=record.code,
@@ -126,7 +147,11 @@ async def rotate_namespace_key(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "namespace not found")
     # 经模块引用调用,使测试 monkeypatch.setattr(hub_client, "rotate_agent_key", ...) 生效(同 create 的 H7 打桩)。
     # 新 agentKey 仅放进本次响应、不入库(库无该列),守 show-once 不变式。
-    agent_key = hub_client.rotate_agent_key(record.code)
+    # 评审 A13:hub 异常统一映射 502/503,不回显 hub URL / 内部细节(rotate 无新建行,无需补偿)。
+    try:
+        agent_key = hub_client.rotate_agent_key(record.code)
+    except (hub_client.HubError, httpx.HTTPError) as exc:
+        _raise_hub_unavailable(exc)
     return NamespaceRotateKeyOut(agent_key=agent_key)
 
 
