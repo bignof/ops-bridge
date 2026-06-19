@@ -9,6 +9,7 @@ from app.config import settings
 from app.db import Database
 from app.middleware import SessionGuardMiddleware
 from app.routers.auth import router as auth_router
+from app.routers.plugins import router as plugins_router
 from app.routers.system import router as system_router
 
 
@@ -36,3 +37,4 @@ app = FastAPI(title="service-platform", version="0.1.0", lifespan=lifespan)
 app.add_middleware(SessionGuardMiddleware)
 app.include_router(system_router)
 app.include_router(auth_router)
+app.include_router(plugins_router)
