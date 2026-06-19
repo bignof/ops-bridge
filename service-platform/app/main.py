@@ -7,6 +7,7 @@ from fastapi import FastAPI
 
 from app.config import settings
 from app.db import Database
+from app.middleware import SessionGuardMiddleware
 from app.routers.auth import router as auth_router
 from app.routers.system import router as system_router
 
@@ -29,6 +30,9 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="service-platform", version="0.1.0", lifespan=lifespan)
-# Task 3.5 起:app.add_middleware(SessionGuardMiddleware)
+# 评审 H6 / spec L100:default-deny 守 /api/**(白名单 login/distribution/health);
+# 逐路由 Depends(require_session) 保留作纵深防御(双层)。add_middleware 注册的
+# 中间件按逆序执行,此处唯一中间件,故为最外层先跑。
+app.add_middleware(SessionGuardMiddleware)
 app.include_router(system_router)
 app.include_router(auth_router)
