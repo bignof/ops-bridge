@@ -19,7 +19,7 @@ import math
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 
-from app import hub_client, store
+from app import hub_client, store, tokens
 from app.auth import require_session
 from app.db_models import Namespace
 from app.models import (
@@ -27,6 +27,8 @@ from app.models import (
     NamespaceIn,
     NamespaceListOut,
     NamespaceOut,
+    NamespaceRotateKeyOut,
+    NamespaceRotatePullTokenOut,
     NamespaceUpdate,
 )
 
@@ -111,3 +113,31 @@ async def delete_namespace(
     if not store.delete_row(Namespace, namespace_id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "namespace not found")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/{namespace_id}/rotate-key", response_model=NamespaceRotateKeyOut, summary="轮换 agentKey", description="向 service-hub 轮换该命名空间(Agent)的连接密钥,返回新 agentKey(仅本次响应、不入库 show-once;旧密钥 hub 侧立即失效)。namespace 不存在 → 404。")
+async def rotate_namespace_key(
+    namespace_id: int,
+    _: str = Depends(require_session),
+) -> NamespaceRotateKeyOut:
+    # 先确认 namespace 存在(不存在则 404,且不调 hub);存在再用其 code(=agentId)轮换。
+    record = store.get_row(Namespace, namespace_id)
+    if record is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "namespace not found")
+    # 经模块引用调用,使测试 monkeypatch.setattr(hub_client, "rotate_agent_key", ...) 生效(同 create 的 H7 打桩)。
+    # 新 agentKey 仅放进本次响应、不入库(库无该列),守 show-once 不变式。
+    agent_key = hub_client.rotate_agent_key(record.code)
+    return NamespaceRotateKeyOut(agent_key=agent_key)
+
+
+@router.post("/{namespace_id}/rotate-pull-token", response_model=NamespaceRotatePullTokenOut, summary="轮换 pull token", description="本地生成新 pull token,只把 sha256 哈希写入 namespace.pull_token_hash;明文仅本次响应返回(show-once,平台不落地明文)。namespace 不存在 → 404。")
+async def rotate_namespace_pull_token(
+    namespace_id: int,
+    _: str = Depends(require_session),
+) -> NamespaceRotatePullTokenOut:
+    plain, hashed = tokens.new_pull_token()
+    # 只把哈希落库;明文仅本次响应返回(show-once)。update_row 行不存在返回 None → 404。
+    record = store.update_row(Namespace, namespace_id, {"pull_token_hash": hashed})
+    if record is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "namespace not found")
+    return NamespaceRotatePullTokenOut(pull_token=plain)

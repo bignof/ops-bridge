@@ -122,6 +122,22 @@ class NamespaceCreateOut(NamespaceOut):
     agent_key: str
 
 
+class NamespaceRotateKeyOut(BaseModel):
+    """rotate-key 响应:仅一次性 `agentKey`(show-once,不入库;旧密钥 hub 侧已失效)。"""
+
+    model_config = MODEL_CONFIG
+
+    agent_key: str
+
+
+class NamespaceRotatePullTokenOut(BaseModel):
+    """rotate-pull-token 响应:仅一次性 `pullToken` 明文(show-once,库内只存哈希)。"""
+
+    model_config = MODEL_CONFIG
+
+    pull_token: str
+
+
 class NamespaceListOut(ListEnvelope[NamespaceOut]):
     """namespace 列表响应(具体子类,避开泛型 response_model 的 Pydantic 警告路径)。"""
 
