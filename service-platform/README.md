@@ -6,7 +6,7 @@ service-platform 是机群插件分发与发布的**控制平台后端**(单 adm
 
 ## 能力
 
-- 单 admin 登录签发 JWT(`POST /api/login`);`/api/**` 默认拒绝中间件守门(白名单 login / distribution / health),逐路由 `Depends(require_session)` 作纵深防御
+- 单 admin 登录签发 JWT(`POST /auth/login`,**不在 `/api/` 前缀下**;会话回显 `GET /auth/me`);`/api/**` 默认拒绝中间件守门(白名单:`/auth/login` / `/api/distribution/` / `/health`),逐路由 `Depends(require_session)` 作纵深防御
 - 命名空间 / 服务 / 插件 / 服务-插件 等台账逐资源 CRUD(响应统一 camelCase + `{count, rows, page, pageSize, totalPage}` 分页信封)
 - 命名空间 provision / rotate(经外部 service-hub),pull token / agent key 仅签发时返回一次(show-once)
 - 插件包 `.tgz` 上传:`version` 取自包内 `package.json`(对齐 NocoBase `build --tar` 产物)
@@ -29,7 +29,7 @@ uvicorn app.main:app --reload
 
 启动时 `app/main.py` 的 lifespan 会自动执行 Alembic 迁移到最新 schema(见下「数据库迁移」),无需手动建表。缺省 `DATABASE_URL` 走本地 sqlite 文件,仅供本机起步;生产请指向独立 MySQL8 库 `service_platform`。
 
-在线接口文档:启动后访问 `/docs`(Swagger UI)与 `/openapi.json`。
+在线接口文档(`/docs` / `/redoc` / `/openapi.json`)**默认关闭**(生产安全:这些端点不在 `/api/` 前缀下,default-deny 中间件不拦,开着即匿名暴露全 API 面)。本机调试需要时设 `PLATFORM_ENABLE_DOCS=true` 再启动,关闭时三者均返回 404。
 
 ## 跑测试
 
@@ -78,6 +78,7 @@ docker run -d --name service-platform \
 | `PLATFORM_ADMIN_PASSWORD`  | 【生产必改】admin 登录密码,空串=无法登录                            | 空串                            |
 | `PLATFORM_JWT_SECRET`      | 【生产必改】JWT 签名密钥,**须 ≥32 字符,否则启动即被拒绝**          | 空串                            |
 | `PLATFORM_JWT_TTL`         | JWT 有效期(秒)                                                     | `28800`(8h)                   |
+| `PLATFORM_ENABLE_DOCS`     | 在线接口文档(`/docs` `/redoc` `/openapi.json`)开关,默认关(生产安全) | `false`                         |
 | `SERVICE_HUB_URL`          | 外部 service-hub 地址(命名空间 provision / rotate)                 | 空串                            |
 | `HUB_ADMIN_TOKEN`          | 【生产必改】调用 service-hub 的管理令牌,仅服务端持有,绝不下发浏览器 | 空串                            |
 | `PLUGIN_STORAGE_DIR`       | 插件包 `.tgz` 落盘目录(生产须挂卷 / 共享存储)                      | `./data/plugins`                |
