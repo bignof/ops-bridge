@@ -13,6 +13,7 @@ camel(alias)也接受 snake(字段名)。
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict
@@ -289,3 +290,29 @@ class ReleaseOut(BaseModel):
 
 class ReleaseListOut(ListEnvelope[ReleaseOut]):
     """release 列表响应(具体子类,避开泛型 response_model 的 Pydantic 警告路径)。"""
+
+
+# --- fetch_record 获取记录列表(Task 11.5,评审 H1) ------------------------
+
+
+class FetchRecordOut(BaseModel):
+    """获取记录响应:本行字段 + LEFT JOIN 回 namespaceCode/serviceCode/pluginCode/version
+    只读名称(评审 H3,关联缺失时为 None)。审计只读,无写入模型。"""
+
+    model_config = MODEL_CONFIG
+
+    id: int
+    namespace_id: int
+    service_id: int
+    plugin_id: int
+    plugin_version_id: int
+    fetch_date: datetime
+    remark: str | None = None
+    namespace_code: str | None = None
+    service_code: str | None = None
+    plugin_code: str | None = None
+    version: str | None = None
+
+
+class FetchRecordListOut(ListEnvelope[FetchRecordOut]):
+    """获取记录列表响应(具体子类,避开泛型 response_model 的 Pydantic 警告路径)。"""

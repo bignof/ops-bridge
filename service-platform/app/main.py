@@ -10,6 +10,7 @@ from app.db import Database
 from app.middleware import SessionGuardMiddleware
 from app.routers.auth import router as auth_router
 from app.routers.distribution import router as distribution_router
+from app.routers.fetch_records import router as fetch_records_router
 from app.routers.namespaces import router as namespaces_router
 from app.routers.plugin_versions import router as plugin_versions_router
 from app.routers.plugins import router as plugins_router
@@ -50,3 +51,4 @@ app.include_router(services_router)
 app.include_router(service_plugins_router)
 app.include_router(releases_router)
 app.include_router(distribution_router)
+app.include_router(fetch_records_router)
