@@ -211,3 +211,31 @@ class ServicePluginOut(BaseModel):
 
 class ServicePluginListOut(ListEnvelope[ServicePluginOut]):
     """service_plugin 列表响应(具体子类,避开泛型 response_model 的 Pydantic 警告路径)。"""
+
+
+# --- plugin_version 资源 / 插件上传(Task 9) -------------------------------
+
+
+class PluginVersionOut(BaseModel):
+    """版本台账响应:id + pluginId + version(= package.json.version)+ name。"""
+
+    model_config = MODEL_CONFIG
+
+    id: int
+    plugin_id: int
+    version: str
+    name: str | None = None
+
+
+class PluginVersionListOut(ListEnvelope[PluginVersionOut]):
+    """plugin_version 列表响应(具体子类,避开泛型 response_model 的 Pydantic 警告路径)。"""
+
+
+class PluginUploadOut(BaseModel):
+    """上传响应:新建的 pluginVersionId / attachmentId + version(取自 package.json)。"""
+
+    model_config = MODEL_CONFIG
+
+    plugin_version_id: int
+    attachment_id: int
+    version: str

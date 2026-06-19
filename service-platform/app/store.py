@@ -105,6 +105,20 @@ def get_row(model: type[ModelT], row_id: int) -> ModelT | None:
         return session.get(model, row_id)
 
 
+def find_rows(model: type[ModelT], *, filters: Sequence[Any], limit: int | None = None) -> list[ModelT]:
+    """按条件取匹配行(不分页);用于 plugin 匹配(精确/LIKE 命中判 0/1/多)与去重预检。
+
+    `limit` 可选(如只需判「是否有 >1 命中」时取 2 即足)。返回 ORM 行列表。
+    """
+    with _db().session_factory() as session:
+        stmt = select(model)
+        for cond in filters:
+            stmt = stmt.where(cond)
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(session.execute(stmt).scalars().all())
+
+
 def create_row(model: type[ModelT], values: dict[str, Any]) -> ModelT:
     """插入一行;`created_at`/`updated_at` 若模型有该列且未显式传入则自动补当前 UTC。
 

@@ -10,6 +10,7 @@ from app.db import Database
 from app.middleware import SessionGuardMiddleware
 from app.routers.auth import router as auth_router
 from app.routers.namespaces import router as namespaces_router
+from app.routers.plugin_versions import router as plugin_versions_router
 from app.routers.plugins import router as plugins_router
 from app.routers.service_plugins import router as service_plugins_router
 from app.routers.services import router as services_router
@@ -41,6 +42,7 @@ app.add_middleware(SessionGuardMiddleware)
 app.include_router(system_router)
 app.include_router(auth_router)
 app.include_router(plugins_router)
+app.include_router(plugin_versions_router)
 app.include_router(namespaces_router)
 app.include_router(services_router)
 app.include_router(service_plugins_router)
