@@ -85,3 +85,113 @@ class PluginOut(BaseModel):
 
 class PluginListOut(ListEnvelope[PluginOut]):
     """plugin 列表响应(具体子类,避开泛型 response_model 的 Pydantic 警告路径)。"""
+
+
+# --- namespace 资源(Task 6b) ----------------------------------------------
+
+
+class NamespaceIn(BaseModel):
+    model_config = MODEL_CONFIG
+
+    code: str
+    name: str | None = None
+
+
+class NamespaceUpdate(BaseModel):
+    """PATCH 局部更新:全字段可选;未传字段保持原值(路由按 `exclude_unset` 取增量)。"""
+
+    model_config = MODEL_CONFIG
+
+    code: str | None = None
+    name: str | None = None
+
+
+class NamespaceOut(BaseModel):
+    """列表/查询响应:`name` 空回退 `code`(评审 H3 由路由层填);在线/心跳 P2 实时读 hub 填。"""
+
+    model_config = MODEL_CONFIG
+
+    id: int
+    code: str
+    name: str | None = None
+
+
+class NamespaceCreateOut(NamespaceOut):
+    """create 专用响应:额外携带一次性 `agentKey`(show-once,不入库,仅本次返回)。"""
+
+    agent_key: str
+
+
+class NamespaceListOut(ListEnvelope[NamespaceOut]):
+    """namespace 列表响应(具体子类,避开泛型 response_model 的 Pydantic 警告路径)。"""
+
+
+# --- service 资源(Task 6b) ------------------------------------------------
+
+
+class ServiceIn(BaseModel):
+    model_config = MODEL_CONFIG
+
+    namespace_id: int
+    service_code: str
+    name: str | None = None
+    dir: str | None = None
+    default_image: str | None = None
+    nacos_service_name: str | None = None
+
+
+class ServiceUpdate(BaseModel):
+    model_config = MODEL_CONFIG
+
+    namespace_id: int | None = None
+    service_code: str | None = None
+    name: str | None = None
+    dir: str | None = None
+    default_image: str | None = None
+    nacos_service_name: str | None = None
+
+
+class ServiceOut(BaseModel):
+    """全字段 + LEFT JOIN 回 `namespaceCode`(评审 H3,namespace 不存在时为 None)。"""
+
+    model_config = MODEL_CONFIG
+
+    id: int
+    namespace_id: int
+    service_code: str
+    name: str | None = None
+    dir: str | None = None
+    default_image: str | None = None
+    nacos_service_name: str | None = None
+    namespace_code: str | None = None
+
+
+class ServiceListOut(ListEnvelope[ServiceOut]):
+    """service 列表响应(具体子类,避开泛型 response_model 的 Pydantic 警告路径)。"""
+
+
+# --- service_plugin 资源(Task 6b) -----------------------------------------
+
+
+class ServicePluginIn(BaseModel):
+    model_config = MODEL_CONFIG
+
+    service_id: int
+    plugin_id: int
+
+
+class ServicePluginOut(BaseModel):
+    """id + serviceId/pluginId + LEFT JOIN 回 namespaceCode/serviceCode/pluginCode(评审 H3)。"""
+
+    model_config = MODEL_CONFIG
+
+    id: int
+    service_id: int
+    plugin_id: int
+    namespace_code: str | None = None
+    service_code: str | None = None
+    plugin_code: str | None = None
+
+
+class ServicePluginListOut(ListEnvelope[ServicePluginOut]):
+    """service_plugin 列表响应(具体子类,避开泛型 response_model 的 Pydantic 警告路径)。"""

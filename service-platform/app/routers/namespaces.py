@@ -1,0 +1,113 @@
+"""namespace 台账 CRUD 路由(Task 6b)。
+
+`/api/namespaces`(GET 列表信封 / POST 201)、`/api/namespaces/{id}`(GET / PATCH /
+DELETE 204)。约束:
+- **响应全 camelCase**(评审 H2):一律 `response_model=*Out`,store 返回经模型序列化,
+  **不手搓 dict**。
+- **唯一冲突 → 409**:`store.Conflict` 捕获后抛 `HTTPException(409)`。
+- **纵深防御**:逐路由 `Depends(require_session)` 保留;`/api/` 前缀下中间件已先挡无/坏 JWT。
+- **列表回名(评审 H3)**:返回 `id/code/name`,`name` 空回退 `code`(在线/心跳 P2 实时读 hub 填,本任务留空)。
+- **create 特例(评审 H7 / show-once)**:先 `hub_client.provision_agent(code)` 取 agentKey,
+  **仅一次性放进 create 响应 `agentKey` 字段、不入库**;库里无该列,后续重查不含明文。
+  > 这里**经模块引用** `hub_client.provision_agent(...)` 调用(而非 `from ... import provision_agent`),
+  > 故测试 `monkeypatch.setattr(hub_client, "provision_agent", ...)` 能生效(评审 H7 同款打桩)。
+"""
+
+from __future__ import annotations
+
+import math
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+
+from app import hub_client, store
+from app.auth import require_session
+from app.db_models import Namespace
+from app.models import (
+    NamespaceCreateOut,
+    NamespaceIn,
+    NamespaceListOut,
+    NamespaceOut,
+    NamespaceUpdate,
+)
+
+
+router = APIRouter(prefix="/api/namespaces", tags=["命名空间台账"])
+
+
+def _to_out(row: Namespace) -> NamespaceOut:
+    """转响应模型;`name` 空回退 `code`(评审 H3)。"""
+    return NamespaceOut(id=row.id, code=row.code, name=row.name or row.code)
+
+
+@router.get("", response_model=NamespaceListOut, summary="命名空间列表", description="分页返回命名空间台账;name 空回退 code(在线/心跳 P2 实时读 hub 填)。")
+async def list_namespaces(
+    _: str = Depends(require_session),
+    page: int = Query(default=1, ge=1, title="页码"),
+    page_size: int = Query(default=20, ge=1, le=200, alias="pageSize", title="每页条数"),
+) -> NamespaceListOut:
+    rows, count = store.list_rows(Namespace, page=page, page_size=page_size)
+    return NamespaceListOut(
+        count=count,
+        rows=[_to_out(row) for row in rows],
+        page=page,
+        page_size=page_size,
+        total_page=math.ceil(count / page_size) if page_size else 0,
+    )
+
+
+@router.post("", response_model=NamespaceCreateOut, status_code=status.HTTP_201_CREATED, summary="创建命名空间", description="先向 service-hub provision Agent 取 agentKey(仅本次响应返回、不入库 show-once);code(=agentId)唯一,重复 → 409。")
+async def create_namespace(
+    body: NamespaceIn,
+    _: str = Depends(require_session),
+) -> NamespaceCreateOut:
+    # 先入库占住唯一 code(冲突即 409,避免无谓地向 hub provision);成功后再取一次性 agentKey。
+    # by_alias=False:取 snake 字段名（ORM 列名）；MODEL_CONFIG 默认 serialize_by_alias=True 会出 camel，需显式覆盖。
+    try:
+        record = store.create_row(Namespace, body.model_dump(by_alias=False))
+    except store.Conflict:
+        raise HTTPException(status.HTTP_409_CONFLICT, "namespace code already exists")
+    # 经模块引用调用,使测试 monkeypatch.setattr(hub_client, "provision_agent", ...) 生效(评审 H7)。
+    agent_key = hub_client.provision_agent(record.code)
+    return NamespaceCreateOut(
+        id=record.id,
+        code=record.code,
+        name=record.name or record.code,
+        agent_key=agent_key,
+    )
+
+
+@router.get("/{namespace_id}", response_model=NamespaceOut, summary="查询单个命名空间", description="按 id 查询;不存在 → 404。")
+async def get_namespace(
+    namespace_id: int,
+    _: str = Depends(require_session),
+) -> NamespaceOut:
+    record = store.get_row(Namespace, namespace_id)
+    if record is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "namespace not found")
+    return _to_out(record)
+
+
+@router.patch("/{namespace_id}", response_model=NamespaceOut, summary="更新命名空间", description="局部更新(只覆盖传入字段);不存在 → 404,code 冲突 → 409。")
+async def update_namespace(
+    namespace_id: int,
+    body: NamespaceUpdate,
+    _: str = Depends(require_session),
+) -> NamespaceOut:
+    values = body.model_dump(exclude_unset=True, by_alias=False)
+    try:
+        record = store.update_row(Namespace, namespace_id, values)
+    except store.Conflict:
+        raise HTTPException(status.HTTP_409_CONFLICT, "namespace code already exists")
+    if record is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "namespace not found")
+    return _to_out(record)
+
+
+@router.delete("/{namespace_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response, summary="删除命名空间", description="按 id 删除;不存在 → 404,成功 → 204(无响应体)。")
+async def delete_namespace(
+    namespace_id: int,
+    _: str = Depends(require_session),
+) -> Response:
+    if not store.delete_row(Namespace, namespace_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "namespace not found")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

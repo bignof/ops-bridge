@@ -62,6 +62,44 @@ def list_rows(
         return list(rows), count
 
 
+def list_rows_joined(
+    base_model: type[Any],
+    *,
+    columns: Sequence[Any],
+    outer_joins: Sequence[tuple[Any, Any]] = (),
+    page: int = 1,
+    page_size: int = 20,
+    filters: Sequence[Any] | None = None,
+    order_by: Any | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """带 LEFT JOIN 的分页查询(评审 H3 回可读名 / 评审 M3 级联过滤)。
+
+    - `columns`:要 SELECT 的列表达式序列(本行字段 + 关联表回名列,用 `.label('xxxCode')`
+      命名,结果以该名进 dict)。
+    - `outer_joins`:`(target_model, onclause)` 序列,逐个 `outerjoin`(LEFT JOIN,
+      关联缺失时回名列为 NULL,不丢主行)。
+    - `filters`:SQLAlchemy 条件表达式序列(含级联过滤的等值条件)。
+
+    返回 `(rows, count)`,`rows` 是 `dict`(键 = column 的 label/键名),路由层经 `*Out`
+    模型 `model_validate(...)` 转 camelCase。
+    """
+    page = max(1, page)
+    page_size = max(1, page_size)
+    with _db().session_factory() as session:
+        base = select(*columns)
+        count_stmt = select(func.count()).select_from(base_model)
+        for target, onclause in outer_joins:
+            base = base.outerjoin(target, onclause)
+        for cond in filters or []:
+            base = base.where(cond)
+            count_stmt = count_stmt.where(cond)
+        count = int(session.execute(count_stmt).scalar_one())
+        base = base.order_by(order_by if order_by is not None else getattr(base_model, "id").asc())
+        result = session.execute(base.offset((page - 1) * page_size).limit(page_size))
+        rows = [dict(m) for m in result.mappings().all()]
+        return rows, count
+
+
 def get_row(model: type[ModelT], row_id: int) -> ModelT | None:
     with _db().session_factory() as session:
         return session.get(model, row_id)
