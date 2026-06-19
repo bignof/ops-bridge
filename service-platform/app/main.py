@@ -7,6 +7,7 @@ from fastapi import FastAPI
 
 from app.config import settings
 from app.db import Database
+from app.routers.auth import router as auth_router
 from app.routers.system import router as system_router
 
 
@@ -30,3 +31,4 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="service-platform", version="0.1.0", lifespan=lifespan)
 # Task 3.5 起:app.add_middleware(SessionGuardMiddleware)
 app.include_router(system_router)
+app.include_router(auth_router)
