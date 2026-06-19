@@ -37,7 +37,15 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="service-platform", version="0.1.0", lifespan=lifespan)
+# 评审 A15/B3:docs/redoc/openapi 不在 /api 前缀下,SessionGuardMiddleware 的 default-deny
+# 不覆盖它们,开着即匿名暴露全 API 面。默认 enable_docs=false(生产安全)→ 三者全 None(404);
+# 仅当 PLATFORM_ENABLE_DOCS 显式打开时才挂内置文档(本机调试用)。
+_docs_kwargs = (
+    {}
+    if settings.enable_docs
+    else {"docs_url": None, "redoc_url": None, "openapi_url": None}
+)
+app = FastAPI(title="service-platform", version="0.1.0", lifespan=lifespan, **_docs_kwargs)
 # 评审 H6 / spec L100:default-deny 守 /api/**(白名单 login/distribution/health);
 # 逐路由 Depends(require_session) 保留作纵深防御(双层)。add_middleware 注册的
 # 中间件按逆序执行,此处唯一中间件,故为最外层先跑。

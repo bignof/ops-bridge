@@ -20,13 +20,25 @@ from app.config import settings
 
 
 def verify_login(user: str, pw: str) -> bool:
-    """常量时间校验单 admin 凭据;未配置 env 凭据时一律拒绝(fail-closed)。"""
-    if not settings.admin_user or not settings.admin_password:
+    """常量时间校验单 admin 凭据;未配置 env 凭据时一律拒绝(fail-closed)。
+
+    评审 A2:`hmac.compare_digest(str, str)` 对非 ASCII 字符串抛 TypeError(只接受
+    纯 ASCII str 或 bytes),会让含中文/Unicode 的用户名/密码登录冒泡成 **500**(违
+    fail-closed)。修法:两侧统一 `.encode("utf-8")` 后用 **bytes 版** compare_digest
+    (无 ASCII 限制),user/pw 仍各跑一次保持常量时间;再用 `except Exception` 兜底——
+    任何意外坏路径一律当作校验失败(返回 False),确保上层返回 401 而非 500。
+    """
+    try:
+        if not settings.admin_user or not settings.admin_password:
+            return False
+        # 两个比较都跑,避免短路泄漏「用户名是否正确」的时序信息;
+        # bytes 版 compare_digest 无 ASCII 限制,合法非 ASCII 凭据可正常比对。
+        user_ok = hmac.compare_digest(user.encode("utf-8"), settings.admin_user.encode("utf-8"))
+        pw_ok = hmac.compare_digest(pw.encode("utf-8"), settings.admin_password.encode("utf-8"))
+        return user_ok and pw_ok
+    except Exception:
+        # fail-closed:任何意外异常一律当校验失败(上层返回 401,绝不 500)。
         return False
-    # 两个比较都跑,避免短路泄漏「用户名是否正确」的时序信息。
-    user_ok = hmac.compare_digest(user, settings.admin_user)
-    pw_ok = hmac.compare_digest(pw, settings.admin_password)
-    return user_ok and pw_ok
 
 
 def issue_token(sub: str) -> str:

@@ -19,6 +19,7 @@ from typing import Iterator
 
 import pytest
 from fastapi import Depends, HTTPException
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 
@@ -178,4 +179,61 @@ def test_downstream_non_http_exception_not_swallowed_as_401(
     with pytest.raises(RuntimeError, match="boom"):
         client_with_boom_probe.get(
             "/api/__boom__", headers={"Authorization": f"Bearer {tok}"}
+        )
+
+
+# ── A15/B3:默认(PLATFORM_ENABLE_DOCS 未设=false)在线文档全关,匿名 GET → 404 ──
+#    /openapi.json /docs /redoc 不在 /api 前缀下,default-deny 中间件不覆盖它们;
+#    默认关闭后三者均不挂载 → 404(不暴露全 API 面)。conftest 未设 PLATFORM_ENABLE_DOCS,
+#    app 在 import 时即按默认 false 创建,故此处直接断言默认安全态。
+def test_openapi_disabled_by_default_404(client: TestClient) -> None:
+    assert client.get("/openapi.json").status_code == 404
+
+
+def test_docs_redoc_disabled_by_default_404(client: TestClient) -> None:
+    assert client.get("/docs").status_code == 404
+    assert client.get("/redoc").status_code == 404
+
+
+# ── A18:白名单与真实公开路由「一致性」自检 ──
+#    防将来挪端点静默失守:枚举 app.routes,对每个**在 /api/ 前缀下**的 APIRoute,
+#    若它**未挂 require_session**(即公开),则其 path 必须命中中间件白名单前缀;
+#    反向再断言每个 /api/ 白名单前缀都至少覆盖一个真实公开路由(防白名单过宽留口子)。
+def _route_calls(dependant) -> list:
+    """递归收集一条路由 dependant 链上的全部依赖 callable(含嵌套 sub-dependency)。"""
+    calls = []
+    if dependant.call is not None:
+        calls.append(dependant.call)
+    for sub in dependant.dependencies:
+        calls.extend(_route_calls(sub))
+    return calls
+
+
+def test_whitelist_matches_real_public_api_routes(client: TestClient) -> None:
+    from app.auth import require_session
+    from app.middleware import API_PREFIX, WHITELIST_PREFIXES
+
+    app = client.app
+    api_routes = [r for r in app.routes if isinstance(r, APIRoute) and r.path.startswith(API_PREFIX)]
+    assert api_routes, "未发现任何 /api/ 路由,断言失去意义(地基异常)"
+
+    # ① 每个未挂 require_session 的公开 /api/ 路由都必须在白名单内(否则匿名可达=失守)。
+    leaks: list[str] = []
+    public_api_paths: set[str] = set()
+    for r in api_routes:
+        protected = require_session in _route_calls(r.dependant)
+        whitelisted = any(r.path.startswith(p) for p in WHITELIST_PREFIXES)
+        if not protected:
+            public_api_paths.add(r.path)
+            if not whitelisted:
+                leaks.append(f"{sorted(r.methods)} {r.path}")
+    assert not leaks, f"公开(无 require_session)且不在白名单的 /api/ 路由(失守口子):{leaks}"
+
+    # ② 反向:每个 /api/ 前缀白名单条目都须至少覆盖一个真实公开路由(防白名单过宽,
+    #    误把本应受保护的路由前缀开放)。非 /api/ 的白名单项(/auth/login、/health)只为
+    #    意图清晰,天然不被中间件拦,不在此断言范围。
+    api_whitelist = [p for p in WHITELIST_PREFIXES if p.startswith(API_PREFIX)]
+    for p in api_whitelist:
+        assert any(path.startswith(p) for path in public_api_paths), (
+            f"白名单前缀 {p!r} 未覆盖任何真实公开路由(过宽/陈旧,应收紧或移除)"
         )
