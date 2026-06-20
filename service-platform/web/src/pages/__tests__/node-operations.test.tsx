@@ -189,7 +189,10 @@ describe('NodeOperationsPage', () => {
     await user.click(screen.getByTitle('下一页'));
 
     await waitFor(() => expect(listNodeOperations).toHaveBeenCalled());
-    const nextParams = listNodeOperations.mock.calls.at(-1)![0] as {
+    // 用末位下标取最后一次调用(ES2020-safe;tsconfig.app target=ES2020 无 Array.prototype.at,
+    // 用 .at() 会令 `tsc -b` 生产构建 TS2550 失败——本仓 vitest 不跑 tsc 故本地易漏,docker 构建会红)。
+    const calls = listNodeOperations.mock.calls;
+    const nextParams = calls[calls.length - 1][0] as {
       page?: number;
       pageSize?: number;
     };
