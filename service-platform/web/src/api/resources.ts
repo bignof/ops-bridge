@@ -72,3 +72,31 @@ export async function rotatePullToken(id: string | number): Promise<{ pullToken:
   const r = await client.post<{ pullToken: string }>(`/api/namespaces/${id}/rotate-pull-token`);
   return r.data;
 }
+
+/** 插件版本上传响应(P1a 解析 .tgz 内 package.json 取 version + 落库)。 */
+export interface UploadPluginVersionResult {
+  pluginVersionId: string | number;
+  attachmentId: string | number;
+  /** 包内 package.json.version,上传成功后回显给用户。 */
+  version: string;
+}
+
+/**
+ * 上传插件版本:multipart POST /api/plugin-versions/upload,字段名固定 `file`(.tgz)。
+ * 成功响应含解析出的 `version`(供页面成功提示回显)。
+ * 失败由调用方按 `e.response.status` 区分:400(未匹配/匹配多个插件)、409(版本已存在)、413(超限)。
+ */
+export async function uploadPluginVersion(file: File): Promise<UploadPluginVersionResult> {
+  const form = new FormData();
+  form.append('file', file);
+  const r = await client.post<UploadPluginVersionResult>('/api/plugin-versions/upload', form);
+  return r.data;
+}
+
+/**
+ * 已上传插件版本列表(服务端分页,统一信封 `{count, rows, …}`):
+ * GET /api/plugin-versions?page=&pageSize=&pluginId=。可选 `pluginId` 过滤按插件查其版本。
+ */
+export async function listPluginVersions<T>(params: ListParams = {}): Promise<ListEnvelope<T>> {
+  return list<T>('plugin-versions', params);
+}
