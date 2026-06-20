@@ -1,0 +1,107 @@
+# service-platform 部署栈:自带 nginx 反代 + hub/platform 均不暴露宿主机面。
+#
+# 拓扑(详见同目录 README.md):
+#   运维浏览器 ──443/80──▶ nginx ──[svc_internal]──▶ service-platform:8080   (SPA + /api)
+#   远程 agent  ──443/80──▶ nginx ─/ws/agent/─[svc_internal]──▶ service-hub:8080 (agent WS)
+#   nginx 是唯一对外面;service-hub / service-platform 都不写 ports,异网段无 TCP 可达。
+#
+# 网络取舍:用普通 bridge,**不**设 internal: true。生产 DATABASE_URL 多指向机群外部 MySQL8
+#   (见 .env.example),internal: true 会切断 hub/platform 到外部 MySQL/Redis 的出站,弄坏部署;
+#   而「不发布端口」本身已满足验收门「异网段直连 hub/platform 被拒」,无需 internal: true。
+#
+# 镜像名经 env 占位(${...:?} 缺省即报错),真实名由部署侧 .env 提供。
+
+networks:
+  # 内网:nginx ↔ platform ↔ hub 互通;不向宿主机发布 hub/platform 端口即满足「异网段不可达」。
+  svc_internal: {}
+
+services:
+  # ── 唯一对外面:nginx 边缘反代 ────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: ${NGINX_CONTAINER_NAME:-service-edge-nginx}
+    init: true
+    networks:
+      - svc_internal
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # 生产 TLS 证书挂载点(本任务不签证书,占位 + README 注明)。
+      # 启用 443 时取消注释,把宿主机证书目录挂进来,并在 nginx.conf 443 段填证书路径。
+      # - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      # hub 有 healthcheck → 等其 healthy 再起,避免 WS 段上游早期不可达。
+      service-hub:
+        condition: service_healthy
+      # platform 镜像未定义 healthcheck(不为此改镜像)→ 仅等容器启动。
+      service-platform:
+        condition: service_started
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── service-hub:agent WS 接入 + 内网给 platform 调用,不暴露宿主机面 ──────────
+  service-hub:
+    image: ${SERVICE_HUB_IMAGE:?SERVICE_HUB_IMAGE is required}
+    pull_policy: always
+    container_name: ${SERVICE_HUB_CONTAINER_NAME:-service-hub}
+    init: true
+    networks:
+      - svc_internal
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${SERVICE_HUB_DATABASE_URL:-sqlite:////data/service-hub/service-hub.db}
+    volumes:
+      - ${SERVICE_HUB_DATA_DIR:-./data/service-hub}:/data/service-hub
+    # 外部 MySQL/Redis 经宿主机回环访问时用 host.docker.internal(沿用 hub 单服务 compose)。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status == 200 else 1)\"",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── service-platform:BFF(SPA + /api),浏览器只与它通信,不暴露宿主机面 ────────
+  service-platform:
+    image: ${SERVICE_PLATFORM_IMAGE:?SERVICE_PLATFORM_IMAGE is required}
+    pull_policy: always
+    container_name: ${SERVICE_PLATFORM_CONTAINER_NAME:-service-platform}
+    init: true
+    networks:
+      - svc_internal
+    env_file:
+      - .env
+    environment:
+      # platform 服务端经内网调 hub(走 svc_internal,不经 nginx)。
+      SERVICE_HUB_URL: ${SERVICE_HUB_URL:-http://service-hub:8080}
+      DATABASE_URL: ${SERVICE_PLATFORM_DATABASE_URL:-sqlite:////data/service-platform/service-platform.db}
+      # 插件包落盘目录:挂卷持久化(见下方 volumes 与 .env.example)。
+      PLUGIN_STORAGE_DIR: ${PLUGIN_STORAGE_DIR:-/data/service-platform/plugins}
+    volumes:
+      - ${SERVICE_PLATFORM_DATA_DIR:-./data/service-platform}:/data/service-platform
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
