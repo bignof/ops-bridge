@@ -1,3 +1,10 @@
+import os
+
+# compose 实现 validate_managed_dir 后会 import config，config 缺 WS_URL/AGENT_KEY 会 sys.exit。
+# 与 test_handlers.py 同款：导入前先注入测试用默认值。
+os.environ.setdefault("WS_URL", "ws://test")
+os.environ.setdefault("AGENT_KEY", "test-key")
+
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -191,3 +198,129 @@ def test_is_image_registry_allowed_prefix_match_with_boundary() -> None:
     assert compose.is_image_registry_allowed("registry.example.com/team", allowlist) is True
     # 边界反例：team-evil 不得被前缀 team 误放
     assert compose.is_image_registry_allowed("registry.example.com/team-evil/app:1", allowlist) is False
+
+
+# ─────────────────────────────────────────────
+# validate_managed_dir — 目录受管根安全闸（纯函数，command 与日志流共用）
+# ─────────────────────────────────────────────
+
+def test_validate_managed_dir_allows_dir_inside_root(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """根内、非自身目录 → (True, None)。"""
+    root = tmp_path / "managed"
+    root.mkdir()
+    project = root / "biz"
+    project.mkdir()
+    monkeypatch.setattr(compose.config, "MANAGED_PROJECTS_ROOT", str(root))
+    monkeypatch.setattr(compose.config, "SELF_PROJECT_DIR", str(root / "agent"))
+
+    ok, reason = compose.validate_managed_dir(str(project))
+
+    assert ok is True
+    assert reason is None
+
+
+def test_validate_managed_dir_rejects_dir_outside_root(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """根外 → (False, 含「不在受管目录」)。"""
+    root = tmp_path / "managed"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setattr(compose.config, "MANAGED_PROJECTS_ROOT", str(root))
+    monkeypatch.setattr(compose.config, "SELF_PROJECT_DIR", "")
+
+    ok, reason = compose.validate_managed_dir(str(outside))
+
+    assert ok is False
+    assert "不在受管目录" in reason
+
+
+def test_validate_managed_dir_rejects_path_traversal_escape(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """`..` 穿越逃逸到根外，realpath 归一后被拒。"""
+    root = tmp_path / "managed"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    traversal = os.path.join(str(root), "..", "outside")
+    monkeypatch.setattr(compose.config, "MANAGED_PROJECTS_ROOT", str(root))
+    monkeypatch.setattr(compose.config, "SELF_PROJECT_DIR", "")
+
+    ok, reason = compose.validate_managed_dir(traversal)
+
+    assert ok is False
+    assert "不在受管目录" in reason
+
+
+def test_validate_managed_dir_rejects_self_project(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """命中 SELF_PROJECT_DIR（含子目录）→ (False, 含「禁止操作 agent 自身」)。"""
+    root = tmp_path / "managed"
+    root.mkdir()
+    self_dir = root / "agent"
+    self_dir.mkdir()
+    monkeypatch.setattr(compose.config, "MANAGED_PROJECTS_ROOT", str(root))
+    monkeypatch.setattr(compose.config, "SELF_PROJECT_DIR", str(self_dir))
+
+    ok, reason = compose.validate_managed_dir(str(self_dir))
+
+    assert ok is False
+    assert "禁止操作 agent 自身" in reason
+
+
+def test_validate_managed_dir_self_empty_skips_self_check(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """SELF_PROJECT_DIR 为空 → 不做自身判定，根内一律放行（与现 _validate_base 等价）。"""
+    root = tmp_path / "managed"
+    root.mkdir()
+    project = root / "anything"
+    project.mkdir()
+    monkeypatch.setattr(compose.config, "MANAGED_PROJECTS_ROOT", str(root))
+    monkeypatch.setattr(compose.config, "SELF_PROJECT_DIR", "")
+
+    ok, reason = compose.validate_managed_dir(str(project))
+
+    assert ok is True
+    assert reason is None
+
+
+def test_validate_managed_dir_root_commonpath_valueerror_rejects(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """根判定的 commonpath 抛 ValueError（如 Windows 跨盘符）→ 从严兜底为「在根外」拒绝。"""
+    project = tmp_path / "biz"
+    project.mkdir()
+    monkeypatch.setattr(compose.config, "MANAGED_PROJECTS_ROOT", str(tmp_path))
+    monkeypatch.setattr(compose.config, "SELF_PROJECT_DIR", "")
+
+    def boom(_paths):
+        raise ValueError("paths on different drives")
+
+    monkeypatch.setattr(compose.os.path, "commonpath", boom)
+
+    ok, reason = compose.validate_managed_dir(str(project))
+
+    assert ok is False
+    assert "不在受管目录" in reason
+
+
+def test_validate_managed_dir_self_commonpath_valueerror_rejects(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """自身判定的 commonpath 抛 ValueError → 从严兜底为「命中自身」拒绝。"""
+    root = tmp_path / "managed"
+    root.mkdir()
+    project = root / "biz"
+    project.mkdir()
+    self_dir = root / "agent"
+    self_dir.mkdir()
+    monkeypatch.setattr(compose.config, "MANAGED_PROJECTS_ROOT", str(root))
+    monkeypatch.setattr(compose.config, "SELF_PROJECT_DIR", str(self_dir))
+
+    calls = {"n": 0}
+
+    def commonpath_first_ok_then_boom(paths):
+        # 第一次（根判定）放行；第二次（self 判定）抛 ValueError，触发从严兜底。
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return os.path.realpath(str(root))
+        raise ValueError("paths on different drives")
+
+    monkeypatch.setattr(compose.os.path, "commonpath", commonpath_first_ok_then_boom)
+
+    ok, reason = compose.validate_managed_dir(str(project))
+
+    assert ok is False
+    assert "禁止操作 agent 自身" in reason

@@ -61,3 +61,10 @@ if not WS_URL:
     sys.exit("ERROR: WS_URL is not set. Example: ws://192.168.1.100:8080/ws/agent")
 if not AGENT_KEY:
     sys.exit("ERROR: AGENT_KEY is not set.")
+
+# criticE：启用了受管根（MANAGED_PROJECTS_ROOT）却没设 SELF_PROJECT_DIR 时，
+# handlers/log_sessions 的「拒操作 agent 自身 project」自杀防护会整段短路（默认失效）。启动时告警一次。
+if MANAGED_PROJECTS_ROOT and not SELF_PROJECT_DIR:
+    logging.getLogger(__name__).warning(
+        "SELF_PROJECT_DIR 未设置，agent 自身 project 的自杀防护未启用；生产请设为 agent 自身 compose 目录"
+    )

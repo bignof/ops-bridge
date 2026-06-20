@@ -7,7 +7,7 @@ import threading
 from typing import Any
 
 from core.handlers import send_message
-from services.compose import find_compose_file, open_compose_process
+from services.compose import find_compose_file, open_compose_process, validate_managed_dir
 
 
 logger = logging.getLogger(__name__)
@@ -158,6 +158,11 @@ def start_log_session(ws, data: dict[str, Any]) -> None:
         return
     if not find_compose_file(project_dir):
         _send_logs_error(ws, session_id, f"No docker-compose.yaml/yml found in {project_dir}")
+        return
+    # 节点控制目录安全闸：与 command 路径同闸（受管根 + 拒 agent 自身），防越权读取任意目录日志（信息泄露）。
+    ok, reason = validate_managed_dir(project_dir)
+    if not ok:
+        _send_logs_error(ws, session_id, reason)
         return
 
     try:

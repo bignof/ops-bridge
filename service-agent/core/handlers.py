@@ -13,7 +13,7 @@ from typing import TypedDict, cast
 
 import config
 from core import graceful
-from services.compose import find_compose_file, is_image_registry_allowed, read_compose_file, restore_compose_file, run_compose, update_image_in_compose
+from services.compose import find_compose_file, is_image_registry_allowed, read_compose_file, restore_compose_file, run_compose, update_image_in_compose, validate_managed_dir
 
 logger = logging.getLogger(__name__)
 
@@ -183,28 +183,12 @@ def _validate_base(ws, data):
         return None
 
     # ── 节点控制安全闸 ──
-    # agent 挂载宿主 docker.sock，这里是防越权（任意目录/`..` 穿越）与防自杀（操作 agent 自身 compose）的最终闸。
-    real = os.path.realpath(project_dir)
-    root = os.path.realpath(config.MANAGED_PROJECTS_ROOT)
-    # ① realpath 归一后必须落在受管根之下；commonpath 在跨盘符/混绝对相对时会 raise ValueError，一律视为「在根外」拒绝。
-    try:
-        in_root = os.path.commonpath([real, root]) == root
-    except ValueError:
-        in_root = False
-    if not in_root:
-        send_error(ws, request_id, f"dir 不在受管目录 {root} 内: {project_dir}")
+    # agent 挂载宿主 docker.sock，目录守卫（受管根 + 拒自身）抽到 services.compose.validate_managed_dir，
+    # 与日志流路径（log_sessions）共用同一闸，逻辑保持单一来源。
+    ok, reason = validate_managed_dir(project_dir)
+    if not ok:
+        send_error(ws, request_id, reason)
         return None
-
-    # ② 拒绝命中 agent 自身 compose 目录（含其子目录）；同样把 ValueError 兜底为「命中」以从严拒绝。
-    if config.SELF_PROJECT_DIR:
-        self_dir = os.path.realpath(config.SELF_PROJECT_DIR)
-        try:
-            hits_self = os.path.commonpath([real, self_dir]) == self_dir
-        except ValueError:
-            hits_self = True
-        if hits_self:
-            send_error(ws, request_id, "禁止操作 agent 自身 project")
-            return None
 
     return request_id, action, project_dir
 
@@ -382,6 +366,13 @@ def _graceful_stop(ws, data, request_id, project_dir):
         return
     except RuntimeError as e:
         # drain 失败（shutdown 非 200）：不自动转 force，由人工决定
+        send_error(ws, request_id, f"优雅停机 drain 失败: {e}")
+        return
+    except Exception as e:
+        # worker 不可达时 requests 抛 ConnectionError/Timeout（OSError 子类，非 Value/Runtime）。
+        # 若不兜底，异常逃出 handler 死在 daemon 线程 → agent 既不 send_error 也不 send result → hub 命令永卡 queued。
+        # 与 handle_pull_redeploy 的 graceful 分支对称：兜底 send_error，不 compose stop、不自动转 force。
+        logger.exception("Execution error")
         send_error(ws, request_id, f"优雅停机 drain 失败: {e}")
         return
 

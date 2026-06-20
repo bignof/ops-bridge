@@ -1,8 +1,16 @@
+import os
+
+# log_sessions → core.handlers → import config，config 缺 WS_URL/AGENT_KEY 会 sys.exit。
+# 与 test_handlers.py / test_graceful.py 同款：导入前先注入测试用默认值，消除文件间隐式顺序依赖。
+os.environ.setdefault("WS_URL", "ws://test")
+os.environ.setdefault("AGENT_KEY", "test-key")
+
 import io
 
 import pytest
 
 from core import log_sessions
+from services import compose
 
 
 class FakeWebSocket:
@@ -110,6 +118,8 @@ def test_start_log_session_validates_missing_compose_and_tail(monkeypatch: pytes
     ws = FakeWebSocket()
     monkeypatch.setattr(log_sessions.os.path, "isdir", lambda value: True)
     monkeypatch.setattr(log_sessions, "find_compose_file", lambda project_dir: None)
+    # 本测试聚焦 compose/tail 校验，放行 dir 受管根闸（闸自身另有专测）。
+    monkeypatch.setattr(log_sessions, "validate_managed_dir", lambda project_dir: (True, None))
 
     log_sessions.start_log_session(ws, {"sessionId": "logs-2", "dir": "/srv/a"})
 
@@ -126,6 +136,8 @@ def test_start_log_session_streams_chunks_and_finishes(monkeypatch: pytest.Monke
     ws = FakeWebSocket()
     monkeypatch.setattr(log_sessions.os.path, "isdir", lambda value: True)
     monkeypatch.setattr(log_sessions, "find_compose_file", lambda project_dir: "compose.yml")
+    # 本测试聚焦流式输出，放行 dir 受管根闸。
+    monkeypatch.setattr(log_sessions, "validate_managed_dir", lambda project_dir: (True, None))
     monkeypatch.setattr(log_sessions, "open_compose_process", lambda project_dir, args: FakeProcess("line-1\nline-2\n"))
     monkeypatch.setattr(log_sessions.threading, "Thread", ImmediateThread)
 
@@ -216,6 +228,8 @@ def test_start_log_session_handles_missing_dir_and_invalid_tail(monkeypatch: pyt
     ws = FakeWebSocket()
     monkeypatch.setattr(log_sessions.os.path, "isdir", lambda value: True)
     monkeypatch.setattr(log_sessions, "find_compose_file", lambda project_dir: "compose.yml")
+    # 本段聚焦 tail 校验，放行 dir 受管根闸。
+    monkeypatch.setattr(log_sessions, "validate_managed_dir", lambda project_dir: (True, None))
     log_sessions.start_log_session(ws, {"sessionId": "logs-7", "dir": "/srv/a", "tail": "abc"})
     assert _decode_messages(ws)[0]["error"] == "Invalid tail value: abc"
 
@@ -224,6 +238,8 @@ def test_start_log_session_reports_process_start_failures(monkeypatch: pytest.Mo
     ws = FakeWebSocket()
     monkeypatch.setattr(log_sessions.os.path, "isdir", lambda value: True)
     monkeypatch.setattr(log_sessions, "find_compose_file", lambda project_dir: "compose.yml")
+    # 本测试聚焦进程启动失败，放行 dir 受管根闸。
+    monkeypatch.setattr(log_sessions, "validate_managed_dir", lambda project_dir: (True, None))
     monkeypatch.setattr(log_sessions.threading, "Thread", ImmediateThread)
 
     def boom(project_dir, args):
@@ -298,3 +314,77 @@ def test_stream_logs_breaks_cleanly_when_stdout_returns_empty_like_values(monkey
         "stopped": False,
         "chunks": 0,
     }
+
+
+# ─────────────────────────────────────────────
+# start_log_session — dir 受管根安全闸（与 command 路径同闸，防信息泄露）
+# ─────────────────────────────────────────────
+
+def test_start_log_session_rejects_dir_outside_managed_root(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """dir 通过 isdir/find_compose 但 realpath 落在受管根之外 → 拒绝、回 logs_error、绝不起 logs 进程。"""
+    ws = FakeWebSocket()
+    root = tmp_path / "managed"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    monkeypatch.setattr(compose.config, "MANAGED_PROJECTS_ROOT", str(root))
+    monkeypatch.setattr(compose.config, "SELF_PROJECT_DIR", "")
+    monkeypatch.setattr(log_sessions, "find_compose_file", lambda project_dir: "compose.yml")
+    started = {"n": 0}
+    monkeypatch.setattr(log_sessions, "open_compose_process", lambda project_dir, args: started.__setitem__("n", started["n"] + 1))
+    monkeypatch.setattr(log_sessions.threading, "Thread", ImmediateThread)
+
+    log_sessions.start_log_session(ws, {"sessionId": "logs-out", "dir": str(outside)})
+
+    decoded = _decode_messages(ws)
+    assert decoded[-1]["type"] == "logs_error"
+    assert "不在受管目录" in decoded[-1]["error"]
+    # 关键：闸拦下后绝不起 logs 进程
+    assert started["n"] == 0
+    assert log_sessions._sessions == {}
+
+
+def test_start_log_session_rejects_self_project_dir(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """dir 命中 agent 自身 compose 目录（SELF_PROJECT_DIR）→ 拒绝、回 logs_error、绝不起 logs 进程。"""
+    ws = FakeWebSocket()
+    root = tmp_path / "managed"
+    root.mkdir()
+    self_dir = root / "agent"
+    self_dir.mkdir()
+
+    monkeypatch.setattr(compose.config, "MANAGED_PROJECTS_ROOT", str(root))
+    monkeypatch.setattr(compose.config, "SELF_PROJECT_DIR", str(self_dir))
+    monkeypatch.setattr(log_sessions, "find_compose_file", lambda project_dir: "compose.yml")
+    started = {"n": 0}
+    monkeypatch.setattr(log_sessions, "open_compose_process", lambda project_dir, args: started.__setitem__("n", started["n"] + 1))
+    monkeypatch.setattr(log_sessions.threading, "Thread", ImmediateThread)
+
+    log_sessions.start_log_session(ws, {"sessionId": "logs-self", "dir": str(self_dir)})
+
+    decoded = _decode_messages(ws)
+    assert decoded[-1]["type"] == "logs_error"
+    assert "禁止操作 agent 自身" in decoded[-1]["error"]
+    assert started["n"] == 0
+    assert log_sessions._sessions == {}
+
+
+def test_start_log_session_allows_dir_inside_managed_root(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """根内、非自身目录的合法 dir → 通过闸，正常起 logs 进程并发 logs_started。"""
+    ws = FakeWebSocket()
+    root = tmp_path / "managed"
+    root.mkdir()
+    project = root / "biz-app"
+    project.mkdir()
+
+    monkeypatch.setattr(compose.config, "MANAGED_PROJECTS_ROOT", str(root))
+    monkeypatch.setattr(compose.config, "SELF_PROJECT_DIR", str(root / "agent"))
+    monkeypatch.setattr(log_sessions, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(log_sessions, "open_compose_process", lambda project_dir, args: FakeProcess("line\n"))
+    monkeypatch.setattr(log_sessions.threading, "Thread", ImmediateThread)
+
+    log_sessions.start_log_session(ws, {"sessionId": "logs-ok", "dir": str(project), "tail": 5})
+
+    decoded = _decode_messages(ws)
+    assert decoded[0]["type"] == "logs_started"
+    assert decoded[-1]["type"] == "logs_finished"

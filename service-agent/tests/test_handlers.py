@@ -667,6 +667,52 @@ def test_handle_stop_graceful_drain_failure_does_not_stop(monkeypatch: pytest.Mo
     assert compose_calls == []
 
 
+def test_handle_stop_graceful_unexpected_drain_error_does_not_stop(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """graceful：drain 抛非 ValueError/RuntimeError 的异常（如 worker 不可达时 requests 抛的
+    ConnectionError，属 OSError 子类）→ 必须走兜底 send_error（status=failed），
+    绝不 compose stop、不自动转 force；否则异常逃出 handler 死在 daemon 线程，命令永卡 queued。"""
+    ws = FakeWebSocket()
+    compose_calls: list[list[str]] = []
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(
+        handlers.graceful,
+        "drain",
+        lambda base, timeout=60: (_ for _ in ()).throw(ConnectionError("worker 不可达")),
+    )
+    monkeypatch.setattr(handlers, "run_compose", lambda project_dir, args: (compose_calls.append(args) or (True, "stop ok")))
+
+    handlers.handle_stop(ws, {"healthBaseUrl": "http://192.168.0.30:18029"}, "req-1", str(tmp_path))
+
+    decoded = _decode_messages(ws)
+    assert decoded[-1]["status"] == "failed"
+    assert "drain 失败" in decoded[-1]["error"]
+    assert "worker 不可达" in decoded[-1]["error"]
+    # 关键：drain 兜底失败时绝不能 compose stop
+    assert compose_calls == []
+
+
+def test_graceful_stop_drain_oserror_propagation_is_caught(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """直接调 _graceful_stop：drain 抛 OSError 子类时不得逃出函数（否则会死在 daemon 线程，
+    hub 命令永卡 queued）。验证函数正常返回、回 failed、且未 compose stop。"""
+    ws = FakeWebSocket()
+    compose_calls: list[list[str]] = []
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(
+        handlers.graceful,
+        "drain",
+        lambda base, timeout=60: (_ for _ in ()).throw(TimeoutError("shutdown 阻塞超时")),
+    )
+    monkeypatch.setattr(handlers, "run_compose", lambda project_dir, args: (compose_calls.append(args) or (True, "stop ok")))
+
+    # 不应抛异常
+    handlers._graceful_stop(ws, {"healthBaseUrl": "http://192.168.0.30:18029"}, "req-1", str(tmp_path))
+
+    decoded = _decode_messages(ws)
+    assert decoded[-1]["status"] == "failed"
+    assert "drain 失败" in decoded[-1]["error"]
+    assert compose_calls == []
+
+
 def test_handle_stop_graceful_no_compose_file_sends_error(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     """graceful：无 compose 文件 → 提前 send_error，不应 drain。"""
     ws = FakeWebSocket()
