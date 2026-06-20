@@ -97,6 +97,8 @@ export default function ReleasesPage() {
   const [history, setHistory] = useState<{
     serviceId: string | number;
     pluginId: string | number;
+    // P1a 主表行回 serviceCode(非 serviceName);标题取 serviceCode,serviceName 仅兜底。
+    serviceCode?: string;
     serviceName?: string;
     pluginCode?: string;
   } | null>(null);
@@ -104,7 +106,7 @@ export default function ReleasesPage() {
 
   const reloadMain = () => actionRef.current?.reload();
 
-  // 主表列(对照基线 §6):namespaceCode / serviceName / pluginCode / version / publishTime + 两个 Tag 列。
+  // 主表列(对照基线 §6):namespaceCode / serviceCode / pluginCode / version / publishTime + 两个 Tag 列。
   const columns: ProColumns<ReleaseRow>[] = [
     { title: '命名空间', dataIndex: 'namespaceCode', key: 'namespaceCode' },
     {
@@ -349,7 +351,7 @@ export default function ReleasesPage() {
       <Drawer
         title={
           history
-            ? `历史版本 — ${history.serviceName || history.serviceId} / ${
+            ? `历史版本 — ${history.serviceCode || history.serviceName || history.serviceId} / ${
                 history.pluginCode || history.pluginId
               }`
             : '历史版本'

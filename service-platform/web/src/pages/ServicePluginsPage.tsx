@@ -4,9 +4,12 @@ import * as resources from '../api/resources';
 
 // 服务插件(服务 ↔ 插件绑定)行记录(对齐 P1a 契约,全 camelCase)。
 // 列全部用后端 LEFT JOIN 回的可读名,不客户端拼 id→名(基线 §4)。
+// ⚠️ P1a service-plugins list 关联回 serviceCode(label service_code),**不存在 serviceName**;
+// serviceName 仅作 render 兜底(防未来后端改回),实际取 serviceCode。
 interface ServicePluginRow {
   id: string | number;
   namespaceCode?: string;
+  serviceCode?: string;
   serviceName?: string;
   pluginCode?: string;
 }
@@ -26,10 +29,16 @@ interface PluginOption {
   code: string;
 }
 
-// 列(对照基线 §4):namespaceCode / serviceName / pluginCode(均后端 JOIN 可读名)。
+// 列(对照基线 §4):namespaceCode / serviceCode / pluginCode(均后端 JOIN 可读名)。
 const columns: ProColumns<ServicePluginRow>[] = [
   { title: '命名空间', dataIndex: 'namespaceCode', key: 'namespaceCode' },
-  { title: '服务', dataIndex: 'serviceName', key: 'serviceName' },
+  {
+    title: '服务',
+    // P1a 实际回 serviceCode(非 serviceName);dataIndex 对齐真实字段,render 兜底防未来后端改回 serviceName。
+    dataIndex: 'serviceCode',
+    key: 'serviceCode',
+    render: (_dom, r) => r.serviceName || r.serviceCode || '-',
+  },
   { title: '插件', dataIndex: 'pluginCode', key: 'pluginCode' },
 ];
 

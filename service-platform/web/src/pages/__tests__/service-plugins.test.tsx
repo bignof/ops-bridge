@@ -35,14 +35,15 @@ if (!globalThis.ResizeObserver) {
   } as unknown as typeof ResizeObserver;
 }
 
-// 列表信封:列直接用后端 JOIN 回的 namespaceCode / serviceName / pluginCode(不客户端拼 id→名)。
+// 列表信封:列直接用后端 JOIN 回的 namespaceCode / serviceCode / pluginCode(不客户端拼 id→名)。
+// P1a service-plugins list 关联回 serviceCode(非 serviceName),服务列据此渲染。
 const servicePluginsEnvelope = {
   count: 1,
   rows: [
     {
       id: 11,
       namespaceCode: 'ns-demo',
-      serviceName: 'svc-demo',
+      serviceCode: 'svc-demo',
       pluginCode: 'plugin-demo',
     },
   ],
@@ -120,7 +121,7 @@ describe('ServicePluginsPage', () => {
     list.mockImplementation((resource: string) => Promise.resolve(routeList(resource)));
   });
 
-  it('列表渲染(走 resources.list,列用后端可读名 namespaceCode/serviceName/pluginCode)', async () => {
+  it('列表渲染(走 resources.list,列用后端可读名 namespaceCode/serviceCode/pluginCode)', async () => {
     render(<ServicePluginsPage />);
     expect(await screen.findByText('svc-demo')).toBeInTheDocument();
     expect(screen.getByText('ns-demo')).toBeInTheDocument();
