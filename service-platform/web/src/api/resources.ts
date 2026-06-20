@@ -80,6 +80,37 @@ export async function listNodes<T = NodeRow>(params: ListParams = {}): Promise<L
 }
 
 /**
+ * 操作审计行(对齐后端 NodeOperationOut,全 camelCase)。
+ * hub dispatch 命令(start/stop/force-restart/redeploy)的审计快照子集;**纯只读展示**。
+ * output/error 后端已截尾(≤~1000 字符);mode/requestedBy/requestSource/dir/image/output/error
+ * /createdAt/updatedAt 均可空(列对空值显「-」)。优雅 restart 走 rolling,不在此列表(已知缺口)。
+ */
+export interface NodeOperationRow {
+  requestId: string;
+  agentId: string;
+  action: string;
+  mode: string | null;
+  status: string;
+  /** 派生身份(谁下发);可空。 */
+  requestedBy: string | null;
+  requestSource: string | null;
+  dir: string | null;
+  image: string | null;
+  /** 命令输出摘要(后端已截尾);可空。 */
+  output: string | null;
+  error: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+}
+
+/** 操作审计列表(服务端分页,统一信封):GET /api/node-operations?page=&pageSize=。 */
+export async function listNodeOperations<T = NodeOperationRow>(
+  params: ListParams = {},
+): Promise<ListEnvelope<T>> {
+  return list<T>('node-operations', params);
+}
+
+/**
  * 行级运维动作:POST /api/nodes/{agentId}/{serviceCode}/{action}(body `{mode?, allowLastInstance?}`)。
  * `suppressGlobalError`:节点页对 400/404/409/502 本地精确提示(各文案不同),opt-out 全局兜底防双 toast。
  * ⚠️ opt-out 后非预期状态失败的可见性由节点页 catch 自己兜底(不可静默吞,A2);401 仍由拦截器统一处理。

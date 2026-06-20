@@ -4,6 +4,7 @@ import { Avatar, Dropdown, Layout, Menu, Typography, type MenuProps } from 'antd
 import {
   ApiOutlined,
   AppstoreOutlined,
+  AuditOutlined,
   ClusterOutlined,
   CloudUploadOutlined,
   DeploymentUnitOutlined,
@@ -20,7 +21,7 @@ const { Header, Sider, Content } = Layout;
 // 左侧栏三组菜单:
 //   配置:命名空间 / 服务 / 插件 / 服务插件
 //   发布:插件上传 / 插件发布 / 获取记录
-//   运维:节点(启停重启重部署 + 二次确认)
+//   运维:节点(启停重启重部署 + 二次确认) / 操作审计(只读命令审计)
 // key 即对应路由 path(供 createHashRouter 的 children 挂载)。
 const MENU_ITEMS: MenuProps['items'] = [
   {
@@ -48,7 +49,10 @@ const MENU_ITEMS: MenuProps['items'] = [
     key: 'grp-ops',
     label: '运维',
     type: 'group',
-    children: [{ key: '/nodes', icon: <ClusterOutlined />, label: '节点' }],
+    children: [
+      { key: '/nodes', icon: <ClusterOutlined />, label: '节点' },
+      { key: '/node-operations', icon: <AuditOutlined />, label: '操作审计' },
+    ],
   },
 ];
 
