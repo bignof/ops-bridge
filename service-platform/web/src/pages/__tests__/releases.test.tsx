@@ -42,6 +42,7 @@ if (!globalThis.ResizeObserver) {
 }
 
 // 主表信封:一行「当前 active 绑定」(列用后端 JOIN 回的可读名;含 serviceId/pluginId 供行操作定位)。
+// isActive/isRolledBack 用 boolean(对齐 P1a ReleaseOut 契约:is_active/is_rolled_back 为 bool → JSON true/false)。
 const releasesEnvelope = {
   count: 1,
   rows: [
@@ -53,8 +54,8 @@ const releasesEnvelope = {
       pluginCode: 'plugin-demo',
       version: '1.2.0',
       publishTime: '2026-06-20 10:00:00',
-      isActive: 'yes',
-      isRolledBack: 'no',
+      isActive: true,
+      isRolledBack: false,
       serviceId: 2,
       pluginId: 3,
     },
@@ -64,7 +65,9 @@ const releasesEnvelope = {
   totalPage: 1,
 };
 
-// 历史抽屉信封:该绑定全部 spv 历史(含一行非 active,可「重新激活」/对其回滚)。
+// 历史抽屉信封:该绑定全部 spv 历史(boolean 契约):
+//  - id=100 当前 active(isActive=true) → 不应出现「重新激活」入口;
+//  - id=99 历史非 active(isActive=false)且 isRolledBack=true → 出现「重新激活」且标「已回滚」。
 const historyEnvelope = {
   count: 2,
   rows: [
@@ -73,8 +76,8 @@ const historyEnvelope = {
       version: '1.2.0',
       versionOrder: 2,
       publishTime: '2026-06-20 10:00:00',
-      isActive: 'yes',
-      isRolledBack: 'no',
+      isActive: true,
+      isRolledBack: false,
       serviceId: 2,
       pluginId: 3,
     },
@@ -83,8 +86,8 @@ const historyEnvelope = {
       version: '1.1.0',
       versionOrder: 1,
       publishTime: '2026-06-10 09:00:00',
-      isActive: 'no',
-      isRolledBack: 'no',
+      isActive: false,
+      isRolledBack: true,
       serviceId: 2,
       pluginId: 3,
     },
@@ -173,7 +176,7 @@ describe('ReleasesPage', () => {
     listPluginVersions.mockResolvedValue(pluginVersionsEnvelope);
   });
 
-  it('主表走 listReleases 且不带 filter(后端按 isActive=yes 聚合);active/回滚用 Tag 标色', async () => {
+  it('主表走 listReleases 且不带 filter(后端按 isActive 聚合);active/回滚用 boolean → Tag 标色', async () => {
     render(<ReleasesPage />);
 
     // 列直接用后端 JOIN 回的可读名。
@@ -191,8 +194,10 @@ describe('ReleasesPage', () => {
     expect(arg.filter).toBeUndefined();
     expect(Object.keys(arg).sort()).toEqual(['page', 'pageSize']);
 
-    // active=yes → 运行中 Tag;isRolledBack=no → 不标「已回滚」。
+    // C1 守卫:isActive=true(boolean)→ 运行中 Tag,绝不显「历史」;isRolledBack=false → 不标「已回滚」。
+    // (旧实现按 'yes' 判,boolean true 恒不命中 → 误显「历史」/不显「运行中」;此断言抓该漂移。)
     expect(screen.getByText('运行中')).toBeInTheDocument();
+    expect(screen.queryByText('历史')).not.toBeInTheDocument();
     expect(screen.queryByText('已回滚')).not.toBeInTheDocument();
   });
 
@@ -267,7 +272,7 @@ describe('ReleasesPage', () => {
     await waitFor(() => expect(rollback).toHaveBeenCalledWith({ spvId: 100 }));
   });
 
-  it('历史抽屉行「重新激活」非 active 版 → 调 reactivate({spvId})', async () => {
+  it('历史抽屉:active 行不露「重新激活」(显「当前运行」)、非 active 行可「重新激活」→ 调 reactivate({spvId})、回滚行标「已回滚」', async () => {
     reactivate.mockResolvedValue({ ok: true });
     const user = userEvent.setup();
     render(<ReleasesPage />);
@@ -275,11 +280,23 @@ describe('ReleasesPage', () => {
     const cell = await screen.findByText('plugin-demo');
     await user.click(within(cell.closest('tr')!).getByText('历史版本'));
 
-    // 等历史行渲染,对非 active 版本(1.1.0,id=99)点「重新激活」。
+    // 等历史行渲染(1.1.0=非 active 历史版本,id=99;1.2.0=当前 active,id=100)。
+    // 注:版本号 1.2.0 在主表「当前版本」列也出现,故把后续行查询**限定在抽屉表格内**(histTable),避免误中主表行。
     const histCell = await screen.findByText('1.1.0');
     const histRow = histCell.closest('tr')!;
-    await user.click(within(histRow).getByText('重新激活'));
+    const histTable = histCell.closest('table')!;
 
+    // C1 守卫①:当前 active 行(1.2.0,isActive=true)**不应**出现可点的「重新激活」,而显「当前运行」。
+    // (旧实现 === 'yes' 守卫对 boolean true 永不命中 → active 行错误露出「重新激活」;此断言抓该漂移。)
+    const activeRow = within(histTable).getByText('1.2.0').closest('tr')!;
+    expect(within(activeRow).queryByText('重新激活')).not.toBeInTheDocument();
+    expect(within(activeRow).getByText('当前运行')).toBeInTheDocument();
+
+    // C1 守卫②:非 active 行(isActive=false)才出现「重新激活」,点击 → reactivate({spvId:99})。
+    await user.click(within(histRow).getByText('重新激活'));
     await waitFor(() => expect(reactivate).toHaveBeenCalledWith({ spvId: 99 }));
+
+    // C1 守卫③:isRolledBack=true(boolean)→ 该非 active 行标「已回滚」。
+    expect(within(histRow).getByText('已回滚')).toBeInTheDocument();
   });
 });

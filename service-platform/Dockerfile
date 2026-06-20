@@ -4,7 +4,8 @@
 #   的 `build.outDir` 是相对 web/ 的 `../app/static`,故在 WORKDIR=/build/web 下构建,
 #   产物会落到 /build/app/static(零内联脚本:已关 modulepreload polyfill,与严格 CSP 相容)。
 # 阶段 2(python):装依赖 + 拷后端代码,再把阶段 1 的 SPA 产物 COPY 进 app/static;
-#   app/main.py 在 app/static 存在时 mount StaticFiles("/") 托管 SPA(见 main.py 守卫)。
+#   app/main.py 在 app/static 存在时经 mount_spa 启用 SPAFallback 中间件兜底托管 SPA
+#   (贴着 router 的最内层,仅 404 时回前端产物,绝不吞 /api;非 StaticFiles("/") catch-all,见 main.py 守卫)。
 
 FROM node:20-slim AS web
 WORKDIR /build/web

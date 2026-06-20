@@ -13,7 +13,7 @@ import * as resources from '../api/resources';
 
 // 发布行记录(对齐 P1a `releases` list 契约,全 camelCase)。
 // 列全部用后端 LEFT JOIN 回的可读名(namespaceCode/serviceCode/pluginCode/version),不客户端拼 id→名。
-// isActive / isRolledBack:enum 'yes' | 'no'(基线 §6 / §10),用 Tag 标色。
+// isActive / isRolledBack:boolean(对齐 P1a ReleaseOut.is_active/is_rolled_back 为 bool → JSON true/false),用 Tag 标色。
 // serviceId / pluginId:行操作(历史版本 / 回滚)定位用;主表行即「当前 active 行」。
 interface ReleaseRow {
   id: string | number;
@@ -23,8 +23,8 @@ interface ReleaseRow {
   pluginCode?: string;
   version?: string;
   publishTime?: string;
-  isActive?: 'yes' | 'no';
-  isRolledBack?: 'yes' | 'no';
+  isActive?: boolean;
+  isRolledBack?: boolean;
   versionOrder?: number;
   serviceId: string | number;
   pluginId: string | number;
@@ -51,13 +51,13 @@ interface PluginVersionOption {
   version?: string;
 }
 
-// 运行版本 Tag(isActive=yes → 绿色「运行中」,否则灰「历史」)。
-const renderActiveTag = (isActive?: 'yes' | 'no') =>
-  isActive === 'yes' ? <Tag color="green">运行中</Tag> : <Tag>历史</Tag>;
+// 运行版本 Tag(isActive=true → 绿色「运行中」,否则灰「历史」)。
+const renderActiveTag = (isActive?: boolean) =>
+  isActive ? <Tag color="green">运行中</Tag> : <Tag>历史</Tag>;
 
-// 是否回滚过 Tag(isRolledBack=yes → 橙色「已回滚」,否则不标色显 '-')。
-const renderRolledBackTag = (isRolledBack?: 'yes' | 'no') =>
-  isRolledBack === 'yes' ? <Tag color="orange">已回滚</Tag> : <span>-</span>;
+// 是否回滚过 Tag(isRolledBack=true → 橙色「已回滚」,否则不标色显 '-')。
+const renderRolledBackTag = (isRolledBack?: boolean) =>
+  isRolledBack ? <Tag color="orange">已回滚</Tag> : <span>-</span>;
 
 // 命名空间选项:list('namespaces'),label=code、value=id。
 const fetchNamespaceOptions = async () => {
@@ -69,8 +69,8 @@ const fetchNamespaceOptions = async () => {
  * 插件发布页(resource `releases`,旧 t_service_plugin_version):发布 + 历史版本 + 重新激活 + 回滚。
  * 全页动作最密集(对照基线 §6)。
  *
- * 主表(`listReleases()` **不传 filter**):后端按 isActive=yes 回每个 service+plugin 绑定当前激活行,
- * 列直接用后端 LEFT JOIN 回的可读名;服务端分页。isActive/isRolledBack 用 Tag 标色。
+ * 主表(`listReleases()` **不传 filter**):后端按 isActive=true 回每个 service+plugin 绑定当前激活行,
+ * 列直接用后端 LEFT JOIN 回的可读名;服务端分页。isActive/isRolledBack(boolean)用 Tag 标色。
  *
  * 工具条「发布」开 Drawer:**四级级联** 命名空间→服务→插件→版本,**逐级服务端过滤**:
  *  - 服务   list('services', { namespaceId })       —— 带 ?namespaceId=
@@ -176,8 +176,8 @@ export default function ReleasesPage() {
       valueType: 'option',
       key: 'option',
       render: (_dom, record) =>
-        // 已是运行版本则无需重新激活,置灰提示。
-        record.isActive === 'yes' ? (
+        // 已是运行版本(isActive=true)则无需重新激活,置灰提示;仅非 active 行才露「重新激活」入口。
+        record.isActive ? (
           <span style={{ color: 'rgba(0,0,0,0.25)' }}>当前运行</span>
         ) : (
           <a key="reactivate" onClick={() => handleReactivate(record)}>
@@ -310,7 +310,7 @@ export default function ReleasesPage() {
         actionRef={actionRef}
         rowKey="id"
         columns={columns}
-        // 主表服务端分页;**不传 filter**(后端按 isActive=yes 回每绑定当前激活行)。
+        // 主表服务端分页;**不传 filter**(后端按 isActive=true 回每绑定当前激活行)。
         // 仅透传分页参数,不把列 search 的 filter 拼进去(主表是聚合视图)。
         request={async (params) => {
           const { current, pageSize } = params;
