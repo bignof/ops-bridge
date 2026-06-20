@@ -281,6 +281,102 @@ def test_dispatch_update_without_image_returns_422(client: TestClient) -> None:
     assert response.status_code == 422
 
 
+def test_dispatch_stop_with_mode_persists_and_returns_202(client: TestClient) -> None:
+    # 放宽 action + mode 字段:stop + graceful 受理、下发帧含 mode、持久化可读回
+    import app.main as main_module
+
+    state = main_module.hub_state
+    socket = attach_agent(state, "agent-a")
+
+    response = client.post(
+        "/api/agents/agent-a/commands",
+        headers={"X-Admin-Token": "test-admin-token"},
+        json={
+            "requestId": "req-stop-graceful",
+            "action": "stop",
+            "mode": "graceful",
+            "dir": "/srv/a",
+        },
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["accepted"] is True
+    assert body["command"]["action"] == "stop"
+    assert body["command"]["mode"] == "graceful"
+    # 下发给 agent 的帧须带 mode,供 agent 侧 handle_stop 读取
+    assert socket.messages[0]["action"] == "stop"
+    assert socket.messages[0]["mode"] == "graceful"
+
+    get_response = client.get("/api/commands/req-stop-graceful", headers={"X-Admin-Token": "test-admin-token"})
+    assert get_response.status_code == 200
+    assert get_response.json()["mode"] == "graceful"
+
+
+def test_dispatch_accepts_new_actions(client: TestClient) -> None:
+    # start / force-restart / pull-redeploy 均应被接受(放宽 Literal)
+    import app.main as main_module
+
+    state = main_module.hub_state
+    attach_agent(state, "agent-a")
+
+    cases = [
+        {"requestId": "req-start", "action": "start", "dir": "/srv/a"},
+        {"requestId": "req-force-restart", "action": "force-restart", "mode": "force", "dir": "/srv/a"},
+        {"requestId": "req-pull-redeploy", "action": "pull-redeploy", "mode": "graceful", "dir": "/srv/a", "image": "nginx:latest"},
+    ]
+    for payload in cases:
+        response = client.post(
+            "/api/agents/agent-a/commands",
+            headers={"X-Admin-Token": "test-admin-token"},
+            json=payload,
+        )
+        assert response.status_code == 202, f"action {payload['action']} 应被受理: {response.text}"
+        assert response.json()["command"]["action"] == payload["action"]
+
+
+def test_dispatch_pull_redeploy_without_image_returns_422(client: TestClient) -> None:
+    # pull-redeploy 复用 agent 侧 handle_update,需 image;缺失应 422
+    import app.main as main_module
+
+    state = main_module.hub_state
+    attach_agent(state, "agent-a")
+
+    response = client.post(
+        "/api/agents/agent-a/commands",
+        headers={"X-Admin-Token": "test-admin-token"},
+        json={
+            "requestId": "req-pull-no-image",
+            "action": "pull-redeploy",
+            "dir": "/srv/a",
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_dispatch_restart_without_mode_persists_null_mode(client: TestClient) -> None:
+    # 既有 restart 不带 mode 不回归:受理且 mode 为 None,下发帧不含 mode
+    import app.main as main_module
+
+    state = main_module.hub_state
+    socket = attach_agent(state, "agent-a")
+
+    response = client.post(
+        "/api/agents/agent-a/commands",
+        headers={"X-Admin-Token": "test-admin-token"},
+        json={
+            "requestId": "req-restart-no-mode",
+            "action": "restart",
+            "dir": "/srv/a",
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json()["command"]["mode"] is None
+    assert "mode" not in socket.messages[0]
+
+
 def test_dispatch_command_to_offline_agent_returns_409(client: TestClient) -> None:
     import app.main as main_module
 

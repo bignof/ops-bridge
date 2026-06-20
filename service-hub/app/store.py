@@ -80,6 +80,7 @@ def command_to_dict(record: CommandModel) -> dict[str, Any]:
         "agent_id": record.agent_id,
         "status": record.status,
         "action": record.action,
+        "mode": record.mode,
         "dir": record.target_dir,
         "image": record.target_image,
         "original_request_id": record.original_request_id,
@@ -678,6 +679,7 @@ class HubState:
                 request_id=payload["requestId"],
                 agent_id=agent_id,
                 action=payload["action"],
+                mode=payload.get("mode"),
                 target_dir=payload["dir"],
                 target_image=payload.get("image"),
                 status="queued",
@@ -721,6 +723,8 @@ class HubState:
                 "action": record.action,
                 "dir": record.target_dir,
             }
+            if record.mode:
+                retry_payload["mode"] = record.mode
             if record.target_image:
                 retry_payload["image"] = record.target_image
 
@@ -728,6 +732,7 @@ class HubState:
                 request_id=new_request_id,
                 agent_id=record.agent_id,
                 action=record.action,
+                mode=record.mode,
                 target_dir=record.target_dir,
                 target_image=record.target_image,
                 status="queued",

@@ -61,6 +61,8 @@ async def dispatch_command(
         "action": request.action,
         "dir": request.dir,
     }
+    if request.mode:
+        payload["mode"] = request.mode
     if request.image:
         payload["image"] = request.image
 

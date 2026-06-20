@@ -31,6 +31,7 @@ class CommandModel(Base):
     request_id: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     agent_id: Mapped[str] = mapped_column(String(255), index=True)
     action: Mapped[str] = mapped_column(String(64))
+    mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
     target_dir: Mapped[str] = mapped_column(String(2048))
     target_image: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     status: Mapped[str] = mapped_column(String(32), index=True)

@@ -30,7 +30,8 @@ class CommandDispatchRequest(BaseModel):
     model_config = ConfigDict(title="下发命令请求")
 
     requestId: str = Field(default_factory=lambda: str(uuid4()), title="请求 ID")
-    action: Literal["update", "restart"] = Field(title="动作")
+    action: Literal["update", "restart", "start", "stop", "force-restart", "pull-redeploy"] = Field(title="动作")
+    mode: Literal["graceful", "force"] | None = Field(default=None, title="操作模式")
     dir: str = Field(title="目标目录")
     image: str | None = Field(default=None, title="目标镜像")
 
@@ -40,8 +41,9 @@ class CommandDispatchRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_image(self) -> "CommandDispatchRequest":
-        if self.action == "update" and not self.image:
-            raise ValueError("Action 'update' requires the 'image' field")
+        # update 与 pull-redeploy 都需要 image(pull-redeploy 在 agent 侧复用 handle_update)
+        if self.action in ("update", "pull-redeploy") and not self.image:
+            raise ValueError("Action 'update'/'pull-redeploy' requires the 'image' field")
         return self
 
 
@@ -107,6 +109,7 @@ class CommandSnapshot(BaseModel):
     agent_id: str = Field(title="Agent 标识")
     status: str = Field(title="状态")
     action: str = Field(title="动作")
+    mode: str | None = Field(default=None, title="操作模式")
     dir: str = Field(title="目标目录")
     image: str | None = Field(default=None, title="目标镜像")
     original_request_id: str | None = Field(default=None, title="原始请求 ID")
