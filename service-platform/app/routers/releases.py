@@ -45,6 +45,7 @@ _LIST_COLUMNS = (
     ServicePluginVersion.is_active,
     ServicePluginVersion.is_rolled_back,
     ServicePluginVersion.spv_active_key,
+    ServicePluginVersion.publish_time.label("publish_time"),
     Namespace.code.label("namespace_code"),
     Service.service_code.label("service_code"),
     Plugin.code.label("plugin_code"),

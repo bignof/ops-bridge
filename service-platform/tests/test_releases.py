@@ -331,6 +331,29 @@ def test_releases_list_is_active_filter_equals_main_view(client: TestClient) -> 
     assert len(rows) == 1 and rows[0]["isActive"] is True and rows[0]["version"] == "1.1"
 
 
+def test_releases_list_returns_publish_time(client: TestClient) -> None:
+    """P1-SPA 修复:GET /api/releases 读路径必须回 publishTime(主表 + 历史视图均含且非空)。
+
+    publish 已写 publish_time(store.publish),DB 列也在;此前读路径(_LIST_COLUMNS/ReleaseOut)
+    漏返该字段,发布页「发布时间」列恒空。断言:主表行与历史视图行都含非空 publishTime。
+    """
+    h = _h(client)
+    svc_id, plg_id, _ = _mk_binding("pt-ns", "pt-svc", "pt-plg")
+    store.publish(svc_id, plg_id, _mk_version(plg_id, "1.0"))
+    store.publish(svc_id, plg_id, _mk_version(plg_id, "1.1"))
+
+    # 主表视图(不传 filter):当前 active 行含非空 publishTime。
+    main = client.get("/api/releases", headers=h).json()
+    main_rows = [r for r in main["rows"] if r["serviceId"] == svc_id and r["pluginId"] == plg_id]
+    assert len(main_rows) == 1
+    assert "publishTime" in main_rows[0] and main_rows[0]["publishTime"] is not None
+
+    # 历史视图(传 serviceId+pluginId):每行(含历史灭活行)均含非空 publishTime。
+    hist = client.get(f"/api/releases?serviceId={svc_id}&pluginId={plg_id}", headers=h).json()
+    assert hist["count"] == 2
+    assert all(r.get("publishTime") is not None for r in hist["rows"])
+
+
 def test_releases_list_history_view_by_service_and_plugin(client: TestClient) -> None:
     """传 serviceId+pluginId → 该绑定版本历史(全部版本,versionOrder 升序)。"""
     h = _h(client)

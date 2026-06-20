@@ -109,9 +109,9 @@ export default function ReleasesPage() {
     { title: '命名空间', dataIndex: 'namespaceCode', key: 'namespaceCode' },
     {
       title: '服务',
-      dataIndex: 'serviceName',
-      key: 'serviceName',
-      // serviceName 可空时回退 serviceCode(两者均后端 JOIN 回的可读名)。
+      // P1a 实际回 serviceCode(非 serviceName);dataIndex 对齐真实字段,render 兜底防未来后端改回 serviceName。
+      dataIndex: 'serviceCode',
+      key: 'serviceCode',
       render: (_dom, r) => r.serviceName || r.serviceCode || '-',
     },
     { title: '插件', dataIndex: 'pluginCode', key: 'pluginCode' },

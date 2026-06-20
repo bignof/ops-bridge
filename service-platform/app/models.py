@@ -320,6 +320,7 @@ class ReleaseOut(BaseModel):
     is_active: bool
     is_rolled_back: bool
     spv_active_key: str | None = None
+    publish_time: datetime | None = None
     namespace_code: str | None = None
     service_code: str | None = None
     plugin_code: str | None = None
