@@ -208,6 +208,30 @@ def test_plugin_versions_list_envelope_and_filter(client: TestClient, storage_tm
     assert filtered_y["rows"][0]["version"] == "2.0.0"
 
 
+def test_plugin_versions_list_joins_plugin_code_and_filename(client: TestClient, storage_tmp) -> None:
+    """评审 A3(契约漂移第 3 例):list 端点 LEFT JOIN 回 pluginCode/filename(此前 list_rows
+    无 JOIN → 上传页两列恒空)。上传一个包后,断言两字段**非空**且取值正确。
+
+    红(未补 JOIN 时):PluginVersionOut 无这两字段 / 路由用 list_rows → pluginCode/filename 缺失或 None。
+    绿(补 JOIN 后):pluginCode == plugin.code,filename == 上传文件名(经 _sanitize)。
+    """
+    h = _h(client)
+    pid = _create_plugin(client, h, "@business/plugin-x")
+    up = client.post(
+        "/api/plugin-versions/upload",
+        files={"file": ("plugin-x-1.2.3.tgz", _make_tgz("@business/plugin-x", "1.2.3"), "application/gzip")},
+        headers=h,
+    )
+    assert up.status_code == 200, up.text
+
+    body = client.get(f"/api/plugin-versions?pluginId={pid}", headers=h).json()
+    assert body["count"] == 1
+    row = body["rows"][0]
+    # pluginCode = plugin.code(JOIN plugin);filename = 上传文件名(JOIN plugin_attachment)
+    assert row["pluginCode"] == "@business/plugin-x", row
+    assert row["filename"] == "plugin-x-1.2.3.tgz", row
+
+
 def _list_stored_files(tmp_path: Path) -> list[Path]:
     """枚举 storage 根(tmp_path/plugins)下所有已落盘文件,用于断言无孤儿 .tgz。"""
     root = tmp_path / "plugins"

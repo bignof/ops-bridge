@@ -313,6 +313,24 @@ def publish(service_id: int, plugin_id: int, plugin_version_id: int) -> ServiceP
         if pv is None or pv.plugin_id != plugin_id:
             raise NotFound("plugin version not found for this plugin")
 
+        # 评审 B1(重复版本守卫,用户定 D1①):同绑定已发过该 plugin_version_id → Conflict(路由层 → 409),
+        # 不再静默追加重复历史行。在父锁内做(已 with_for_update 锁 service_plugin),先于全灭活/INSERT,
+        # 避免重发自灭活自身后又追加重复行。重新激活历史版本走 reactivate(不经此路径)。
+        #
+        # 复审 Minor-2:守卫作用域用 (service_id, plugin_id, plugin_version_id),**不用 sp.id**。
+        # MySQL 下「删建同 (service_id,plugin_id) 绑定」后 service_plugin.id 会变化 → 按 sp.id 查不到
+        # rebind 前的旧历史行 → 漏判而追加重复历史行。改为与单活键 spv_active_key=f"{service_id}-{plugin_id}"
+        # 同一作用域(service_id+plugin_id)判重,跨 rebind 仍能命中旧行。
+        dup = session.execute(
+            select(ServicePluginVersion.id).where(
+                ServicePluginVersion.service_id == service_id,
+                ServicePluginVersion.plugin_id == plugin_id,
+                ServicePluginVersion.plugin_version_id == plugin_version_id,
+            )
+        ).first()
+        if dup is not None:
+            raise Conflict("该版本已发布过(同绑定重复发布同一版本)")
+
         # 先全灭活 + 清 key,再 flush(评审 M4),最后 INSERT 带 key 的新行。
         _deactivate_all(session, service_id, plugin_id)
         session.flush()
@@ -340,7 +358,9 @@ def publish(service_id: int, plugin_id: int, plugin_version_id: int) -> ServiceP
             session.commit()
         except IntegrityError as exc:
             session.rollback()
-            raise Conflict(str(exc.orig)) from exc
+            # 复审 Minor-1:并发置活撞 spv_active_key UNIQUE 的兜底路径。路由层已改为 str(exc) 透传,
+            # 故这里须给可读中文(不能漏 str(IntegrityError) 的英文 SQL 到前端)。
+            raise Conflict("并发发布冲突,请重试") from exc
         session.refresh(record)
         return record
 

@@ -208,6 +208,130 @@ def test_publish_unbound_raises_not_found(client: TestClient) -> None:
         store.publish(123456, 654321, 1)
 
 
+# --- B1:同绑定 publish 同一 pluginVersionId 重复 → 守卫拒(Conflict / 端点 409)----------
+#
+# 用户定方向(D1①):后端加守卫。同 (service_plugin_id, plugin_version_id) 已发过 → Conflict,
+# 不再静默追加重复历史行(此前重发返 201 + version_order 递增,前端 409 文案悬空)。
+# TDD:加守卫前第 2 次 publish 返 201(红);加守卫后返 Conflict / 端点 409(绿)。
+
+
+def test_publish_duplicate_same_version_raises_conflict(client: TestClient) -> None:
+    """store 层:同绑定 publish 同一 pluginVersionId 第二次 → Conflict(B1 守卫)。
+
+    红(未加守卫):第二次正常返新行(201 语义),重复历史行被静默追加。
+    绿(加守卫后):第二次抛 store.Conflict;且台账里该版本只有一行(未追加重复)。
+    """
+    svc_id, plg_id, sp_id = _mk_binding("dup-ns", "dup-svc", "dup-plg")
+    pv = _mk_version(plg_id, "1.0")
+
+    first = store.publish(svc_id, plg_id, pv)
+    assert first.is_active is True and first.version_order == 1
+
+    # 同绑定 + 同 pluginVersionId 再发 → 守卫拒(Conflict)
+    with pytest.raises(store.Conflict):
+        store.publish(svc_id, plg_id, pv)
+
+    # 守卫拒后台账里该 (binding, version) 仍只有一行(未追加重复历史行)
+    rows = store.find_rows(
+        ServicePluginVersion,
+        filters=[
+            ServicePluginVersion.service_plugin_id == sp_id,
+            ServicePluginVersion.plugin_version_id == pv,
+        ],
+    )
+    assert len(rows) == 1, rows
+    # 守卫不破坏单活:原行仍是唯一 active
+    assert len(_active_rows(svc_id, plg_id)) == 1
+
+
+def test_publish_endpoint_duplicate_same_version_409(client: TestClient) -> None:
+    """端点层:同绑定 publish 同一 pluginVersionId 第二次 → 409(store.Conflict 映射)。
+
+    红(未加守卫):第二次端点返 201。绿(加守卫后):第二次返 409。
+    对照:发布**不同**版本仍 201(守卫只挡同版本重发,不误伤正常追加新版本)。
+    """
+    h = _h(client)
+    svc_id, plg_id, _ = _mk_binding("dup-ep-ns", "dup-ep-svc", "dup-ep-plg")
+    pv1 = _mk_version(plg_id, "1.0")
+    pv2 = _mk_version(plg_id, "1.1")
+
+    first = client.post(
+        "/api/releases/publish",
+        json={"serviceId": svc_id, "pluginId": plg_id, "pluginVersionId": pv1},
+        headers=h,
+    )
+    assert first.status_code == 201, first.text
+
+    # 同版本重发 → 409
+    dup = client.post(
+        "/api/releases/publish",
+        json={"serviceId": svc_id, "pluginId": plg_id, "pluginVersionId": pv1},
+        headers=h,
+    )
+    assert dup.status_code == 409, dup.text
+    # 复审 Minor-1:detail 须透传 B1 守卫的可读中文文案(含「已发布过」),
+    # 不能被硬编码的「并发发布冲突,请重试」抹平(否则前端拿不到真实重复语义)。
+    assert "已发布过" in dup.json()["detail"], dup.json()
+
+    # 对照:发布不同版本(pv2)仍 201(守卫不误伤正常追加新版本)
+    other = client.post(
+        "/api/releases/publish",
+        json={"serviceId": svc_id, "pluginId": plg_id, "pluginVersionId": pv2},
+        headers=h,
+    )
+    assert other.status_code == 201, other.text
+
+
+def test_publish_dup_guard_scoped_by_service_and_plugin_not_sp_id(client: TestClient) -> None:
+    """复审 Minor-2:B1 重复守卫作用域必须是 (service_id, plugin_id, plugin_version_id),不是 service_plugin_id。
+
+    背景:MySQL 下「删建同 (service_id,plugin_id) 绑定」后 service_plugin.id 会变化;若守卫按当前
+    sp.id 查重,就查不到 rebind 前用旧 service_plugin_id 写下的历史行 → 漏判而追加重复历史行。
+
+    sqlite 上 id 复用挡不住该语义,故这里**显式构造**一条 stray 历史行:它带与当前绑定**相同的
+    (service_id, plugin_id, plugin_version_id)**,但 service_plugin_id 取一个**不同**的值(模拟 rebind
+    前的旧绑定 id)。然后 publish 同一版本:
+      - 旧守卫(service_plugin_id == sp.id):查不到 stray 行(其 sp_id 不同)→ 误放行(红)。
+      - 新守卫(service_id + plugin_id + plugin_version_id):命中 stray 行 → Conflict(绿)。
+    """
+    svc_id, plg_id, sp_id = _mk_binding("dupscope-ns", "dupscope-svc", "dupscope-plg")
+    pv = _mk_version(plg_id, "1.0")
+
+    # 取一个与当前 sp_id 不同的 service_plugin_id(模拟 rebind 前的旧绑定行号);+1000 必不冲突。
+    stale_sp_id = sp_id + 1000
+    assert stale_sp_id != sp_id
+    # stray 历史行:同 (service_id, plugin_id, plugin_version_id),但挂在旧 service_plugin_id 上,
+    # 且非 active(spv_active_key=None,不占单活键,避免干扰后续 publish 置活)。
+    store.create_row(
+        ServicePluginVersion,
+        {
+            "service_plugin_id": stale_sp_id,
+            "service_id": svc_id,
+            "plugin_id": plg_id,
+            "plugin_version_id": pv,
+            "version_order": 1,
+            "is_active": False,
+            "is_rolled_back": False,
+            "spv_active_key": None,
+        },
+    )
+
+    # 新守卫按 (service_id, plugin_id, plugin_version_id) 判重 → 命中 stray 行 → Conflict。
+    with pytest.raises(store.Conflict):
+        store.publish(svc_id, plg_id, pv)
+
+    # 守卫拒后未追加任何新行:该 (service_id, plugin_id, version) 仍只有最初那条 stray 行。
+    rows = store.find_rows(
+        ServicePluginVersion,
+        filters=[
+            ServicePluginVersion.service_id == svc_id,
+            ServicePluginVersion.plugin_id == plg_id,
+            ServicePluginVersion.plugin_version_id == pv,
+        ],
+    )
+    assert len(rows) == 1, rows
+
+
 def test_publish_cross_plugin_version_raises_not_found(client: TestClient) -> None:
     """最终评审修复:plugin_version_id 必须归属于 plugin_id。
 
@@ -329,6 +453,29 @@ def test_releases_list_is_active_filter_equals_main_view(client: TestClient) -> 
     body = client.get("/api/releases?isActive=true", headers=h).json()
     rows = [r for r in body["rows"] if r["serviceId"] == svc_id and r["pluginId"] == plg_id]
     assert len(rows) == 1 and rows[0]["isActive"] is True and rows[0]["version"] == "1.1"
+
+
+def test_releases_list_returns_publish_time(client: TestClient) -> None:
+    """P1-SPA 修复:GET /api/releases 读路径必须回 publishTime(主表 + 历史视图均含且非空)。
+
+    publish 已写 publish_time(store.publish),DB 列也在;此前读路径(_LIST_COLUMNS/ReleaseOut)
+    漏返该字段,发布页「发布时间」列恒空。断言:主表行与历史视图行都含非空 publishTime。
+    """
+    h = _h(client)
+    svc_id, plg_id, _ = _mk_binding("pt-ns", "pt-svc", "pt-plg")
+    store.publish(svc_id, plg_id, _mk_version(plg_id, "1.0"))
+    store.publish(svc_id, plg_id, _mk_version(plg_id, "1.1"))
+
+    # 主表视图(不传 filter):当前 active 行含非空 publishTime。
+    main = client.get("/api/releases", headers=h).json()
+    main_rows = [r for r in main["rows"] if r["serviceId"] == svc_id and r["pluginId"] == plg_id]
+    assert len(main_rows) == 1
+    assert "publishTime" in main_rows[0] and main_rows[0]["publishTime"] is not None
+
+    # 历史视图(传 serviceId+pluginId):每行(含历史灭活行)均含非空 publishTime。
+    hist = client.get(f"/api/releases?serviceId={svc_id}&pluginId={plg_id}", headers=h).json()
+    assert hist["count"] == 2
+    assert all(r.get("publishTime") is not None for r in hist["rows"])
 
 
 def test_releases_list_history_view_by_service_and_plugin(client: TestClient) -> None:

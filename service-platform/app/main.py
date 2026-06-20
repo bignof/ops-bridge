@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
 from app.config import settings
 from app.db import Database
-from app.middleware import SessionGuardMiddleware
+from app.middleware import (
+    SecurityHeadersMiddleware,
+    SessionGuardMiddleware,
+    mount_spa,
+)
 from app.routers.auth import router as auth_router
 from app.routers.distribution import router as distribution_router
 from app.routers.fetch_records import router as fetch_records_router
@@ -46,10 +51,26 @@ _docs_kwargs = (
     else {"docs_url": None, "redoc_url": None, "openapi_url": None}
 )
 app = FastAPI(title="service-platform", version="0.1.0", lifespan=lifespan, **_docs_kwargs)
-# 评审 H6 / spec L100:default-deny 守 /api/**(白名单 login/distribution/health);
-# 逐路由 Depends(require_session) 保留作纵深防御(双层)。add_middleware 注册的
-# 中间件按逆序执行,此处唯一中间件,故为最外层先跑。
+
+# ── 中间件注册 ───────────────────────────────────────────────────────────────────
+# ⚠️ add_middleware **逆序**生效(最后 add 的在**最外层**先跑)。期望的链(外→内):
+#     SecurityHeaders → SessionGuard → SPAFallback → router
+#   - SecurityHeaders 最外层:给**所有**响应(含 SessionGuard 的 401、SPA 静态、异常)注入
+#     CSP/安全头,无遗漏 → 必须**最后** add。
+#   - SPAFallback 最内层(贴着 router):只在 router 返回 404 后兜底回前端产物,API 路由
+#     (含运行期新增的 /api 路由)永远优先,绝不吞 API → 必须**最先** add。
+#   - SessionGuard 居中:对 /api/**(白名单外)default-deny 校验 Bearer JWT。
+# 故 add 顺序 = 期望链的**逆序**:SPAFallback → SessionGuard → SecurityHeaders。
+#
+# SPAFallback 仅当 app/static 存在(有前端构建产物)时启用;纯后端/测试环境(无产物)跳过。
+_static_dir = os.path.join(os.path.dirname(__file__), "static")
+if mount_spa(app, _static_dir):
+    logger.info("SPA 静态资源已启用(fallback 托管):%s", _static_dir)
+else:
+    logger.info("未发现 app/static(无前端构建产物),跳过 SPA 托管(纯后端模式)")
 app.add_middleware(SessionGuardMiddleware)
+app.add_middleware(SecurityHeadersMiddleware)
+
 app.include_router(system_router)
 app.include_router(auth_router)
 app.include_router(plugins_router)
