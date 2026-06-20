@@ -28,8 +28,9 @@ interface ServiceOption {
   name?: string;
 }
 
-// B4:筛选下拉一次取较大上限 + showSearch 本地过滤,大集合可检索。
-const OPTIONS_PAGE_SIZE = 500;
+// B4:筛选下拉 pageSize 取后端硬上限 200(各 list 端点 Query le=200,前后端必须一致;取 500 会 422)
+// + showSearch 本地过滤,已加载选项可检索。>200 的真·大集合需远程搜索,属后续增强。
+const OPTIONS_PAGE_SIZE = 200;
 
 // 命名空间筛选选项:list('namespaces'),value=id、label=code。
 const fetchNamespaceOptions = async () => {

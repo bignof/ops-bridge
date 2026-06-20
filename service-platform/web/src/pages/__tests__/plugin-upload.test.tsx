@@ -195,6 +195,26 @@ describe('PluginUploadPage', () => {
     expect(await screen.findByText((t) => t.includes('上传失败'))).toBeInTheDocument();
   });
 
+  // Minor-4:非 400/409/413 的兜底分支须**优先回显后端 detail**(后端有「插件包落地失败」等具体原因),
+  // 不一律「上传失败」丢信息。后端 500 带 detail 时,提示应是该 detail。
+  it('上传非特定错误码(500)带后端 detail → 回显 detail(如「插件包落地失败」)而非通用文案', async () => {
+    uploadPluginVersion.mockRejectedValue({
+      response: { status: 500, data: { detail: '插件包落地失败' } },
+    });
+    const user = userEvent.setup();
+    const { container } = render(<PluginUploadPage />);
+
+    expect(await screen.findByText('plugin-demo')).toBeInTheDocument();
+
+    await user.upload(fileInput(container), makeTgz());
+
+    await waitFor(() => {
+      expect(uploadPluginVersion).toHaveBeenCalledTimes(1);
+    });
+    // 回显后端 detail,而非通用「上传失败」。
+    expect(await screen.findByText((t) => t.includes('插件包落地失败'))).toBeInTheDocument();
+  });
+
   // B2(按插件服务端过滤):选插件筛选项 → 查询 → listPluginVersions({pluginId}) 透传后端。
   it('筛选区按插件过滤:选筛选项 → listPluginVersions({pluginId}) 带后端过滤参数', async () => {
     const user = userEvent.setup();
@@ -210,5 +230,12 @@ describe('PluginUploadPage', () => {
     await waitFor(() => {
       expect(listPluginVersions).toHaveBeenCalledWith(expect.objectContaining({ pluginId: 3 }));
     });
+
+    // B4 契约钉死:后端 plugins 列表硬卡 pageSize le=200,插件筛选下拉取值 **必须 ≤ 200**,
+    // 否则真后端 422 下拉崩。逐一断言每次 list('plugins') 的 pageSize 都不超过 200。
+    for (const call of list.mock.calls) {
+      const ps = (call[1] as { pageSize?: number } | undefined)?.pageSize;
+      if (ps !== undefined) expect(ps).toBeLessThanOrEqual(200);
+    }
   });
 });

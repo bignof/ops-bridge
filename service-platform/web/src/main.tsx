@@ -55,8 +55,12 @@ const router = createHashRouter([
   },
 ]);
 
-// G2 遗留(A2):用 antd <App> 包裹,为静态 message/notification 提供上下文,消「static function
-// can not consume context」告警(client.ts 拦截器仍用静态 message.error,<App> 在则上下文可用)。
+// antd <App> 仅为 **React 组件内** 的 `App.useApp()`(拿到受 ConfigProvider 主题/locale 包裹的
+// message/notification/modal 实例)提供上下文。
+// 注意(Minor-5 更正):client.ts 拦截器用的是 **静态** `message.error`,它走 antd 全局 holder,
+// **不读** AppContext —— 故全局兜底 toast 不受此 <App> 影响(既不继承其上下文,也不被它“消除告警”)。
+// 此处保留 <App> 是为将来组件内用 App.useApp();静态 message 的主题继承如有需要,另需在 bootstrap
+// 用 ConfigProvider 注册受包裹的 holder(本控制台为内网 admin,默认全局 holder 已够用,暂不做)。
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <ConfigProvider locale={zhCN}>

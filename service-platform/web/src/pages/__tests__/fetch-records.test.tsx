@@ -160,6 +160,13 @@ describe('FetchRecordsPage', () => {
         expect.objectContaining({ namespaceId: 1 }),
       );
     });
+
+    // B4 契约钉死:后端各 list 端点硬卡 pageSize le=200,筛选下拉(命名空间/服务)取值 **必须 ≤ 200**,
+    // 否则真后端 422 下拉崩。逐一断言每次 list 的 pageSize 都不超过 200。
+    for (const call of list.mock.calls) {
+      const ps = (call[1] as { pageSize?: number } | undefined)?.pageSize;
+      if (ps !== undefined) expect(ps).toBeLessThanOrEqual(200);
+    }
   });
 
   // B2(服务服务端过滤):基线硬要求。选服务筛选项 → 查询 → list('fetch-records',{serviceId}) 透传后端。

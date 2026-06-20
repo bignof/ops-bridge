@@ -25,9 +25,10 @@ interface NamespaceOption {
 }
 
 // 命名空间关联选择 options:拉 list('namespaces'),value=id、label=code(name 兜底)。
-// B4:抬高 pageSize 上限(500)+ 下拉 showSearch 本地过滤,大集合也能检索到(避免旧 100 硬上限不可见)。
+// B4:pageSize 取后端硬上限 200(各 list 端点 Query le=200,前后端必须一致;取 500 会 422 下拉崩)
+// + 下拉 showSearch 本地过滤,已加载选项可检索。>200 的真·大集合需远程搜索,属后续增强。
 // 选项即时拉取,不缓存(命名空间低频新增)。
-const NS_OPTIONS_PAGE_SIZE = 500;
+const NS_OPTIONS_PAGE_SIZE = 200;
 const fetchNamespaceOptions = async () => {
   const env = await resources.list<NamespaceOption>('namespaces', { pageSize: NS_OPTIONS_PAGE_SIZE });
   return env.rows.map((n) => ({ label: n.code || String(n.id), value: n.id }));

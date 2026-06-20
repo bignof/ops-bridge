@@ -19,8 +19,9 @@ interface PluginOption {
   code: string;
 }
 
-// B4:筛选下拉一次取较大上限 + showSearch 本地过滤,大集合可检索。
-const PLUGIN_OPTIONS_PAGE_SIZE = 500;
+// B4:筛选下拉 pageSize 取后端硬上限 200(plugins 列表 Query le=200,前后端必须一致;取 500 会 422)
+// + showSearch 本地过滤,已加载选项可检索。>200 的真·大集合需远程搜索,属后续增强。
+const PLUGIN_OPTIONS_PAGE_SIZE = 200;
 const fetchPluginOptions = async () => {
   const env = await resources.list<PluginOption>('plugins', { pageSize: PLUGIN_OPTIONS_PAGE_SIZE });
   return env.rows.map((p) => ({ label: p.code || String(p.id), value: p.id }));
@@ -51,6 +52,16 @@ const statusOf = (e: unknown): number | undefined =>
     ? (e as { response?: { status?: number } }).response?.status
     : undefined;
 
+// 从 axios 异常响应体取后端 detail(FastAPI 习惯放 `detail`);取不到 / 非字符串 / 空串则 undefined。
+// Minor-4:非 400/409/413 的兜底分支优先回显后端 detail(如「插件包落地失败」),比一律「上传失败」更有信息量。
+const detailOf = (e: unknown): string | undefined => {
+  const detail =
+    typeof e === 'object' && e !== null && 'response' in e
+      ? (e as { response?: { data?: { detail?: unknown } } }).response?.data?.detail
+      : undefined;
+  return typeof detail === 'string' && detail.trim() !== '' ? detail : undefined;
+};
+
 /**
  * 插件上传页(resource `plugin-versions` 的 upload):
  * - 上方 antd Upload 拖拽 / 选 `.tgz` → `POST /api/plugin-versions/upload`(字段 file);
@@ -62,7 +73,8 @@ const statusOf = (e: unknown): number | undefined =>
  * - 400 未匹配 / 匹配多个插件 → 「未匹配到插件…」
  * - 409 版本已存在            → 「该版本已存在」
  * - 413 文件超限              → 「文件超出大小限制」
- * - 其它                      → 通用「上传失败」(client 拦截器仅处理 401,此处兜底给可见提示)。
+ * - 其它                      → 优先回显后端 detail(如「插件包落地失败」,Minor-4),无则通用「上传失败」
+ *                              (client 拦截器仅处理 401,此处兜底给可见提示)。
  *
  * 本页只负责上传 + 列版本,不建「发布」入口(发布统一在插件发布页,基线 §5 P2)。
  */
@@ -84,7 +96,8 @@ export default function PluginUploadPage() {
       if (status === 400) messageApi.error('未匹配到插件(或匹配到多个),请检查包名后重试');
       else if (status === 409) messageApi.error('该版本已存在');
       else if (status === 413) messageApi.error('文件超出大小限制');
-      else messageApi.error('上传失败,请重试');
+      // Minor-4:其余(如 500「插件包落地失败」)优先回显后端 detail,无 detail 才回落通用文案,不丢信息。
+      else messageApi.error(detailOf(e) ?? '上传失败,请重试');
       onError?.(e as Error);
     }
   };

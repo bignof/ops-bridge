@@ -29,8 +29,10 @@ interface PluginOption {
   code: string;
 }
 
-// 命名空间选项:list('namespaces'),label=code、value=id。B4:抬 pageSize 上限 + 下拉 showSearch 可检索。
-const NS_OPTIONS_PAGE_SIZE = 500;
+// 命名空间选项:list('namespaces'),label=code、value=id。
+// B4:pageSize 取后端硬上限 200(各 list 端点 Query le=200,前后端必须一致;取 500 会 422 下拉崩)
+// + 下拉 showSearch 本地过滤可检索。>200 的真·大集合需远程搜索,属后续增强。
+const NS_OPTIONS_PAGE_SIZE = 200;
 const fetchNamespaceOptions = async () => {
   const env = await resources.list<NamespaceOption>('namespaces', { pageSize: NS_OPTIONS_PAGE_SIZE });
   return env.rows.map((n) => ({ label: n.code || String(n.id), value: n.id }));

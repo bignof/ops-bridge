@@ -60,8 +60,10 @@ const renderRolledBackTag = (isRolledBack?: boolean) =>
   isRolledBack ? <Tag color="orange">已回滚</Tag> : <span>-</span>;
 
 // 命名空间选项:list('namespaces'),label=code、value=id。
+// B4:pageSize 取后端硬上限 200(各 list 端点 Query le=200,前后端必须一致;>200 会 422 下拉崩)。
+// 四级级联各 select 均 showSearch,已加载选项本地过滤;>200 的真·大集合需远程搜索,属后续增强。
 const fetchNamespaceOptions = async () => {
-  const env = await resources.list<NamespaceOption>('namespaces', { pageSize: 100 });
+  const env = await resources.list<NamespaceOption>('namespaces', { pageSize: 200 });
   return env.rows.map((n) => ({ label: n.code || String(n.id), value: n.id }));
 };
 
@@ -222,7 +224,7 @@ export default function ReleasesPage() {
       request: async (params) => {
         const namespaceId = (params as { namespaceId?: string | number }).namespaceId;
         if (namespaceId === undefined || namespaceId === null || namespaceId === '') return [];
-        const env = await resources.list<ServiceOption>('services', { namespaceId, pageSize: 100 });
+        const env = await resources.list<ServiceOption>('services', { namespaceId, pageSize: 200 });
         return env.rows.map((s) => ({
           label: s.name ? `${s.serviceCode}(${s.name})` : s.serviceCode,
           value: s.id,
@@ -243,7 +245,7 @@ export default function ReleasesPage() {
         if (serviceId === undefined || serviceId === null || serviceId === '') return [];
         const env = await resources.list<ServicePluginOption>('service-plugins', {
           serviceId,
-          pageSize: 100,
+          pageSize: 200,
         });
         return env.rows.map((sp) => ({
           label: sp.pluginCode || String(sp.pluginId),
@@ -264,7 +266,7 @@ export default function ReleasesPage() {
         if (pluginId === undefined || pluginId === null || pluginId === '') return [];
         const env = await resources.listPluginVersions<PluginVersionOption>({
           pluginId,
-          pageSize: 100,
+          pageSize: 200,
         });
         return env.rows.map((v) => ({ label: v.version || String(v.id), value: v.id }));
       },

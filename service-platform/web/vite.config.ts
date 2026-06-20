@@ -35,6 +35,13 @@ export default defineConfig({
     environment: 'jsdom',
     setupFiles: './src/test/setup.ts',
     css: false,
+    // Minor-3:jsdom + antd Select(虚拟列表/portal)在 coverage 插桩下渲染明显变慢,默认 5s
+    // testTimeout 对「创建/四级级联」这类多次开关下拉的用例偏紧,会零星 timeout flake。抬到 15s
+    // 给足余量(纯等待上限,不拖慢正常通过的用例)。
+    testTimeout: 15000,
+    // coverage 并发下各 worker 写 coverage-N.json,曾出现 ENOENT 竞争;固定用 forks 进程池隔离,
+    // 让覆盖率产物写入稳定(代价是略慢,但消除 flake)。
+    pool: 'forks',
     // 评审 D3(系统性根因:此前 vitest run 无 thresholds → 零覆盖文件永不让 CI 转红,假绿是结构必然)。
     // 覆盖率门:v8 provider;阈值取当前实测水位整数下限(实测 lines/statements 90.97、functions 89.15、
     // branches 84.95,均稳定;下取整 + 1pt 余量 → 90/89/84),锁住覆盖率防回退又不卡边(对齐后端

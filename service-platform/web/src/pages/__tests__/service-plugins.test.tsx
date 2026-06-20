@@ -237,6 +237,13 @@ describe('ServicePluginsPage', () => {
     });
     const payload = create.mock.calls[0]?.[1] as Record<string, unknown>;
     expect(payload).not.toHaveProperty('namespaceId');
+
+    // B4 契约钉死:后端各 list 端点硬卡 pageSize le=200,前端级联/选项下拉一切取值 **必须 ≤ 200**,
+    // 否则真后端 422 下拉崩。逐一断言每次 list 的 pageSize 都不超过 200。
+    for (const call of list.mock.calls) {
+      const ps = (call[1] as { pageSize?: number } | undefined)?.pageSize;
+      if (ps !== undefined) expect(ps).toBeLessThanOrEqual(200);
+    }
   });
 
   // B3(409 文案):服务插件无 code 字段,409=重复绑定,文案须为「该插件已绑定该服务…」,非「编码已存在」。

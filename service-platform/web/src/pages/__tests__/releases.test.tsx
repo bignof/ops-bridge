@@ -275,6 +275,18 @@ describe('ReleasesPage', () => {
     await waitFor(() =>
       expect(publish).toHaveBeenCalledWith({ serviceId: 2, pluginId: 3, pluginVersionId: 9 }),
     );
+
+    // B4 契约钉死:后端各 list 端点硬卡 pageSize le=200,前端级联下拉一切取值 **必须 ≤ 200**,
+    // 否则真后端 422 下拉崩(G3 曾抬到 500/100 是真回归)。逐一断言每次 list / listPluginVersions
+    // 的 pageSize 都不超过 200。
+    for (const call of list.mock.calls) {
+      const ps = (call[1] as { pageSize?: number } | undefined)?.pageSize;
+      if (ps !== undefined) expect(ps).toBeLessThanOrEqual(200);
+    }
+    for (const call of listPluginVersions.mock.calls) {
+      const ps = (call[0] as { pageSize?: number } | undefined)?.pageSize;
+      if (ps !== undefined) expect(ps).toBeLessThanOrEqual(200);
+    }
   });
 
   it('A1 级联清空:发布抽屉选命名空间 A→服务→插件→版本后,改命名空间 B → 下级(服务/插件/版本)全被清空', async () => {
@@ -377,5 +389,36 @@ describe('ReleasesPage', () => {
 
     // C1 守卫③:isRolledBack=true(boolean)→ 该非 active 行标「已回滚」。
     expect(within(histRow).getByText('已回滚')).toBeInTheDocument();
+  });
+
+  // Minor-6(A2 兜底分支):publish 在资源层 opt-out 全局兜底,故 handlePublish 必须自管非 409 失败的
+  // 可见性(else if status!==401 通用兜底 toast),且失败时**不关抽屉**(返回 false)便于用户重试。
+  // 后端专设 502(hub 不可用)→ 须见「发布失败」类提示,抽屉保持打开。
+  it('发布 502(hub 不可用)→ 通用兜底「发布失败」提示且抽屉不关闭(A2 写失败不静默吞)', async () => {
+    publish.mockRejectedValue({ response: { status: 502 } });
+    const user = userEvent.setup();
+    render(<ReleasesPage />);
+
+    expect(await screen.findByText('plugin-demo')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: byNormalizedName('发布') }));
+
+    // 四级级联逐级选满(命名空间→服务→插件→版本)。
+    await openSelect(user, 'namespaceId');
+    await clickOption(user, 'ns-demo');
+    await openSelect(user, 'serviceId');
+    await clickOption(user, 'svc-demo');
+    await openSelect(user, 'pluginId');
+    await clickOption(user, 'plugin-demo');
+    await openSelect(user, 'pluginVersionId');
+    await clickOption(user, '1.2.0');
+
+    // 提交 → publish 抛 502。
+    await user.click(screen.getByRole('button', { name: byNormalizedName('确认') }));
+    await waitFor(() => expect(publish).toHaveBeenCalled());
+
+    // A2 关键:非 401 失败有通用兜底可见提示(不静默吞)。
+    expect(await screen.findByText((t) => t.includes('发布失败'))).toBeInTheDocument();
+    // 抽屉不关闭:发布表单标题仍在(handlePublish 返回 false)。
+    expect(screen.getByText('发布插件版本')).toBeInTheDocument();
   });
 });

@@ -129,6 +129,38 @@ describe('ServicesPage', () => {
         expect.objectContaining({ namespaceId: 1, serviceCode: 'svc-new' }),
       );
     });
+
+    // B4 契约钉死:后端各 list 端点硬卡 pageSize le=200,关联选择下拉(命名空间)取值 **必须 ≤ 200**,
+    // 否则真后端 422 下拉崩。逐一断言每次 list 的 pageSize 都不超过 200。
+    for (const call of list.mock.calls) {
+      const ps = (call[1] as { pageSize?: number } | undefined)?.pageSize;
+      if (ps !== undefined) expect(ps).toBeLessThanOrEqual(200);
+    }
+  });
+
+  // Minor-6(A2 兜底分支):create/update 在资源层 opt-out 全局兜底,CrudTable.handleWriteError 必须
+  // 自管非 409 失败的可见性(else if status!==401 通用兜底 toast「操作失败」)。后端 500 → 须见该提示,
+  // 抽屉不关闭(返回 false)。覆盖此前零测试的页面侧兜底分支。
+  it('创建 500 → CrudTable 通用兜底「操作失败」提示且抽屉不关闭(A2 写失败不静默吞)', async () => {
+    create.mockRejectedValue({ response: { status: 500 } });
+    const user = userEvent.setup();
+    render(<ServicesPage />);
+
+    expect(await screen.findByText('svc-demo')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: byNormalizedName('添加') }));
+
+    // 选命名空间(必填)+ 填服务编码(必填)后提交。
+    await openSelect(user, 'namespaceId');
+    await clickOption(user, 'ns-demo');
+    await user.type(await screen.findByLabelText('服务编码'), 'svc-x');
+    await user.click(screen.getByRole('button', { name: byNormalizedName('确认') }));
+
+    await waitFor(() => expect(create).toHaveBeenCalled());
+
+    // A2 关键:非 401 写失败有通用兜底可见提示(不静默吞)。
+    expect(await screen.findByText((t) => t.includes('操作失败'))).toBeInTheDocument();
+    // 抽屉不关闭:新建表单标题仍在(handleWriteError 返回 false)。
+    expect(screen.getByText('新建服务')).toBeInTheDocument();
   });
 
   // C5(编辑回填关联字段):渲染 → 点行内「编辑」→ 断言 namespaceId select 预填后端行的当前命名空间、
