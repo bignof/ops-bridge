@@ -30,13 +30,30 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Upl
 
 from app import storage, store
 from app.auth import require_session
-from app.db_models import Plugin, PluginVersion
+from app.db_models import Plugin, PluginAttachment, PluginVersion
 from app.models import PluginUploadOut, PluginVersionListOut, PluginVersionOut
 
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/plugin-versions", tags=["插件版本/上传"])
+
+# SELECT 列(评审 A3):plugin_version 本行字段 + LEFT JOIN 回 pluginCode(= plugin.code)
+# 与 filename(= plugin_attachment.filename;P1a UNIQUE(plugin_version_id) → 至多一条,1:1)。
+_LIST_COLUMNS = (
+    PluginVersion.id,
+    PluginVersion.plugin_id,
+    PluginVersion.version,
+    PluginVersion.name,
+    Plugin.code.label("plugin_code"),
+    PluginAttachment.filename.label("filename"),
+)
+
+# LEFT JOIN 链:plugin_version →(plugin / plugin_attachment)各一跳(关联缺失时回名列为 NULL,不丢主行)。
+_OUTER_JOINS = (
+    (Plugin, Plugin.id == PluginVersion.plugin_id),
+    (PluginAttachment, PluginAttachment.plugin_version_id == PluginVersion.id),
+)
 
 # 请求体大小上限(评审 L3)。默认 200MB,可由 env 覆盖;同时依赖 nginx client_max_body_size
 # 在边缘兜底(见 storage.py 文档)。读入前先按 Content-Length 挡,避免超大体进内存。
@@ -133,7 +150,10 @@ async def upload_plugin_version(
     "",
     response_model=PluginVersionListOut,
     summary="插件版本列表",
-    description="分页返回版本台账;支持 ?pluginId= 过滤(P1-SPA 上传页 ProTable 依赖信封形状)。",
+    description=(
+        "分页返回版本台账;LEFT JOIN 回 pluginCode/filename(评审 A3,上传页列依赖);"
+        "支持 ?pluginId= 过滤(P1-SPA 上传页 ProTable 依赖信封形状)。"
+    ),
 )
 async def list_plugin_versions(
     _: str = Depends(require_session),
@@ -141,8 +161,18 @@ async def list_plugin_versions(
     page: int = Query(default=1, ge=1, title="页码"),
     page_size: int = Query(default=20, ge=1, le=200, alias="pageSize", title="每页条数"),
 ) -> PluginVersionListOut:
+    # 评审 A3:照 fetch_records 模式用 list_rows_joined 回 pluginCode/filename(此前 list_rows 无 JOIN
+    # → 上传页两列恒空)。保留 ?pluginId= 过滤;最新优先(审计/上传列表惯例)。
     filters = [PluginVersion.plugin_id == plugin_id] if plugin_id is not None else []
-    rows, count = store.list_rows(PluginVersion, page=page, page_size=page_size, filters=filters)
+    rows, count = store.list_rows_joined(
+        PluginVersion,
+        columns=_LIST_COLUMNS,
+        outer_joins=_OUTER_JOINS,
+        page=page,
+        page_size=page_size,
+        filters=filters,
+        order_by=PluginVersion.id.desc(),
+    )
     return PluginVersionListOut(
         count=count,
         rows=[PluginVersionOut.model_validate(row) for row in rows],

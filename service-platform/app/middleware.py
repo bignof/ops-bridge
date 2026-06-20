@@ -58,6 +58,8 @@ def _is_whitelisted(path: str) -> bool:
 # - `connect-src 'self'`:XHR/fetch 同源(api client baseURL='/')。
 # - `object-src 'none'` / `base-uri 'self'` / `frame-ancestors 'none'`:额外收紧(禁插件、禁
 #   篡改 base、禁被嵌入,与 X-Frame-Options: DENY 双保险)。
+# - `form-action 'self'`(评审 C4):登录表单纵深——限制表单只能 POST 回同源,防注入脚本把
+#   凭据表单 action 改指向外站(CSP frame-ancestors/base-uri 之外再补一道表单出站约束)。
 CSP_POLICY = "; ".join(
     (
         "default-src 'self'",
@@ -69,6 +71,7 @@ CSP_POLICY = "; ".join(
         "object-src 'none'",
         "base-uri 'self'",
         "frame-ancestors 'none'",
+        "form-action 'self'",
     )
 )
 

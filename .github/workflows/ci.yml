@@ -138,10 +138,13 @@ jobs:
           print("alembic upgrade ok")
           PY
 
-      - name: Run tests
+      - name: Run tests with coverage gate
         env:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
-        run: python -m pytest -q
+        # 评审 D3(系统性根因:此前仅 pytest -q,无覆盖率门 → 零覆盖文件永不让 CI 转红)。
+        # 显式 -p pytest_cov:PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 会禁插件自动加载,须手动启用 cov 插件。
+        # 阈值 94 取自当前实测水位(94.11%)的整数下限,锁住覆盖率防回退(参 service-agent 的 97)。
+        run: python -m pytest -p pytest_cov --cov=app --cov-report=term-missing --cov-fail-under=94 -q
 
       - name: Build Docker image
         run: docker build -t service-platform:ci .

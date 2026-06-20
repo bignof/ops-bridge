@@ -256,7 +256,13 @@ class ServicePluginListOut(ListEnvelope[ServicePluginOut]):
 
 
 class PluginVersionOut(BaseModel):
-    """版本台账响应:id + pluginId + version(= package.json.version)+ name。"""
+    """版本台账响应:id + pluginId + version(= package.json.version)+ name。
+
+    评审 A3(契约漂移第 3 例):列表端点 LEFT JOIN 回只读 `pluginCode`(= plugin.code)
+    与 `filename`(= plugin_attachment.filename,P1a UNIQUE(plugin_version_id) → 1:1),
+    供上传页 ProTable 的「插件编码 / 文件名」列填充(此前 store.list_rows 无 JOIN → 两列恒空)。
+    单条 get 端点不 JOIN,两字段留 None(无影响,前端列表页才依赖)。
+    """
 
     model_config = MODEL_CONFIG
 
@@ -264,6 +270,8 @@ class PluginVersionOut(BaseModel):
     plugin_id: int
     version: str
     name: str | None = None
+    plugin_code: str | None = None
+    filename: str | None = None
 
 
 class PluginVersionListOut(ListEnvelope[PluginVersionOut]):

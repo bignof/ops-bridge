@@ -313,6 +313,18 @@ def publish(service_id: int, plugin_id: int, plugin_version_id: int) -> ServiceP
         if pv is None or pv.plugin_id != plugin_id:
             raise NotFound("plugin version not found for this plugin")
 
+        # 评审 B1(重复版本守卫,用户定 D1①):同绑定已发过该 plugin_version_id → Conflict(路由层 → 409),
+        # 不再静默追加重复历史行。在父锁内做(已 with_for_update 锁 service_plugin),先于全灭活/INSERT,
+        # 避免重发自灭活自身后又追加重复行。重新激活历史版本走 reactivate(不经此路径)。
+        dup = session.execute(
+            select(ServicePluginVersion.id).where(
+                ServicePluginVersion.service_plugin_id == sp.id,
+                ServicePluginVersion.plugin_version_id == plugin_version_id,
+            )
+        ).first()
+        if dup is not None:
+            raise Conflict("该版本已发布过(同绑定重复发布同一版本)")
+
         # 先全灭活 + 清 key,再 flush(评审 M4),最后 INSERT 带 key 的新行。
         _deactivate_all(session, service_id, plugin_id)
         session.flush()

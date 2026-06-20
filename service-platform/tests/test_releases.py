@@ -208,6 +208,77 @@ def test_publish_unbound_raises_not_found(client: TestClient) -> None:
         store.publish(123456, 654321, 1)
 
 
+# --- B1:同绑定 publish 同一 pluginVersionId 重复 → 守卫拒(Conflict / 端点 409)----------
+#
+# 用户定方向(D1①):后端加守卫。同 (service_plugin_id, plugin_version_id) 已发过 → Conflict,
+# 不再静默追加重复历史行(此前重发返 201 + version_order 递增,前端 409 文案悬空)。
+# TDD:加守卫前第 2 次 publish 返 201(红);加守卫后返 Conflict / 端点 409(绿)。
+
+
+def test_publish_duplicate_same_version_raises_conflict(client: TestClient) -> None:
+    """store 层:同绑定 publish 同一 pluginVersionId 第二次 → Conflict(B1 守卫)。
+
+    红(未加守卫):第二次正常返新行(201 语义),重复历史行被静默追加。
+    绿(加守卫后):第二次抛 store.Conflict;且台账里该版本只有一行(未追加重复)。
+    """
+    svc_id, plg_id, sp_id = _mk_binding("dup-ns", "dup-svc", "dup-plg")
+    pv = _mk_version(plg_id, "1.0")
+
+    first = store.publish(svc_id, plg_id, pv)
+    assert first.is_active is True and first.version_order == 1
+
+    # 同绑定 + 同 pluginVersionId 再发 → 守卫拒(Conflict)
+    with pytest.raises(store.Conflict):
+        store.publish(svc_id, plg_id, pv)
+
+    # 守卫拒后台账里该 (binding, version) 仍只有一行(未追加重复历史行)
+    rows = store.find_rows(
+        ServicePluginVersion,
+        filters=[
+            ServicePluginVersion.service_plugin_id == sp_id,
+            ServicePluginVersion.plugin_version_id == pv,
+        ],
+    )
+    assert len(rows) == 1, rows
+    # 守卫不破坏单活:原行仍是唯一 active
+    assert len(_active_rows(svc_id, plg_id)) == 1
+
+
+def test_publish_endpoint_duplicate_same_version_409(client: TestClient) -> None:
+    """端点层:同绑定 publish 同一 pluginVersionId 第二次 → 409(store.Conflict 映射)。
+
+    红(未加守卫):第二次端点返 201。绿(加守卫后):第二次返 409。
+    对照:发布**不同**版本仍 201(守卫只挡同版本重发,不误伤正常追加新版本)。
+    """
+    h = _h(client)
+    svc_id, plg_id, _ = _mk_binding("dup-ep-ns", "dup-ep-svc", "dup-ep-plg")
+    pv1 = _mk_version(plg_id, "1.0")
+    pv2 = _mk_version(plg_id, "1.1")
+
+    first = client.post(
+        "/api/releases/publish",
+        json={"serviceId": svc_id, "pluginId": plg_id, "pluginVersionId": pv1},
+        headers=h,
+    )
+    assert first.status_code == 201, first.text
+
+    # 同版本重发 → 409
+    dup = client.post(
+        "/api/releases/publish",
+        json={"serviceId": svc_id, "pluginId": plg_id, "pluginVersionId": pv1},
+        headers=h,
+    )
+    assert dup.status_code == 409, dup.text
+
+    # 对照:发布不同版本(pv2)仍 201(守卫不误伤正常追加新版本)
+    other = client.post(
+        "/api/releases/publish",
+        json={"serviceId": svc_id, "pluginId": plg_id, "pluginVersionId": pv2},
+        headers=h,
+    )
+    assert other.status_code == 201, other.text
+
+
 def test_publish_cross_plugin_version_raises_not_found(client: TestClient) -> None:
     """最终评审修复:plugin_version_id 必须归属于 plugin_id。
 
