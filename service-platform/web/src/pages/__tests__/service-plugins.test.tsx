@@ -52,20 +52,35 @@ const servicePluginsEnvelope = {
   totalPage: 1,
 };
 
+// 两个命名空间:A1 级联清空用例需切换父级,验证下级被清(单命名空间无法观测切换)。
 const namespacesEnvelope = {
-  count: 1,
-  rows: [{ id: 1, code: 'ns-demo', name: '演示命名空间' }],
+  count: 2,
+  rows: [
+    { id: 1, code: 'ns-demo', name: '演示命名空间' },
+    { id: 10, code: 'ns-other', name: '另一命名空间' },
+  ],
   page: 1,
   pageSize: 100,
   totalPage: 1,
 };
 
-const servicesEnvelope = {
-  count: 1,
-  rows: [{ id: 2, serviceCode: 'svc-demo', name: '演示服务' }],
-  page: 1,
-  pageSize: 100,
-  totalPage: 1,
+// 服务按命名空间隔离:ns-demo(id=1)→ svc-demo(id=2);ns-other(id=10)→ svc-other(id=20)。
+// 据 params.namespaceId 返回对应服务,使「换命名空间后服务列表变化 + 旧选值必须被清」可断言。
+const servicesByNamespace: Record<number, typeof servicePluginsEnvelope> = {
+  1: {
+    count: 1,
+    rows: [{ id: 2, serviceCode: 'svc-demo', name: '演示服务' }],
+    page: 1,
+    pageSize: 100,
+    totalPage: 1,
+  } as never,
+  10: {
+    count: 1,
+    rows: [{ id: 20, serviceCode: 'svc-other', name: '另一服务' }],
+    page: 1,
+    pageSize: 100,
+    totalPage: 1,
+  } as never,
 };
 
 const pluginsEnvelope = {
@@ -76,13 +91,15 @@ const pluginsEnvelope = {
   totalPage: 1,
 };
 
-// 按 resource 路由 list 返回。
-const routeList = (resource: string) => {
+// 按 resource 路由 list 返回;services 再按 namespaceId 服务端过滤分流。
+const routeList = (resource: string, params?: Record<string, unknown>) => {
   switch (resource) {
     case 'namespaces':
       return namespacesEnvelope;
-    case 'services':
-      return servicesEnvelope;
+    case 'services': {
+      const nsId = Number(params?.namespaceId);
+      return servicesByNamespace[nsId] ?? { count: 0, rows: [], page: 1, pageSize: 100, totalPage: 1 };
+    }
     case 'plugins':
       return pluginsEnvelope;
     default:
@@ -118,7 +135,9 @@ describe('ServicePluginsPage', () => {
     create.mockReset();
     update.mockReset();
     remove.mockReset();
-    list.mockImplementation((resource: string) => Promise.resolve(routeList(resource)));
+    list.mockImplementation((resource: string, params?: Record<string, unknown>) =>
+      Promise.resolve(routeList(resource, params)),
+    );
   });
 
   it('列表渲染(走 resources.list,列用后端可读名 namespaceCode/serviceCode/pluginCode)', async () => {
@@ -172,7 +191,7 @@ describe('ServicePluginsPage', () => {
     });
   });
 
-  it('点「添加」→ 选满级联 → 提交 → 调 create(service-plugins, {namespaceId,serviceId,pluginId})', async () => {
+  it('点「添加」→ 选满级联 → 提交 → 调 create(service-plugins, {serviceId,pluginId}),C3 裁掉 namespaceId', async () => {
     create.mockResolvedValue({ id: 12 });
     const user = userEvent.setup();
     render(<ServicePluginsPage />);
@@ -195,11 +214,50 @@ describe('ServicePluginsPage', () => {
     // 提交。
     await user.click(screen.getByRole('button', { name: byNormalizedName('确认') }));
 
+    // C3:提交体只含 serviceId/pluginId,**不含**仅用于级联的 namespaceId(裁干净,不留隐患)。
     await waitFor(() => {
       expect(create).toHaveBeenCalledWith(
         'service-plugins',
-        expect.objectContaining({ namespaceId: 1, serviceId: 2, pluginId: 3 }),
+        expect.objectContaining({ serviceId: 2, pluginId: 3 }),
       );
     });
+    const payload = create.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(payload).not.toHaveProperty('namespaceId');
+  });
+
+  it('A1 级联清空:选命名空间 A → 选其服务 → 改命名空间 B → 服务被清空(不残留 A 的服务,不会错配提交)', async () => {
+    const user = userEvent.setup();
+    render(<ServicePluginsPage />);
+
+    expect(await screen.findByText('svc-demo')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: byNormalizedName('添加') }));
+
+    // 选命名空间 A(ns-demo,id=1)。
+    await openSelect(user, 'namespaceId');
+    await clickOption(user, 'ns-demo');
+
+    // 选 A 的服务(svc-demo,id=2)。
+    await openSelect(user, 'serviceId');
+    await clickOption(user, 'svc-demo');
+
+    // 选中后,serviceId 字段渲染出已选项文案 svc-demo。
+    const serviceField = document.getElementById('serviceId')!.closest('.ant-select')!;
+    await waitFor(() =>
+      expect(serviceField.querySelector('.ant-select-selection-item')?.textContent).toContain(
+        'svc-demo',
+      ),
+    );
+
+    // 改命名空间为 B(ns-other,id=10)。
+    await openSelect(user, 'namespaceId');
+    await clickOption(user, 'ns-other');
+
+    // A1 关键断言:父级变更后,serviceId 已选值被清空 —— 不再残留 A 的 svc-demo
+    // (旧实现仅靠 dependencies 重拉选项,值不清 → 提交会带 A 的 serviceId=2 与 B 错配)。
+    await waitFor(() =>
+      expect(serviceField.querySelector('.ant-select-selection-item')?.textContent ?? '').not.toContain(
+        'svc-demo',
+      ),
+    );
   });
 });

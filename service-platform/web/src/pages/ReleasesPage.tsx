@@ -7,18 +7,18 @@ import {
   type ProColumns,
   type ProFormColumnsType,
 } from '@ant-design/pro-components';
-import { Button, Drawer, Popconfirm, Space, Tag, message } from 'antd';
+import { Button, Drawer, Form, Popconfirm, Space, Tag, message } from 'antd';
 import { CloudUploadOutlined } from '@ant-design/icons';
 import * as resources from '../api/resources';
 
-// 发布行记录(对齐 P1a `releases` list 契约,全 camelCase)。
+// 发布行记录(对齐 P1a `releases` list 契约 ReleaseOut,全 camelCase)。
 // 列全部用后端 LEFT JOIN 回的可读名(namespaceCode/serviceCode/pluginCode/version),不客户端拼 id→名。
 // isActive / isRolledBack:boolean(对齐 P1a ReleaseOut.is_active/is_rolled_back 为 bool → JSON true/false),用 Tag 标色。
 // serviceId / pluginId:行操作(历史版本 / 回滚)定位用;主表行即「当前 active 行」。
+// 注:ReleaseOut **只回 serviceCode**(无 serviceName),服务列直接用 serviceCode。
 interface ReleaseRow {
   id: string | number;
   namespaceCode?: string;
-  serviceName?: string;
   serviceCode?: string;
   pluginCode?: string;
   version?: string;
@@ -91,15 +91,34 @@ export default function ReleasesPage() {
 
   // 发布 Drawer 开关。
   const [publishOpen, setPublishOpen] = useState(false);
+  // 发布表单实例:A1 级联清空靠它在父级变更时 setFieldValue(子, undefined)。
+  const [publishForm] = Form.useForm();
+
+  // A1 级联清空:四级级联(命名空间→服务→插件→版本)父级变更时,清空所有下级已选值。
+  // 否则换命名空间/服务后下级仍残留旧选项的 serviceId/pluginId/pluginVersionId → 可提交「张冠李戴」错配。
+  // 仅 dependencies 重拉选项不够(选项变了但值还在),必须显式清值。
+  const CASCADE_CHILDREN: Record<string, string[]> = {
+    namespaceId: ['serviceId', 'pluginId', 'pluginVersionId'],
+    serviceId: ['pluginId', 'pluginVersionId'],
+    pluginId: ['pluginVersionId'],
+  };
+  const handlePublishValuesChange = (changed: Record<string, unknown>) => {
+    for (const parent of Object.keys(CASCADE_CHILDREN)) {
+      if (parent in changed) {
+        const cleared: Record<string, undefined> = {};
+        for (const child of CASCADE_CHILDREN[parent]) cleared[child] = undefined;
+        publishForm.setFieldsValue(cleared);
+      }
+    }
+  };
 
   // 历史版本抽屉:记录当前查看的绑定(serviceId+pluginId),为空表示关闭。
   // 含可读名仅用于抽屉标题展示;过滤只用 serviceId+pluginId。
   const [history, setHistory] = useState<{
     serviceId: string | number;
     pluginId: string | number;
-    // P1a 主表行回 serviceCode(非 serviceName);标题取 serviceCode,serviceName 仅兜底。
+    // P1a 主表行回 serviceCode(无 serviceName);标题取 serviceCode。
     serviceCode?: string;
-    serviceName?: string;
     pluginCode?: string;
   } | null>(null);
   const historyActionRef = useRef<ActionType>();
@@ -109,16 +128,12 @@ export default function ReleasesPage() {
   // 主表列(对照基线 §6):namespaceCode / serviceCode / pluginCode / version / publishTime + 两个 Tag 列。
   const columns: ProColumns<ReleaseRow>[] = [
     { title: '命名空间', dataIndex: 'namespaceCode', key: 'namespaceCode' },
-    {
-      title: '服务',
-      // P1a 实际回 serviceCode(非 serviceName);dataIndex 对齐真实字段,render 兜底防未来后端改回 serviceName。
-      dataIndex: 'serviceCode',
-      key: 'serviceCode',
-      render: (_dom, r) => r.serviceName || r.serviceCode || '-',
-    },
+    // P1a ReleaseOut 只回 serviceCode(无 serviceName),服务列直接用 serviceCode。
+    { title: '服务', dataIndex: 'serviceCode', key: 'serviceCode' },
     { title: '插件', dataIndex: 'pluginCode', key: 'pluginCode' },
     { title: '当前版本', dataIndex: 'version', key: 'version' },
-    { title: '发布时间', dataIndex: 'publishTime', key: 'publishTime' },
+    // C1:后端回 ISO8601(带 T/Z),用 valueType 'dateTime' 经 dayjs 格式化为 YYYY-MM-DD HH:mm:ss,避免直显原始 ISO。
+    { title: '发布时间', dataIndex: 'publishTime', key: 'publishTime', valueType: 'dateTime' },
     {
       title: '运行版本',
       dataIndex: 'isActive',
@@ -158,7 +173,8 @@ export default function ReleasesPage() {
   const historyColumns: ProColumns<ReleaseRow>[] = [
     { title: '版本', dataIndex: 'version', key: 'version' },
     { title: '版本序号', dataIndex: 'versionOrder', key: 'versionOrder' },
-    { title: '发布时间', dataIndex: 'publishTime', key: 'publishTime' },
+    // C1:后端回 ISO8601(带 T/Z),用 valueType 'dateTime' 经 dayjs 格式化为 YYYY-MM-DD HH:mm:ss,避免直显原始 ISO。
+    { title: '发布时间', dataIndex: 'publishTime', key: 'publishTime', valueType: 'dateTime' },
     {
       title: '运行版本',
       dataIndex: 'isActive',
@@ -269,12 +285,15 @@ export default function ReleasesPage() {
       reloadMain();
       return true; // DrawerForm 返回 true 自动关闭
     } catch (e) {
-      // 409 视为「该版本已发布过」,提示去历史版本重新激活;其余交回拦截器兜底。
+      // publish 在资源层 opt-out 全局兜底(suppressGlobalError),故此处必须自管全部错误 UX:
+      //  - 409 → 「该版本已发布过」精确文案(去历史版本重新激活);
+      //  - 其余(如 502 hub 不可用)→ 通用兜底,**不可静默吞**(A2);401 仍由拦截器统一处理。
       const status =
         typeof e === 'object' && e && 'response' in e
           ? (e as { response?: { status?: number } }).response?.status
           : undefined;
       if (status === 409) messageApi.error('该版本已发布过,请到「历史版本」重新激活');
+      else if (status !== 401) messageApi.error('发布失败,请稍后重试');
       return false; // 不关闭抽屉,便于用户改选
     }
   };
@@ -287,7 +306,7 @@ export default function ReleasesPage() {
       reloadMain();
       historyActionRef.current?.reload();
     } catch {
-      // 失败(如非 active 版「无需回滚」)由 client 拦截器统一提示。
+      // 失败(如非 active 版「无需回滚」)由 client 拦截器统一兜底 toast(取后端 detail)。
     }
   };
 
@@ -336,8 +355,11 @@ export default function ReleasesPage() {
       {/* 发布 Drawer:四级级联 → publish。 */}
       <DrawerForm<Record<string, unknown>>
         title="发布插件版本"
+        form={publishForm}
         open={publishOpen}
         onOpenChange={setPublishOpen}
+        // A1:父级(命名空间/服务/插件)变更时级联清空所有下级已选值,杜绝错配提交。
+        onValuesChange={handlePublishValuesChange}
         onFinish={handlePublish}
         drawerProps={{ destroyOnClose: true }}
       >
@@ -351,7 +373,7 @@ export default function ReleasesPage() {
       <Drawer
         title={
           history
-            ? `历史版本 — ${history.serviceCode || history.serviceName || history.serviceId} / ${
+            ? `历史版本 — ${history.serviceCode || history.serviceId} / ${
                 history.pluginCode || history.pluginId
               }`
             : '历史版本'

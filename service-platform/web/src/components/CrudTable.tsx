@@ -7,7 +7,7 @@ import {
   type ProFormColumnsType,
   BetaSchemaForm,
 } from '@ant-design/pro-components';
-import { Button, Popconfirm, Space, message } from 'antd';
+import { Button, Form, Popconfirm, Space, message } from 'antd';
 import { PlusOutlined } from '@ant-design/icons';
 import * as resources from '../api/resources';
 
@@ -34,6 +34,16 @@ export interface CrudTableProps<T extends RowWithId> {
   /** 是否可删除;默认 true。 */
   deletable?: boolean;
   /**
+   * A1 级联清空映射:`{ 父字段: [需清空的下级字段...] }`。父字段值变更时,自动把所有下级字段清空,
+   * 避免「换上级后下级残留旧选值」造成错配提交(如 service-plugins 的 命名空间→服务→插件 三级级联)。
+   */
+  cascadeChildren?: Record<string, string[]>;
+  /**
+   * 提交前对表单值做变换(C3):如 service-plugins 仅用 namespaceId 做级联,提交时须裁掉它只发
+   * `{serviceId, pluginId}`(后端 extra='ignore' 虽会静默丢弃,但前端裁干净更显式、不留隐患)。
+   */
+  transformValues?: (values: Record<string, unknown>) => Record<string, unknown>;
+  /**
    * 创建成功回调:拿到 create 响应体(可能含 show-once 明文,如 { agentKey })。
    * 命名空间页据此在响应含 agentKey 时弹 ShowOnceModal。
    */
@@ -58,10 +68,14 @@ export default function CrudTable<T extends RowWithId>({
   rowExtraActions,
   editable = true,
   deletable = true,
+  cascadeChildren,
+  transformValues,
   onCreated,
 }: CrudTableProps<T>) {
   const actionRef = useRef<ActionType>();
   const [messageApi, contextHolder] = message.useMessage();
+  // 表单实例:A1 级联清空靠它在父级变更时 setFieldsValue(下级=undefined)。
+  const [form] = Form.useForm();
 
   // Drawer 状态:open + 当前编辑记录(null = 新建)。
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -69,14 +83,28 @@ export default function CrudTable<T extends RowWithId>({
 
   const reload = () => actionRef.current?.reload();
 
-  // 统一错误处理:唯一冲突 409 给明确文案;其余交回拦截器(返回 false 让 DrawerForm 不关闭)。
+  // A1 级联清空:父字段变更时清空其所有下级字段(防换上级后下级残留旧选值造成错配)。
+  const handleValuesChange = (changed: Record<string, unknown>) => {
+    if (!cascadeChildren) return;
+    for (const parent of Object.keys(cascadeChildren)) {
+      if (parent in changed) {
+        const cleared: Record<string, undefined> = {};
+        for (const child of cascadeChildren[parent]) cleared[child] = undefined;
+        form.setFieldsValue(cleared);
+      }
+    }
+  };
+
+  // 统一错误处理:唯一冲突 409 给明确文案;其余给通用兜底(返回 false 让 DrawerForm 不关闭)。
+  // 注:create/update 在资源层 opt-out 全局兜底(suppressGlobalError),故此处必须自管全部错误 UX,
+  //     否则非 409 写失败会静默吞(A2)。401 仍由 client 拦截器统一处理(清 token + 跳登录)。
   const handleWriteError = (e: unknown): boolean => {
     const status =
       typeof e === 'object' && e && 'response' in e
         ? (e as { response?: { status?: number } }).response?.status
         : undefined;
     if (status === 409) messageApi.error('编码已存在');
-    // 非 409:client 响应拦截器已统一提示(401 跳登录等),这里不重复 toast。
+    else if (status !== 401) messageApi.error('操作失败,请稍后重试');
     return false;
   };
 
@@ -92,12 +120,14 @@ export default function CrudTable<T extends RowWithId>({
 
   // Drawer 提交:editing 为空走 create,否则 update;成功后关抽屉、刷新列表。
   const handleSubmit = async (values: Record<string, unknown>): Promise<boolean> => {
+    // C3:提交前按需裁剪/变换字段(如 service-plugins 裁掉仅用于级联的 namespaceId)。
+    const payload = transformValues ? transformValues(values) : values;
     try {
       if (editing) {
-        await resources.update(resource, editing.id, values);
+        await resources.update(resource, editing.id, payload);
         messageApi.success('保存成功');
       } else {
-        const created = await resources.create(resource, values);
+        const created = await resources.create(resource, payload);
         messageApi.success('创建成功');
         onCreated?.(created);
       }
@@ -182,8 +212,11 @@ export default function CrudTable<T extends RowWithId>({
       />
       <DrawerForm<Record<string, unknown>>
         title={`${editing ? '编辑' : '新建'}${title}`}
+        form={form}
         open={drawerOpen}
         onOpenChange={setDrawerOpen}
+        // A1:父级字段变更时级联清空下级(按 cascadeChildren 配置),杜绝错配提交。
+        onValuesChange={handleValuesChange}
         // 编辑时回填当前行;新建时清空。key 切换强制 DrawerForm 重置内部表单值。
         key={editing ? `edit-${editing.id}` : 'create'}
         initialValues={editing ?? {}}

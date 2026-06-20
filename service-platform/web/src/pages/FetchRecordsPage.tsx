@@ -11,7 +11,7 @@ interface FetchRecordRow {
   serviceCode?: string;
   pluginCode?: string;
   version?: string;
-  /** 获取时间(后端回 ISO 字符串,直接展示)。 */
+  /** 获取时间(后端回 ISO8601 字符串;列用 valueType 'dateTime' 经 dayjs 格式化展示)。 */
   fetchDate?: string;
 }
 
@@ -22,7 +22,8 @@ const columns: ProColumns<FetchRecordRow>[] = [
   { title: '服务', dataIndex: 'serviceCode', key: 'serviceCode' },
   { title: '插件', dataIndex: 'pluginCode', key: 'pluginCode' },
   { title: '插件版本', dataIndex: 'version', key: 'version' },
-  { title: '获取时间', dataIndex: 'fetchDate', key: 'fetchDate' },
+  // C1:后端回 ISO8601(带 T/Z),用 valueType 'dateTime' 经 dayjs 格式化,避免直显原始 ISO。
+  { title: '获取时间', dataIndex: 'fetchDate', key: 'fetchDate', valueType: 'dateTime' },
 ];
 
 /**

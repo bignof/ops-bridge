@@ -22,10 +22,22 @@ if (!globalThis.ResizeObserver) {
   } as unknown as typeof ResizeObserver;
 }
 
-// 下方列表信封:列直接用后端回的可读名 pluginCode / version / filename。
+// 下方列表信封:mock 字段集对齐后端真实 PluginVersionOut(根治假绿,勿注入后端不回的字段)。
+// PluginVersionOut = { id, pluginId, version, name, pluginCode, filename }
+//   —— G1 后端已让 GET /api/plugin-versions LEFT JOIN 回 pluginCode(=plugin.code)/filename(=attachment.filename),
+//   故 mock 保留这两字段是「真回」而非伪造;列渲染 pluginCode/version/filename。
 const versionsEnvelope = {
   count: 1,
-  rows: [{ id: 21, pluginCode: 'plugin-demo', version: '1.0.0', filename: 'plugin-demo-1.0.0.tgz' }],
+  rows: [
+    {
+      id: 21,
+      pluginId: 3,
+      version: '1.0.0',
+      name: '演示插件',
+      pluginCode: 'plugin-demo',
+      filename: 'plugin-demo-1.0.0.tgz',
+    },
+  ],
   page: 1,
   pageSize: 20,
   totalPage: 1,
@@ -111,5 +123,36 @@ describe('PluginUploadPage', () => {
       expect(uploadPluginVersion).toHaveBeenCalledTimes(1);
     });
     expect(await screen.findByText((t) => t.includes('未匹配到插件'))).toBeInTheDocument();
+  });
+
+  it('上传 413 → 明确提示「文件超出大小限制」', async () => {
+    uploadPluginVersion.mockRejectedValue({ response: { status: 413 } });
+    const user = userEvent.setup();
+    const { container } = render(<PluginUploadPage />);
+
+    expect(await screen.findByText('plugin-demo')).toBeInTheDocument();
+
+    await user.upload(fileInput(container), makeTgz());
+
+    await waitFor(() => {
+      expect(uploadPluginVersion).toHaveBeenCalledTimes(1);
+    });
+    expect(await screen.findByText((t) => t.includes('文件超出大小限制'))).toBeInTheDocument();
+  });
+
+  it('上传非特定错误码(500)→ 通用兜底提示「上传失败,请重试」(opt-out 后页面自管,不静默吞)', async () => {
+    uploadPluginVersion.mockRejectedValue({ response: { status: 500 } });
+    const user = userEvent.setup();
+    const { container } = render(<PluginUploadPage />);
+
+    expect(await screen.findByText('plugin-demo')).toBeInTheDocument();
+
+    await user.upload(fileInput(container), makeTgz());
+
+    await waitFor(() => {
+      expect(uploadPluginVersion).toHaveBeenCalledTimes(1);
+    });
+    // A2:上传请求在资源层 opt-out 全局兜底,页面对非 400/409/413 必须有通用可见提示,不可静默吞。
+    expect(await screen.findByText((t) => t.includes('上传失败'))).toBeInTheDocument();
   });
 });

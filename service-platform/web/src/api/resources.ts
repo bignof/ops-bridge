@@ -37,22 +37,30 @@ export async function get<T>(resource: string, id: string | number): Promise<T> 
   return r.data;
 }
 
-/** 新建:POST /api/<resource>(201)。返回响应体(可能含 show-once 明文)。 */
+/**
+ * 新建:POST /api/<resource>(201)。返回响应体(可能含 show-once 明文)。
+ * `suppressGlobalError`:CrudTable 对 409「编码已存在」本地精确提示,故 opt-out 全局兜底防双 toast。
+ */
 export async function create<T = unknown>(
   resource: string,
   values: Record<string, unknown>,
 ): Promise<T> {
-  const r = await client.post<T>(base(resource), values);
+  const r = await client.post<T>(base(resource), values, { suppressGlobalError: true });
   return r.data;
 }
 
-/** 更新:PATCH /api/<resource>/{id}。 */
+/**
+ * 更新:PATCH /api/<resource>/{id}。
+ * `suppressGlobalError`:同 create,CrudTable 对 409 本地提示,opt-out 全局兜底防双 toast。
+ */
 export async function update<T = unknown>(
   resource: string,
   id: string | number,
   values: Record<string, unknown>,
 ): Promise<T> {
-  const r = await client.patch<T>(`${base(resource)}/${id}`, values);
+  const r = await client.patch<T>(`${base(resource)}/${id}`, values, {
+    suppressGlobalError: true,
+  });
   return r.data;
 }
 
@@ -89,7 +97,10 @@ export interface UploadPluginVersionResult {
 export async function uploadPluginVersion(file: File): Promise<UploadPluginVersionResult> {
   const form = new FormData();
   form.append('file', file);
-  const r = await client.post<UploadPluginVersionResult>('/api/plugin-versions/upload', form);
+  // 上传页对 400/409/413 本地精确提示,opt-out 全局兜底防双 toast(401 仍统一处理)。
+  const r = await client.post<UploadPluginVersionResult>('/api/plugin-versions/upload', form, {
+    suppressGlobalError: true,
+  });
   return r.data;
 }
 
@@ -119,7 +130,9 @@ export interface PublishReleaseParams {
  * 旧 `pluginPublisher`:校验绑定存在 + 版本未发过(已发过提示去历史版本),全灭活后新建 isActive 行。
  */
 export async function publish<T = unknown>(params: PublishReleaseParams): Promise<T> {
-  const r = await client.post<T>('/api/releases/publish', params);
+  // 发布页对 409「该版本已发布过」本地精确提示,故 opt-out 全局兜底防双 toast。
+  // ⚠️ opt-out 后非 409 失败的可见性由发布页 handlePublish 自己兜底(generic fallback),不可静默吞。
+  const r = await client.post<T>('/api/releases/publish', params, { suppressGlobalError: true });
   return r.data;
 }
 

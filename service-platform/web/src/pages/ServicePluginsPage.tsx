@@ -115,6 +115,13 @@ export default function ServicePluginsPage() {
       formFields={formFields}
       // 关联绑定表只增删,无编辑(基线 §4「本页无编辑」)。
       editable={false}
+      // A1:三级级联(命名空间→服务→插件)父级变更时清空下级,杜绝错配绑定。
+      cascadeChildren={{
+        namespaceId: ['serviceId', 'pluginId'],
+        serviceId: ['pluginId'],
+      }}
+      // C3:namespaceId 仅用于级联拉服务选项,提交时裁掉,只发 {serviceId, pluginId}。
+      transformValues={({ serviceId, pluginId }) => ({ serviceId, pluginId })}
     />
   );
 }

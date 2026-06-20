@@ -22,6 +22,7 @@ if (!globalThis.ResizeObserver) {
 
 // 列表信封:列直接用后端 JOIN 回的可读名(基线 §7)。
 // ⚠️ 服务列回 serviceCode(非 serviceName),断言据此校验服务列渲染的是 serviceCode。
+// C1:fetchDate 用真实 ISO8601(带 T/Z,后端 datetime 序列化),断言列经 valueType 'dateTime' 格式化(不直显 ISO)。
 const fetchRecordsEnvelope = {
   count: 1,
   rows: [
@@ -31,7 +32,7 @@ const fetchRecordsEnvelope = {
       serviceCode: 'svc-demo',
       pluginCode: 'plugin-demo',
       version: '1.2.0',
-      fetchDate: '2026-06-20 10:00:00',
+      fetchDate: '2026-06-20T10:00:00Z',
     },
   ],
   page: 1,
@@ -53,7 +54,13 @@ describe('FetchRecordsPage', () => {
     expect(screen.getByText('ns-demo')).toBeInTheDocument();
     expect(screen.getByText('plugin-demo')).toBeInTheDocument();
     expect(screen.getByText('1.2.0')).toBeInTheDocument();
-    expect(screen.getByText('2026-06-20 10:00:00')).toBeInTheDocument();
+
+    // C1:获取时间经 valueType 'dateTime' 格式化为 YYYY-MM-DD HH:mm:ss(本地时区),不直显原始 ISO。
+    // 原始 ISO(带 T/Z)绝不出现;格式化后的「日期 时间」串出现(时区无关,用正则匹配格式)。
+    expect(screen.queryByText('2026-06-20T10:00:00Z')).not.toBeInTheDocument();
+    expect(
+      screen.getByText((t) => /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(t)),
+    ).toBeInTheDocument();
   });
 
   it('走 resources.list("fetch-records") 且服务端分页:参数含 page/pageSize', async () => {

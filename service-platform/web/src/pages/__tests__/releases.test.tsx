@@ -43,17 +43,17 @@ if (!globalThis.ResizeObserver) {
 
 // 主表信封:一行「当前 active 绑定」(列用后端 JOIN 回的可读名;含 serviceId/pluginId 供行操作定位)。
 // isActive/isRolledBack 用 boolean(对齐 P1a ReleaseOut 契约:is_active/is_rolled_back 为 bool → JSON true/false)。
+// 对齐真实 ReleaseOut 形状:**无 serviceName**(后端只回 serviceCode);publishTime 为 ISO8601(带 T/Z,后端 datetime 序列化)。
 const releasesEnvelope = {
   count: 1,
   rows: [
     {
       id: 100,
       namespaceCode: 'ns-demo',
-      serviceName: 'svc-demo',
       serviceCode: 'svc-demo',
       pluginCode: 'plugin-demo',
       version: '1.2.0',
-      publishTime: '2026-06-20 10:00:00',
+      publishTime: '2026-06-20T10:00:00Z',
       isActive: true,
       isRolledBack: false,
       serviceId: 2,
@@ -75,7 +75,7 @@ const historyEnvelope = {
       id: 100,
       version: '1.2.0',
       versionOrder: 2,
-      publishTime: '2026-06-20 10:00:00',
+      publishTime: '2026-06-20T10:00:00Z',
       isActive: true,
       isRolledBack: false,
       serviceId: 2,
@@ -85,7 +85,7 @@ const historyEnvelope = {
       id: 99,
       version: '1.1.0',
       versionOrder: 1,
-      publishTime: '2026-06-10 09:00:00',
+      publishTime: '2026-06-10T09:00:00Z',
       isActive: false,
       isRolledBack: true,
       serviceId: 2,
@@ -97,19 +97,33 @@ const historyEnvelope = {
   totalPage: 1,
 };
 
+// 两个命名空间:A1 级联清空用例需切换父级,验证下级被清(单命名空间无法观测切换)。
 const namespacesEnvelope = {
-  count: 1,
-  rows: [{ id: 1, code: 'ns-demo', name: '演示命名空间' }],
+  count: 2,
+  rows: [
+    { id: 1, code: 'ns-demo', name: '演示命名空间' },
+    { id: 10, code: 'ns-other', name: '另一命名空间' },
+  ],
   page: 1,
   pageSize: 100,
   totalPage: 1,
 };
-const servicesEnvelope = {
-  count: 1,
-  rows: [{ id: 2, serviceCode: 'svc-demo', name: '演示服务' }],
-  page: 1,
-  pageSize: 100,
-  totalPage: 1,
+// 服务按命名空间隔离:ns-demo(id=1)→ svc-demo(id=2);ns-other(id=10)→ svc-other(id=20)。
+const servicesByNamespace: Record<number, unknown> = {
+  1: {
+    count: 1,
+    rows: [{ id: 2, serviceCode: 'svc-demo', name: '演示服务' }],
+    page: 1,
+    pageSize: 100,
+    totalPage: 1,
+  },
+  10: {
+    count: 1,
+    rows: [{ id: 20, serviceCode: 'svc-other', name: '另一服务' }],
+    page: 1,
+    pageSize: 100,
+    totalPage: 1,
+  },
 };
 // 服务已绑定插件(service-plugins?serviceId=):value 用绑定行回的 pluginId(=3)。
 const servicePluginsEnvelope = {
@@ -127,13 +141,21 @@ const pluginVersionsEnvelope = {
   totalPage: 1,
 };
 
-// 按 resource 路由 list 返回(级联各级)。
-const routeList = (resource: string) => {
+// 按 resource 路由 list 返回(级联各级);services 再按 namespaceId 服务端过滤分流。
+const routeList = (resource: string, params?: Record<string, unknown>) => {
   switch (resource) {
     case 'namespaces':
       return namespacesEnvelope;
     case 'services':
-      return servicesEnvelope;
+      return (
+        servicesByNamespace[Number(params?.namespaceId)] ?? {
+          count: 0,
+          rows: [],
+          page: 1,
+          pageSize: 100,
+          totalPage: 1,
+        }
+      );
     case 'service-plugins':
       return servicePluginsEnvelope;
     default:
@@ -170,7 +192,9 @@ describe('ReleasesPage', () => {
     publish.mockReset();
     reactivate.mockReset();
     rollback.mockReset();
-    list.mockImplementation((resource: string) => Promise.resolve(routeList(resource)));
+    list.mockImplementation((resource: string, params?: Record<string, unknown>) =>
+      Promise.resolve(routeList(resource, params)),
+    );
     listReleases.mockResolvedValue(releasesEnvelope);
     listReleaseHistory.mockResolvedValue(historyEnvelope);
     listPluginVersions.mockResolvedValue(pluginVersionsEnvelope);
@@ -183,6 +207,12 @@ describe('ReleasesPage', () => {
     expect(await screen.findByText('plugin-demo')).toBeInTheDocument();
     expect(screen.getByText('ns-demo')).toBeInTheDocument();
     expect(screen.getByText('1.2.0')).toBeInTheDocument();
+
+    // C1:发布时间经 valueType 'dateTime' 格式化(本地时区),不直显原始 ISO(带 T/Z)。
+    expect(screen.queryByText('2026-06-20T10:00:00Z')).not.toBeInTheDocument();
+    expect(
+      screen.getByText((t) => /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(t)),
+    ).toBeInTheDocument();
 
     // 关键断言:主表调用 listReleases,且参数**只含分页**、不含任何业务过滤键
     // (serviceId/pluginId/isActive 等都不应出现 —— 主表是聚合视图,不传 filter)。
@@ -244,6 +274,55 @@ describe('ReleasesPage', () => {
     await user.click(screen.getByRole('button', { name: byNormalizedName('确认') }));
     await waitFor(() =>
       expect(publish).toHaveBeenCalledWith({ serviceId: 2, pluginId: 3, pluginVersionId: 9 }),
+    );
+  });
+
+  it('A1 级联清空:发布抽屉选命名空间 A→服务→插件→版本后,改命名空间 B → 下级(服务/插件/版本)全被清空', async () => {
+    const user = userEvent.setup();
+    render(<ReleasesPage />);
+
+    expect(await screen.findByText('plugin-demo')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: byNormalizedName('发布') }));
+
+    // 选命名空间 A(ns-demo,id=1)→ 选其服务 svc-demo(id=2)→ 选插件 → 选版本,逐级选满。
+    await openSelect(user, 'namespaceId');
+    await clickOption(user, 'ns-demo');
+    await openSelect(user, 'serviceId');
+    await clickOption(user, 'svc-demo');
+    await openSelect(user, 'pluginId');
+    await clickOption(user, 'plugin-demo');
+    await openSelect(user, 'pluginVersionId');
+    await clickOption(user, '1.2.0');
+
+    // 选满后,各级渲染出已选项文案。
+    const serviceField = document.getElementById('serviceId')!.closest('.ant-select')!;
+    const pluginField = document.getElementById('pluginId')!.closest('.ant-select')!;
+    const versionField = document.getElementById('pluginVersionId')!.closest('.ant-select')!;
+    await waitFor(() =>
+      expect(serviceField.querySelector('.ant-select-selection-item')?.textContent).toContain(
+        'svc-demo',
+      ),
+    );
+    expect(pluginField.querySelector('.ant-select-selection-item')?.textContent).toContain(
+      'plugin-demo',
+    );
+    expect(versionField.querySelector('.ant-select-selection-item')?.textContent).toContain('1.2.0');
+
+    // 改命名空间为 B(ns-other,id=10)。
+    await openSelect(user, 'namespaceId');
+    await clickOption(user, 'ns-other');
+
+    // A1 关键断言:换命名空间后,服务/插件/版本三级已选值全部被清空(不残留 A 的旧值 → 杜绝错配提交)。
+    await waitFor(() =>
+      expect(serviceField.querySelector('.ant-select-selection-item')?.textContent ?? '').not.toContain(
+        'svc-demo',
+      ),
+    );
+    expect(pluginField.querySelector('.ant-select-selection-item')?.textContent ?? '').not.toContain(
+      'plugin-demo',
+    );
+    expect(versionField.querySelector('.ant-select-selection-item')?.textContent ?? '').not.toContain(
+      '1.2.0',
     );
   });
 
