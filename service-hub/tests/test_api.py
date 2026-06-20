@@ -944,3 +944,150 @@ def test_log_stream_subscriptions_share_upstream_and_stop_on_last_subscriber(cli
         "agent_id": "agent-a",
         "session_id": session_id,
     }
+
+
+# === T9a: list-instances REST 端点(供平台节点页查健康实例,token-gated) ===
+
+
+def _stub_call_agent(state: HubState, monkeypatch: pytest.MonkeyPatch, *, result: dict[str, Any] | None = None, raises: BaseException | None = None) -> dict[str, Any]:
+    """把 hub_state.call_agent 替换成 stub。
+
+    - result:返回该 dict;raises:抛出该异常(二选一)。
+    - 返回 recorder,recorder["messages"] 记录每次下发给 agent 的 message,用于断言转发内容。
+    """
+    recorder: dict[str, Any] = {"calls": 0, "messages": []}
+
+    async def fake_call_agent(agent_id: str, message: dict, timeout: float) -> dict:
+        recorder["calls"] += 1
+        recorder["messages"].append(message)
+        if raises is not None:
+            raise raises
+        return result if result is not None else {"status": "success", "instances": []}
+
+    monkeypatch.setattr(state, "call_agent", fake_call_agent)
+    return recorder
+
+
+def test_list_instances_requires_admin_token(client: TestClient) -> None:
+    # 不带 X-Admin-Token → 403(证明该端点 token-gated,不可匿名)。
+    response = client.post(
+        "/api/agents/agent-a/list-instances",
+        json={"serviceName": "memory-share"},
+    )
+
+    assert response.status_code == 403
+
+
+def test_list_instances_returns_instances_for_online_agent(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    # agent 在线 + call_agent 返回 success 与健康实例 → 200,且原样回传 instances。
+    import app.main as main_module
+
+    state = main_module.hub_state
+    attach_agent(state, "agent-a")
+    instances = [
+        {"address": "h:1800", "containerId": "c0", "healthy": True, "matched": True, "composeProject": "memory-share-1"},
+        {"address": "h:1801", "containerId": "c1", "healthy": False, "matched": True, "composeProject": "memory-share-1"},
+    ]
+    recorder = _stub_call_agent(state, monkeypatch, result={"status": "success", "instances": instances})
+
+    response = client.post(
+        "/api/agents/agent-a/list-instances",
+        headers={"X-Admin-Token": "test-admin-token"},
+        json={"serviceName": "memory-share"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["instances"] == instances
+    # 转发给 agent 的 message:type/serviceName 正确,且带 requestId。
+    assert recorder["calls"] == 1
+    sent = recorder["messages"][0]
+    assert sent["type"] == "list-instances"
+    assert sent["serviceName"] == "memory-share"
+    assert sent["requestId"]
+    # 未传 expectedComposeProject 时不应注入该键。
+    assert "expectedComposeProject" not in sent
+
+
+def test_list_instances_forwards_expected_compose_project(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 传了 expectedComposeProject → 透传给 agent 的 message。
+    import app.main as main_module
+
+    state = main_module.hub_state
+    attach_agent(state, "agent-a")
+    recorder = _stub_call_agent(state, monkeypatch, result={"status": "success", "instances": []})
+
+    response = client.post(
+        "/api/agents/agent-a/list-instances",
+        headers={"X-Admin-Token": "test-admin-token"},
+        json={"serviceName": "memory-share", "expectedComposeProject": "memory-share-1"},
+    )
+
+    assert response.status_code == 200, response.text
+    sent = recorder["messages"][0]
+    assert sent["expectedComposeProject"] == "memory-share-1"
+
+
+def test_list_instances_to_offline_agent_returns_409(client: TestClient) -> None:
+    # agent 已登记但离线(无连接)→ 409。
+    import app.main as main_module
+
+    state = main_module.hub_state
+    state._register_agent_sync("agent-a", "127.0.0.1:12345")
+
+    response = client.post(
+        "/api/agents/agent-a/list-instances",
+        headers={"X-Admin-Token": "test-admin-token"},
+        json={"serviceName": "memory-share"},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Agent is offline"}
+
+
+def test_list_instances_to_unknown_agent_returns_404(client: TestClient) -> None:
+    # agent 不存在 → 404。
+    response = client.post(
+        "/api/agents/ghost/list-instances",
+        headers={"X-Admin-Token": "test-admin-token"},
+        json={"serviceName": "memory-share"},
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Agent not found"}
+
+
+def test_list_instances_agent_failure_returns_502(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    # call_agent 返回 status != success → 502,且回传脱敏后的 error。
+    import app.main as main_module
+
+    state = main_module.hub_state
+    attach_agent(state, "agent-a")
+    _stub_call_agent(state, monkeypatch, result={"status": "failed", "error": "boom"})
+
+    response = client.post(
+        "/api/agents/agent-a/list-instances",
+        headers={"X-Admin-Token": "test-admin-token"},
+        json={"serviceName": "memory-share"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "boom"
+
+
+def test_list_instances_agent_timeout_returns_502(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    # call_agent 抛 TimeoutError(agent 不应答)→ 502。
+    import app.main as main_module
+
+    state = main_module.hub_state
+    attach_agent(state, "agent-a")
+    _stub_call_agent(state, monkeypatch, raises=asyncio.TimeoutError())
+
+    response = client.post(
+        "/api/agents/agent-a/list-instances",
+        headers={"X-Admin-Token": "test-admin-token"},
+        json={"serviceName": "memory-share"},
+    )
+
+    assert response.status_code == 502

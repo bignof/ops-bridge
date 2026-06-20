@@ -58,6 +58,31 @@ class CommandDispatchRequest(BaseModel):
         return self
 
 
+class ListInstancesRequest(BaseModel):
+    # camelCase 入参,与 CommandDispatchRequest 风格一致;serviceName 必填。
+    model_config = ConfigDict(title="查询实例请求")
+
+    serviceName: str = Field(title="服务名")
+    expectedComposeProject: str | None = Field(default=None, title="期望 compose 项目名")
+
+    @property
+    def service_name(self) -> str:
+        return self.serviceName
+
+    @property
+    def expected_compose_project(self) -> str | None:
+        return self.expectedComposeProject
+
+
+class ListInstancesResponse(BaseModel):
+    model_config = titled_model_config("查询实例响应")
+
+    status: str = Field(title="状态")
+    # 直接回传 agent 上报的实例数组(字段含 address/containerId/healthy/matched/composeProject),
+    # 不做严格 schema 约束,避免与 agent 端实例结构耦合。
+    instances: list[dict[str, Any]] = Field(default_factory=list, title="实例列表")
+
+
 class AgentLogsStreamRequest(BaseModel):
     model_config = ConfigDict(title="流式日志请求")
 

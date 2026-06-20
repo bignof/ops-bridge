@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, status
 
 from app import force_guard
 from app.api_support import _build_command_list_response, _command_list_query_dependency, _derive_requested_by, _require_admin_token, _serialize_command, get_command_events_response
-from app.models import CommandDispatchRequest, CommandDispatchResponse, CommandEventSnapshot, CommandListResponse, CommandSnapshot
+from app.models import CommandDispatchRequest, CommandDispatchResponse, CommandEventSnapshot, CommandListResponse, CommandSnapshot, ListInstancesRequest, ListInstancesResponse
 
 
 router = APIRouter(tags=["命令管理"])
@@ -107,6 +109,57 @@ async def dispatch_command(
 
     command = await _serialize_command(request.request_id)
     return CommandDispatchResponse(accepted=True, command=command)
+
+
+@router.post(
+    "/api/agents/{agent_id}/list-instances",
+    response_model=ListInstancesResponse,
+    summary="查询 Agent 实例",
+    description="经指定 Agent 查询某 service 当前的容器实例(含健康状态),供平台节点页展示健康实例数。",
+    tags=["命令管理"],
+)
+async def list_agent_instances(
+    request: ListInstancesRequest,
+    agent_id: str = Path(title="Agent 标识", description="要查询实例的 Agent 唯一标识。"),
+    admin_token: str | None = Header(default=None, alias="X-Admin-Token", title="管理令牌", description="管理操作鉴权令牌。"),
+) -> ListInstancesResponse:
+    import app.main as main_module
+
+    # 安全:节点控制查端点不可匿名,首行强制校验 admin token(非法即 403)。
+    _require_admin_token(admin_token)
+
+    agent = await main_module.hub_state.get_agent(agent_id)
+    if agent is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
+    if not agent["online"]:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Agent is offline")
+
+    req = str(uuid.uuid4())
+    message: dict[str, Any] = {
+        "type": "list-instances",
+        "requestId": req,
+        "serviceName": request.serviceName,
+    }
+    # 仅在显式给出时透传 expectedComposeProject,空值不注入(与 dispatch 的可选字段风格一致)。
+    if request.expectedComposeProject:
+        message["expectedComposeProject"] = request.expectedComposeProject
+
+    try:
+        result = await main_module.hub_state.call_agent(
+            agent_id,
+            message,
+            timeout=main_module.settings.rolling_cmd_timeout,
+        )
+    except asyncio.TimeoutError as exc:
+        # agent 未在超时内应答;脱敏,不向调用方暴露内部细节。
+        main_module.logger.warning("Agent %s 未应答 list-instances(requestId=%s)", agent_id, req)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="agent 未应答 list-instances") from exc
+
+    if result.get("status") != "success":
+        # agent 端执行失败,回传其 error(脱敏:仅取 error 字段)。
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=result.get("error") or "agent list-instances 失败")
+
+    return ListInstancesResponse(status="success", instances=result.get("instances") or [])
 
 
 @router.post("/api/commands/{request_id}/retry", response_model=CommandDispatchResponse, status_code=status.HTTP_202_ACCEPTED, summary="重试失败命令", description="重新下发一条失败命令，并生成新的请求 ID。")
