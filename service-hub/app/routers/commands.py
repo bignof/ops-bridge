@@ -12,17 +12,29 @@ router = APIRouter(tags=["命令管理"])
 
 
 @router.get("/api/commands", response_model=CommandListResponse, summary="查询全局命令列表", description="分页查询所有 Agent 的命令历史，支持多条件筛选与排序。")
-async def list_commands(query: dict[str, Any] = Depends(_command_list_query_dependency)) -> CommandListResponse:
+async def list_commands(
+    query: dict[str, Any] = Depends(_command_list_query_dependency),
+    admin_token: str | None = Header(default=None, alias="X-Admin-Token", title="管理令牌", description="管理操作鉴权令牌。"),
+) -> CommandListResponse:
+    _require_admin_token(admin_token)
     return await _build_command_list_response(**query)
 
 
 @router.get("/api/commands/{request_id}", response_model=CommandSnapshot, summary="查询单条命令", description="根据请求 ID 查询单条命令的最新状态。")
-async def get_command(request_id: str = Path(title="请求 ID", description="要查询的命令请求 ID。")) -> CommandSnapshot:
+async def get_command(
+    request_id: str = Path(title="请求 ID", description="要查询的命令请求 ID。"),
+    admin_token: str | None = Header(default=None, alias="X-Admin-Token", title="管理令牌", description="管理操作鉴权令牌。"),
+) -> CommandSnapshot:
+    _require_admin_token(admin_token)
     return await _serialize_command(request_id)
 
 
 @router.get("/api/commands/{request_id}/events", response_model=list[CommandEventSnapshot], summary="查询命令事件", description="查询命令的完整审计事件流。")
-async def get_command_events(request_id: str = Path(title="请求 ID", description="要查询事件流的命令请求 ID。")) -> list[CommandEventSnapshot]:
+async def get_command_events(
+    request_id: str = Path(title="请求 ID", description="要查询事件流的命令请求 ID。"),
+    admin_token: str | None = Header(default=None, alias="X-Admin-Token", title="管理令牌", description="管理操作鉴权令牌。"),
+) -> list[CommandEventSnapshot]:
+    _require_admin_token(admin_token)
     return await get_command_events_response(request_id)
 
 

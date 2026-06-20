@@ -7,6 +7,7 @@ from typing import Any
 from fastapi import APIRouter, Header, HTTPException, Path, status
 from fastapi.responses import StreamingResponse
 
+from app.api_support import _require_admin_token
 from app.models import AgentLogsStreamRequest
 
 
@@ -25,11 +26,13 @@ def _encode_sse(event: str, payload: dict[str, Any]) -> str:
 async def stream_agent_logs(
     request: AgentLogsStreamRequest,
     agent_id: str = Path(title="Agent 标识", description="要查看日志的 Agent 唯一标识。"),
+    admin_token: str | None = Header(default=None, alias="X-Admin-Token", title="管理令牌", description="管理操作鉴权令牌。"),
     requested_by: str | None = Header(default=None, alias="X-Requested-By", title="请求发起方", description="调用该接口的系统或用户标识。"),
     request_source: str | None = Header(default=None, alias="X-Requested-Source", title="请求来源", description="调用来源，例如控制台、调度器。"),
 ) -> StreamingResponse:
     import app.main as main_module
 
+    _require_admin_token(admin_token)
     agent = await main_module.hub_state.get_agent(agent_id)
     if agent is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")

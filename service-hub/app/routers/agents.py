@@ -10,17 +10,24 @@ router = APIRouter()
 
 
 @router.get("/api/agents", response_model=list[AgentSnapshot], summary="查询全部 Agent", description="返回当前所有 Agent 的最新连接状态与在线状态。", tags=["Agent 管理"])
-async def list_agents() -> list[AgentSnapshot]:
+async def list_agents(
+    admin_token: str | None = Header(default=None, alias="X-Admin-Token", title="管理令牌", description="Hub 管理令牌，值来自环境变量 ADMIN_TOKEN。"),
+) -> list[AgentSnapshot]:
     import app.main as main_module
 
+    _require_admin_token(admin_token)
     agents = await main_module.hub_state.list_agents()
     return [AgentSnapshot.model_validate(agent) for agent in agents]
 
 
 @router.get("/api/agents/{agent_id}", response_model=AgentSnapshot, summary="查询单个 Agent", description="根据 Agent 标识查询其最新状态。", tags=["Agent 管理"])
-async def get_agent(agent_id: str = Path(title="Agent 标识", description="要查询的 Agent 唯一标识。")) -> AgentSnapshot:
+async def get_agent(
+    agent_id: str = Path(title="Agent 标识", description="要查询的 Agent 唯一标识。"),
+    admin_token: str | None = Header(default=None, alias="X-Admin-Token", title="管理令牌", description="Hub 管理令牌，值来自环境变量 ADMIN_TOKEN。"),
+) -> AgentSnapshot:
     import app.main as main_module
 
+    _require_admin_token(admin_token)
     agent = await main_module.hub_state.get_agent(agent_id)
     if agent is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")

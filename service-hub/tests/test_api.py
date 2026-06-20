@@ -80,7 +80,7 @@ def test_list_agents_and_get_agent_return_expected_shape(client: TestClient) -> 
     state = main_module.hub_state
     attach_agent(state, "agent-a")
 
-    response = client.get("/api/agents")
+    response = client.get("/api/agents", headers={"X-Admin-Token": "test-admin-token"})
 
     assert response.status_code == 200
     body = response.json()
@@ -93,7 +93,7 @@ def test_list_agents_and_get_agent_return_expected_shape(client: TestClient) -> 
     assert body[0]["processingCommands"] == 0
     assert body[0]["lastCommandCreatedAt"] is None
 
-    agent_response = client.get("/api/agents/agent-a")
+    agent_response = client.get("/api/agents/agent-a", headers={"X-Admin-Token": "test-admin-token"})
 
     assert agent_response.status_code == 200
     assert agent_response.json()["agentId"] == "agent-a"
@@ -118,7 +118,7 @@ def test_agent_status_includes_queued_and_processing_command_summary(client: Tes
     )
     asyncio.run(state.mark_ack("req-processing"))
 
-    response = client.get("/api/agents/agent-a")
+    response = client.get("/api/agents/agent-a", headers={"X-Admin-Token": "test-admin-token"})
 
     assert response.status_code == 200
     body = response.json()
@@ -145,7 +145,7 @@ def test_rotate_agent_credentials_requires_admin_token_and_persists_state(client
     assert body["issuedAt"]
     assert body["created"] is True
 
-    agent_response = client.get("/api/agents/agent-a")
+    agent_response = client.get("/api/agents/agent-a", headers={"X-Admin-Token": "test-admin-token"})
 
     assert agent_response.status_code == 200
     assert agent_response.json()["credentialConfigured"] is True
@@ -204,13 +204,13 @@ def test_provisioned_key_remains_valid_even_if_issued_at_is_old(client: TestClie
     with client.websocket_connect(f"/ws/agent/agent-e2e?key={agent_key}") as websocket:
         websocket.send_json({"type": "heartbeat"})
 
-    agent_response = client.get("/api/agents/agent-e2e")
+    agent_response = client.get("/api/agents/agent-e2e", headers={"X-Admin-Token": "test-admin-token"})
     assert agent_response.status_code == 200
     assert agent_response.json()["credentialConfigured"] is True
 
 
 def test_get_unknown_agent_returns_404(client: TestClient) -> None:
-    response = client.get("/api/agents/missing-agent")
+    response = client.get("/api/agents/missing-agent", headers={"X-Admin-Token": "test-admin-token"})
 
     assert response.status_code == 404
     assert response.json() == {"detail": "Agent not found"}
@@ -244,7 +244,7 @@ def test_dispatch_command_creates_record_and_returns_expected_payload(client: Te
     assert body["command"]["requestSource"] == "ops-console"
     assert socket.messages[0]["requestId"] == "req-dispatch-1"
 
-    get_response = client.get("/api/commands/req-dispatch-1")
+    get_response = client.get("/api/commands/req-dispatch-1", headers={"X-Admin-Token": "test-admin-token"})
     assert get_response.status_code == 200
     assert get_response.json()["requestId"] == "req-dispatch-1"
 
@@ -316,7 +316,7 @@ def test_get_command_events_returns_created_ack_and_result(client: TestClient) -
     asyncio.run(state.mark_ack("req-events-1"))
     asyncio.run(state.mark_result("req-events-1", "success", message="done"))
 
-    response = client.get("/api/commands/req-events-1/events")
+    response = client.get("/api/commands/req-events-1/events", headers={"X-Admin-Token": "test-admin-token"})
 
     assert response.status_code == 200
     body = response.json()
@@ -324,8 +324,8 @@ def test_get_command_events_returns_created_ack_and_result(client: TestClient) -
 
 
 def test_get_unknown_command_and_events_return_404(client: TestClient) -> None:
-    command_response = client.get("/api/commands/missing")
-    events_response = client.get("/api/commands/missing/events")
+    command_response = client.get("/api/commands/missing", headers={"X-Admin-Token": "test-admin-token"})
+    events_response = client.get("/api/commands/missing/events", headers={"X-Admin-Token": "test-admin-token"})
 
     assert command_response.status_code == 404
     assert events_response.status_code == 404
@@ -353,6 +353,7 @@ def test_list_commands_supports_sort_and_pagination(client: TestClient) -> None:
             "limit": 1,
             "offset": 0,
         },
+        headers={"X-Admin-Token": "test-admin-token"},
     )
 
     assert response.status_code == 200
@@ -381,6 +382,7 @@ def test_list_commands_tolerates_empty_query_values(client: TestClient) -> None:
             "limit": "",
             "offset": "",
         },
+        headers={"X-Admin-Token": "test-admin-token"},
     )
 
     assert response.status_code == 200
@@ -400,7 +402,7 @@ def test_list_commands_supports_agent_filter(client: TestClient) -> None:
     asyncio.run(state.store_command("agent-a", {"type": "command", "requestId": "req-agent-filter-1", "action": "restart", "dir": "/srv/a"}))
     asyncio.run(state.store_command("agent-b", {"type": "command", "requestId": "req-agent-filter-2", "action": "restart", "dir": "/srv/b"}))
 
-    filtered_response = client.get("/api/commands", params={"agentId": "agent-a"})
+    filtered_response = client.get("/api/commands", params={"agentId": "agent-a"}, headers={"X-Admin-Token": "test-admin-token"})
 
     assert filtered_response.status_code == 200
     filtered_body = filtered_response.json()
@@ -424,6 +426,7 @@ def test_list_commands_tolerates_empty_query_values_after_agent_filter_cleanup(c
             "limit": "",
             "offset": "",
         },
+        headers={"X-Admin-Token": "test-admin-token"},
     )
 
     assert response.status_code == 200
@@ -444,7 +447,7 @@ def test_command_history_is_paginated_with_agent_filter(client: TestClient) -> N
     asyncio.run(state.store_command("agent-b", {"type": "command", "requestId": "req-2", "action": "restart", "dir": "/srv/b"}, requested_by="platform-api", request_source="ops-console"))
     asyncio.run(state.mark_result("req-2", "success", message="done"))
 
-    response = client.get("/api/commands", params={"agentId": "agent-a", "status": "failed"})
+    response = client.get("/api/commands", params={"agentId": "agent-a", "status": "failed"}, headers={"X-Admin-Token": "test-admin-token"})
 
     assert response.status_code == 200
     body = response.json()
@@ -474,7 +477,7 @@ def test_retry_failed_command_creates_new_command_and_audit_event(client: TestCl
     assert body["command"]["retryCount"] == 1
     assert fake_socket.messages[0]["requestId"] == body["command"]["requestId"]
 
-    events_response = client.get("/api/commands/req-1/events")
+    events_response = client.get("/api/commands/req-1/events", headers={"X-Admin-Token": "test-admin-token"})
     assert events_response.status_code == 200
     event_types = [item["eventType"] for item in events_response.json()]
     assert "retry" in event_types
@@ -536,6 +539,7 @@ def test_stream_agent_logs_returns_sse_events(client: TestClient) -> None:
         "POST",
         "/api/agents/agent-a/logs/stream",
         headers={
+            "X-Admin-Token": "test-admin-token",
             "X-Requested-By": "ops-console",
             "X-Requested-Source": "manual-operation",
         },
@@ -584,6 +588,7 @@ def test_stream_agent_logs_returns_stream_error_event(client: TestClient) -> Non
     with client.stream(
         "POST",
         "/api/agents/agent-a/logs/stream",
+        headers={"X-Admin-Token": "test-admin-token"},
         json={"dir": "/srv/a"},
     ) as response:
         body = "".join(response.iter_text())
