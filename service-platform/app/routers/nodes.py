@@ -216,25 +216,66 @@ def _resolve_service(agent_id: str, service_code: str) -> Service:
     return svc_rows[0]
 
 
-def _derive_health_base_url(agent_id: str, nacos_service_name: str | None) -> str:
-    """优雅 stop / redeploy 的 healthBaseUrl 派生(单 drain 近似)。
+def _compose_default_project(dir_: str | None) -> str | None:
+    """从 compose 目录推 Docker **默认**工程名:目录 basename → 小写 → 仅留 [a-z0-9_-] → 去前导非字母数字。
+
+    Docker Compose 在未设 `COMPOSE_PROJECT_NAME` / `-p` 时,默认工程名取自工作目录 basename,
+    并做规范化(转小写、剔除非 `[a-z0-9_-]`、去掉开头的非 `[a-z0-9]` 字符)。本函数复刻该启发式,
+    供优雅 drain 把它作为 `expectedComposeProject` 传给 agent 做工程对齐(评审 #11)。
+
+    ⚠️ 启发式取舍(评审 #11 注明):仅在部署**沿用 compose 默认工程名**时准确。若部署用
+    `COMPOSE_PROJECT_NAME` 或 `-p` 覆盖了工程名,这里推出来的值会与容器实际 compose project 不符,
+    导致 agent 守卫把本机容器也置 `matched=False` → 优雅 drain 因「无本机 matched 实例」回 409。
+    这是 **fail-safe(宁拒不误 drain)**:拒绝总比 drain 错节点安全,运维改用 force 即可。`dir_`
+    为空时返回 None(不带 expectedComposeProject,优雅路径随后会因缺 nacos 等早返)。
+    """
+    if not dir_:
+        return None
+    # 兼容 Windows / POSIX 分隔符,去尾部斜杠后取最后一段(basename)。
+    base = dir_.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
+    # 仅保留 [a-z0-9_-](已小写;限 ASCII 字母数字,避免非 ASCII 字母被 isalnum 放过)。
+    kept = "".join(ch for ch in base if (ch.isascii() and ch.isalnum()) or ch in "_-")
+    # 去掉前导非字母数字(Docker 默认工程名规范化要求开头必须是 [a-z0-9])。
+    start = 0
+    while start < len(kept) and not (kept[start].isascii() and kept[start].isalnum()):
+        start += 1
+    return kept[start:] or None
+
+
+def _derive_health_base_url(agent_id: str, nacos_service_name: str | None, dir_: str | None) -> str:
+    """优雅 stop / redeploy 的 healthBaseUrl 派生(只选**本机** matched 健康实例)。
 
     `nacos_service_name` 缺失 → 400(优雅操作需配置 nacosServiceName);经 hub
-    `list_instances` 取实例,无健康实例 → 409(请用 force);否则取**第一个**健康实例的
-    address 拼 `http://<addr>`。
+    `list_instances`(带从 `dir_` 推得的 `expectedComposeProject`)取实例,**过滤 healthy 且
+    matched** 后无实例 → 409(请用 force);否则取过滤后**第一个**实例的 address 拼 `http://<addr>`。
 
-    ⚠️ 近似性说明(评审已知):compose `stop` 是**目录级**(停该 compose 项目下全部容器),
-    而这里只 drain 第一个健康实例的 worker。多实例同目录场景下,其余实例不会被逐一 drain
-    即随目录一起停 —— 这是 P1 可接受的近似(真正逐实例零中断走 restart+graceful 的 rolling
-    路径)。`list_instances` 失败由调用方的 502 兜底捕获。
+    ⚠️ 为什么必须 matched(评审 #3/multi-node):nacos 是**集群级**注册中心,`healthy` 实例可能在
+    **别的节点**;agent 恒置 `healthy=True`,只有 `matched` 反映「该容器在**本机**找到(端口/IP 匹配,
+    且 compose 工程对齐)」。若不看 matched 而取第 0 个 healthy,可能 drain 了别节点的 worker,再
+    compose stop 本节点目录 → 本节点没排空就停、别节点被无故 drain。故这里只选本机 matched 实例;
+    全无本机 matched 实例时拒绝(409),让调用方改用 force(force 是目录级,不依赖按实例 drain)。
+
+    ⚠️ 单 drain 近似(评审已知):compose `stop` 是**目录级**(停该 compose 项目下全部容器),
+    而这里只 drain 第一个本机健康实例的 worker。多本机实例同目录场景下,其余实例随目录一起停,不逐一
+    drain —— P1 可接受的近似(真正逐实例零中断走 restart+graceful 的 rolling 路径)。`list_instances`
+    失败由调用方的 502 兜底捕获。
     """
     if not nacos_service_name:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "优雅操作需配置 nacosServiceName")
-    r = hub_client.list_instances(agent_id, nacos_service_name)
-    healthy = [i for i in (r.get("instances") or []) if isinstance(i, dict) and i.get("healthy")]
-    if not healthy:
-        raise HTTPException(status.HTTP_409_CONFLICT, "无健康实例可优雅 drain;请用 force")
-    return f"http://{healthy[0]['address']}"
+    # 把 dir 推得的 compose 默认工程名作为 expected 传下去:matched 由此同时校验「本机 + 同 compose 工程」。
+    expected_project = _compose_default_project(dir_)
+    r = hub_client.list_instances(agent_id, nacos_service_name, expected_compose_project=expected_project)
+    # 评审 #3:只选 healthy **且** matched(本机)的实例;别节点(matched=False)的 healthy 实例一律排除。
+    local_healthy = [
+        i
+        for i in (r.get("instances") or [])
+        if isinstance(i, dict) and i.get("healthy") and i.get("matched")
+    ]
+    if not local_healthy:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "本节点无可 drain 的本机健康实例(优雅操作需本机实例,或改用 force)"
+        )
+    return f"http://{local_healthy[0]['address']}"
 
 
 @router.post(
@@ -281,7 +322,7 @@ async def dispatch_node_action(
         elif action == "stop" and effective_mode == "force":
             payload.update(action="stop", mode="force", serviceName=nacos, allowLastInstance=body.allow_last_instance)
         elif action == "stop":  # graceful stop
-            health_base_url = _derive_health_base_url(agent_id, nacos)
+            health_base_url = _derive_health_base_url(agent_id, nacos, dir_)
             payload.update(action="stop", mode="graceful", healthBaseUrl=health_base_url, shutdownTimeoutSec=_GRACEFUL_SHUTDOWN_TIMEOUT_SEC, serviceName=nacos)
         elif action == "redeploy" and effective_mode == "force":
             if not default_image:
@@ -290,7 +331,7 @@ async def dispatch_node_action(
         else:  # redeploy graceful
             if not default_image:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, "重部署需配置 defaultImage")
-            health_base_url = _derive_health_base_url(agent_id, nacos)
+            health_base_url = _derive_health_base_url(agent_id, nacos, dir_)
             payload.update(action="pull-redeploy", mode="graceful", image=default_image, healthBaseUrl=health_base_url, shutdownTimeoutSec=_GRACEFUL_SHUTDOWN_TIMEOUT_SEC)
 
         resp = hub_client.dispatch_command(agent_id, payload)

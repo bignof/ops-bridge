@@ -245,8 +245,40 @@ def test_list_instances(monkeypatch) -> None:
     assert out["status"] == "success"
     assert calls["url"] == "http://hub:8080/api/agents/a1/list-instances"
     assert calls["headers"]["X-Admin-Token"] == "T"
-    assert calls["json"] == {"serviceName": "svc-nacos"}
+    assert calls["json"] == {"serviceName": "svc-nacos"}  # 未传 expected → body 不带该字段(旧行为)
     assert calls["timeout"] == 5.0  # 短超时(默认),保证节点页响应
+
+
+def test_list_instances_passes_expected_compose_project(monkeypatch) -> None:
+    # 评审 #11:传 expected_compose_project(非空)→ body 带 expectedComposeProject(触发 agent 工程漂移守卫)。
+    calls: dict = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002
+        calls["json"] = json
+        return _Resp({"status": "success", "instances": []})
+
+    monkeypatch.setattr(hc, "settings", _fake_settings())
+    monkeypatch.setattr(hc.httpx, "post", fake_post)
+
+    hc.list_instances("a1", "svc-nacos", expected_compose_project="my_proj")
+    assert calls["json"] == {"serviceName": "svc-nacos", "expectedComposeProject": "my_proj"}
+
+
+def test_list_instances_empty_expected_compose_project_omitted(monkeypatch) -> None:
+    # 评审 #11:expected 为空串/None → 不带该字段(避免空值污染 body / 误触守卫)。
+    calls: dict = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002
+        calls["json"] = json
+        return _Resp({"status": "success", "instances": []})
+
+    monkeypatch.setattr(hc, "settings", _fake_settings())
+    monkeypatch.setattr(hc.httpx, "post", fake_post)
+
+    hc.list_instances("a1", "svc-nacos", expected_compose_project="")
+    assert calls["json"] == {"serviceName": "svc-nacos"}  # 空串不带
+    hc.list_instances("a1", "svc-nacos", expected_compose_project=None)
+    assert calls["json"] == {"serviceName": "svc-nacos"}  # None 不带
 
 
 def test_list_instances_custom_timeout(monkeypatch) -> None:

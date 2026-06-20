@@ -97,12 +97,23 @@ def list_agents() -> list[dict]:
     return r.json()
 
 
-def list_instances(agent_id: str, service_name: str, timeout: float = 5.0) -> dict:
-    """经指定 Agent 查询某 service 当前容器实例(含健康状态),供节点页算健康实例数。
+def list_instances(
+    agent_id: str,
+    service_name: str,
+    expected_compose_project: str | None = None,
+    timeout: float = 5.0,
+) -> dict:
+    """经指定 Agent 查询某 service 当前容器实例(含健康状态),供节点页算健康实例数 / 优雅 drain 选实例。
 
-    `POST {hub}/api/agents/{agentId}/list-instances`,body `{serviceName}`,返回
-    hub `ListInstancesResponse`(`{status, instances}`;instances 各项含 `address` /
-    `containerId` / `healthy` / `matched` / `composeProject`,见 T9a `commands.py`)。
+    `POST {hub}/api/agents/{agentId}/list-instances`,body `{serviceName}`(可选
+    `expectedComposeProject`),返回 hub `ListInstancesResponse`(`{status, instances}`;
+    instances 各项含 `address` / `containerId` / `healthy` / `matched` / `composeProject`,
+    见 T9a `commands.py`)。
+
+    `expected_compose_project`(评审 #11/contract):非空时随 body 传 `expectedComposeProject`,
+    触发 agent 的 compose 工程漂移守卫——容器实际 compose project 与之不符时 agent 置
+    `matched=False`。BFF 优雅 drain 据此把 matched 收窄为「本机 + 同 compose 工程」(否则该守卫
+    永不触发,inert)。为 None 时不带该字段(保持节点列表 healthyCount fan-out 的旧行为不变)。
 
     `timeout` 故意**短**(默认 5s):节点页对每行并发 fan-out 调本函数,单 agent/nacos 卡死
     必须被这层短超时截断,配合路由层 `gather(return_exceptions=True)` 把该行标 degraded,
@@ -114,10 +125,13 @@ def list_instances(agent_id: str, service_name: str, timeout: float = 5.0) -> di
     """
     if not settings.service_hub_url:
         raise HubError("SERVICE_HUB_URL 未配置")
+    body: dict[str, str] = {"serviceName": service_name}
+    if expected_compose_project:  # 非空才带(为 None/空串时保持旧 body,不影响节点列表 fan-out)
+        body["expectedComposeProject"] = expected_compose_project
     r = httpx.post(
         f"{settings.service_hub_url}/api/agents/{quote(agent_id, safe='')}/list-instances",
         headers=_headers(),
-        json={"serviceName": service_name},
+        json=body,
         timeout=timeout,
     )
     r.raise_for_status()

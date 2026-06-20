@@ -58,11 +58,30 @@ def _agent(agent_id: str, *, online: bool = True, last_seen: str = "2026-06-21T0
 
 
 def _instances(*healthy_flags: bool) -> dict:
-    """造一条 list_instances 成功响应:instances 数组按 healthy 标记生成。"""
+    """造一条 list_instances 成功响应:instances 数组按 healthy 标记生成。
+
+    instances 各项默认 `matched=True`(= 本机实例),供节点列表 healthyCount 用例使用
+    (列表只看 healthy,matched 对其无影响)。优雅 drain 用例需要区分本机/别节点时,
+    直接内联构造 instances 显式给 matched(见下方 stop/redeploy graceful 用例)。
+    """
     return {
         "status": "success",
-        "instances": [{"address": f"10.0.0.{i}", "healthy": h} for i, h in enumerate(healthy_flags)],
+        "instances": [{"address": f"10.0.0.{i}", "healthy": h, "matched": True} for i, h in enumerate(healthy_flags)],
     }
+
+
+def test_compose_default_project_normalization() -> None:
+    # 评审 #11:Docker 默认 compose 工程名启发式 = basename → 小写 → 仅留 [a-z0-9_-] → 去前导非字母数字。
+    f = nodes._compose_default_project
+    assert f("/opt/My_Svc-01") == "my_svc-01"  # 大写转小写
+    assert f("/opt/svc/") == "svc"  # 去尾部斜杠后取 basename
+    assert f("C:\\deploy\\Worker_A") == "worker_a"  # Windows 分隔符
+    assert f("/opt/a.b c!d") == "abcd"  # 剔除非 [a-z0-9_-](点/空格/感叹号)
+    assert f("/opt/__lead") == "lead"  # 去前导非字母数字(下划线开头被剥到首个字母)
+    assert f("/opt/-9x") == "9x"  # 前导连字符被剥,数字开头保留
+    assert f(None) is None  # 空 dir → None(不带 expectedComposeProject)
+    assert f("") is None
+    assert f("/opt/___") is None  # 规范化后为空 → None
 
 
 def test_nodes_basic_rows_and_fields(client: TestClient, monkeypatch) -> None:
@@ -427,23 +446,24 @@ def test_op_stop_force_dispatches_with_servicename_and_allowlast(client: TestCli
 
 
 def test_op_stop_graceful_derives_health_base_url(client: TestClient, monkeypatch) -> None:
-    # stop + graceful → list_instances 返 1 healthy → dispatch 含 healthBaseUrl=http://<addr> + mode=graceful
-    # + shutdownTimeoutSec=60 + serviceName。
+    # stop + graceful → list_instances 返「本机 matched 健康实例」→ dispatch 含 healthBaseUrl=http://<addr>
+    # + mode=graceful + shutdownTimeoutSec=60 + serviceName。
+    # 评审 #3/#11(同步更新):新过滤为「healthy 且 matched」,既有桩须补 matched=True 才能过新过滤。
     h = _h(client)
     ns = _mk_ns("agent-sg")
     _mk_svc(ns, "svc-sg", nacos="sg-nacos")
 
     box = {}
     monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch(box))
-    # 第一个 unhealthy、第二个 healthy → 应取第一个 healthy 的 address(10.0.0.1)
+    # 第一个 unhealthy、第二个 healthy(均本机 matched)→ 应取第一个 healthy 的 address(10.0.0.1)
     monkeypatch.setattr(
         nodes.hub_client,
         "list_instances",
         lambda agent_id, service_name, **kw: {
             "status": "success",
             "instances": [
-                {"address": "10.0.0.0", "healthy": False},
-                {"address": "10.0.0.1", "healthy": True},
+                {"address": "10.0.0.0", "healthy": False, "matched": True},
+                {"address": "10.0.0.1", "healthy": True, "matched": True},
             ],
         },
     )
@@ -456,6 +476,81 @@ def test_op_stop_graceful_derives_health_base_url(client: TestClient, monkeypatc
     assert p["serviceName"] == "sg-nacos"
     assert p["healthBaseUrl"] == "http://10.0.0.1"
     assert p["shutdownTimeoutSec"] == 60
+
+
+def test_op_stop_graceful_picks_matched_not_index_zero(client: TestClient, monkeypatch) -> None:
+    # 评审 #3(multi-node):healthy 实例可能在别节点(nacos 集群级,agent 恒置 healthy=True,
+    # 只有 matched 反映「本机有该容器」)。即便别节点实例排在前面,也必须 drain **本机 matched** 那个,
+    # 否则会 drain 别节点 worker、本节点没排空就停。断言 healthBaseUrl 指向 matched 实例(非第 0 个)。
+    h = _h(client)
+    ns = _mk_ns("agent-mx")
+    _mk_svc(ns, "svc-mx", nacos="mx-nacos")
+
+    box = {}
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch(box))
+    # 第 0 个:别节点(healthy 但 matched=False);第 1 个:本机(healthy 且 matched=True)。
+    monkeypatch.setattr(
+        nodes.hub_client,
+        "list_instances",
+        lambda agent_id, service_name, **kw: {
+            "status": "success",
+            "instances": [
+                {"address": "10.9.9.9", "healthy": True, "matched": False},  # 别节点,不可 drain
+                {"address": "10.0.0.5", "healthy": True, "matched": True},  # 本机
+            ],
+        },
+    )
+    resp = client.post("/api/nodes/agent-mx/svc-mx/stop", json={"mode": "graceful"}, headers=h)
+    assert resp.status_code == 200
+    # 选中的是本机 matched 实例,而非数组第 0 个(别节点)
+    assert box["payload"]["healthBaseUrl"] == "http://10.0.0.5"
+
+
+def test_op_stop_graceful_only_unmatched_409(client: TestClient, monkeypatch) -> None:
+    # 评审 #3:仅有 matched=False(别节点)健康实例 → 本节点无可 drain 的本机实例 → 409(改用 force)。
+    h = _h(client)
+    ns = _mk_ns("agent-um")
+    _mk_svc(ns, "svc-um", nacos="um-nacos")
+
+    monkeypatch.setattr(
+        nodes.hub_client,
+        "list_instances",
+        lambda *a, **k: {
+            "status": "success",
+            "instances": [{"address": "10.9.9.9", "healthy": True, "matched": False}],  # 仅别节点
+        },
+    )
+    monkeypatch.setattr(
+        nodes.hub_client, "dispatch_command", lambda *a, **k: (_ for _ in ()).throw(AssertionError("无本机实例不应 dispatch"))
+    )
+    resp = client.post("/api/nodes/agent-um/svc-um/stop", json={"mode": "graceful"}, headers=h)
+    assert resp.status_code == 409
+
+
+def test_op_stop_graceful_passes_expected_compose_project(client: TestClient, monkeypatch) -> None:
+    # 评审 #11(contract):BFF 须把由 Service.dir 推得的 compose 默认工程名作为 expectedComposeProject
+    # 传给 list_instances(否则 agent 的工程漂移守卫永不触发)。Docker 默认工程名 = 目录 basename
+    # 小写、仅留 [a-z0-9_-]、去前导非字母数字。dir=/opt/My_Svc-01 → 工程名 my_svc-01。
+    h = _h(client)
+    ns = _mk_ns("agent-ecp")
+    # 覆盖 _mk_svc 默认 dir,用带大写/混合字符的目录验证 basename 规范化
+    store.create_row(
+        Service,
+        {"namespace_id": ns, "service_code": "svc-ecp", "dir": "/opt/My_Svc-01", "default_image": "registry/x:1.0", "nacos_service_name": "ecp-nacos"},
+    )
+
+    captured = {}
+
+    def fake_list_instances(agent_id, service_name, expected_compose_project=None, **kw):
+        captured["expected"] = expected_compose_project
+        return {"status": "success", "instances": [{"address": "10.0.0.3", "healthy": True, "matched": True}]}
+
+    monkeypatch.setattr(nodes.hub_client, "list_instances", fake_list_instances)
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch({}))
+
+    resp = client.post("/api/nodes/agent-ecp/svc-ecp/stop", json={"mode": "graceful"}, headers=h)
+    assert resp.status_code == 200
+    assert captured["expected"] == "my_svc-01"  # 由 /opt/My_Svc-01 推得
 
 
 def test_op_stop_graceful_no_healthy_409(client: TestClient, monkeypatch) -> None:
@@ -523,10 +618,11 @@ def test_op_redeploy_graceful_derives_health_and_image(client: TestClient, monke
 
     box = {}
     monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch(box))
+    # 评审 #3/#11(同步更新):本机 matched 健康实例,才能过「healthy 且 matched」新过滤。
     monkeypatch.setattr(
         nodes.hub_client,
         "list_instances",
-        lambda *a, **k: {"status": "success", "instances": [{"address": "10.0.0.7", "healthy": True}]},
+        lambda *a, **k: {"status": "success", "instances": [{"address": "10.0.0.7", "healthy": True, "matched": True}]},
     )
     resp = client.post("/api/nodes/agent-rdg/svc-rdg/redeploy", json={"mode": "graceful"}, headers=h)
     assert resp.status_code == 200
@@ -568,6 +664,43 @@ def test_op_redeploy_graceful_no_default_image_400(client: TestClient, monkeypat
     )
     resp = client.post("/api/nodes/agent-rdgn/svc-rdgn/redeploy", json={"mode": "graceful"}, headers=h)
     assert resp.status_code == 400
+
+
+def test_op_stop_graceful_list_instances_failure_502(client: TestClient, monkeypatch) -> None:
+    # 评审 #8(test-integrity):优雅 stop 派生 healthBaseUrl 时 list_instances 抛错(hub 不可达/超时)
+    # → 被 dispatch 的 broad except 压平成脱敏 502;且派生失败**不得**继续下发(dispatch 不被调)。
+    h = _h(client)
+    ns = _mk_ns("agent-sgf")
+    _mk_svc(ns, "svc-sgf", nacos="sgf-nacos")
+
+    def boom(*a, **k):
+        raise hc.HubError("hub list-instances 内部细节-勿泄漏")
+
+    monkeypatch.setattr(nodes.hub_client, "list_instances", boom)
+    monkeypatch.setattr(
+        nodes.hub_client, "dispatch_command", lambda *a, **k: (_ for _ in ()).throw(AssertionError("派生失败不应 dispatch"))
+    )
+    resp = client.post("/api/nodes/agent-sgf/svc-sgf/stop", json={"mode": "graceful"}, headers=h)
+    assert resp.status_code == 502
+    assert "勿泄漏" not in resp.text  # 脱敏:不回显内部异常文案
+
+
+def test_op_redeploy_graceful_list_instances_timeout_502(client: TestClient, monkeypatch) -> None:
+    # 评审 #8:优雅 redeploy 派生 healthBaseUrl 时 list_instances 超时 → 脱敏 502 + dispatch 不被调。
+    h = _h(client)
+    ns = _mk_ns("agent-rgf")
+    _mk_svc(ns, "svc-rgf", nacos="rgf-nacos")
+
+    def boom(*a, **k):
+        raise httpx.TimeoutException("connect timeout 内部细节-勿泄漏")
+
+    monkeypatch.setattr(nodes.hub_client, "list_instances", boom)
+    monkeypatch.setattr(
+        nodes.hub_client, "dispatch_command", lambda *a, **k: (_ for _ in ()).throw(AssertionError("派生失败不应 dispatch"))
+    )
+    resp = client.post("/api/nodes/agent-rgf/svc-rgf/redeploy", json={"mode": "graceful"}, headers=h)
+    assert resp.status_code == 502
+    assert "勿泄漏" not in resp.text
 
 
 def test_op_redeploy_requires_mode(client: TestClient) -> None:
@@ -724,6 +857,30 @@ def test_node_operations_truncates_output(client: TestClient, monkeypatch) -> No
     assert len(row["output"]) < len(long_out)  # 确实被截短
     assert row["error"].endswith("E" * 1000)
     assert "已截断" in row["error"]
+
+
+def test_node_operations_truncate_boundary(client: TestClient, monkeypatch) -> None:
+    # 评审 #9(test-integrity):截尾边界。恰 1000 字符(== 上限)→ 原样返回、不加「已截断」;
+    # 1001 字符(> 上限)→ 被截、含前缀标记。
+    h = _h(client)
+    exact = "X" * 1000  # 恰好等于 _AUDIT_FIELD_MAX,不应截
+    over = "Y" * 1001  # 超 1 字符,应截
+
+    monkeypatch.setattr(
+        nodes.hub_client,
+        "list_commands",
+        lambda page, page_size, **kw: _hub_commands(
+            total=1, items=[_cmd_row("cb", output=exact, error=over)], limit=page_size, offset=0
+        ),
+    )
+    row = client.get("/api/node-operations", headers=h).json()["rows"][0]
+    # == 上限:原样、长度不变、无前缀
+    assert row["output"] == exact
+    assert len(row["output"]) == 1000
+    assert "已截断" not in row["output"]
+    # > 上限:被截、保留末尾 1000、含前缀
+    assert "已截断" in row["error"]
+    assert row["error"].endswith("Y" * 1000)
 
 
 def test_node_operations_hub_failure_502(client: TestClient, monkeypatch) -> None:
