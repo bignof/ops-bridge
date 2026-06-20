@@ -146,6 +146,34 @@ jobs:
       - name: Build Docker image
         run: docker build -t service-platform:ci .
 
+  service-platform-web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: service-platform/web
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build SPA
+        run: npm run build
+
   phase1-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 30

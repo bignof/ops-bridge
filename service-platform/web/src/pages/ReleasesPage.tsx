@@ -12,7 +12,7 @@ import { CloudUploadOutlined } from '@ant-design/icons';
 import * as resources from '../api/resources';
 
 // 发布行记录(对齐 P1a `releases` list 契约,全 camelCase)。
-// 列全部用后端 LEFT JOIN 回的可读名(namespaceCode/serviceName/pluginCode/version),不客户端拼 id→名。
+// 列全部用后端 LEFT JOIN 回的可读名(namespaceCode/serviceCode/pluginCode/version),不客户端拼 id→名。
 // isActive / isRolledBack:enum 'yes' | 'no'(基线 §6 / §10),用 Tag 标色。
 // serviceId / pluginId:行操作(历史版本 / 回滚)定位用;主表行即「当前 active 行」。
 interface ReleaseRow {

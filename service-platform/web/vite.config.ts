@@ -17,10 +17,18 @@ export default defineConfig({
     },
   },
   build: {
-    // TODO(Task 7): 构建集成时把 outDir 指向被 FastAPI StaticFiles 托管的目录
-    // (计划二选一:① 直接 outDir 到 ../app/static;② 保持默认 dist,由 Dockerfile
-    //  多阶段 COPY web/dist -> app/static)。本任务暂用默认 'dist',不锁定方案。
-    outDir: 'dist',
+    // Task 7 锁定方案①:产物直接落到 FastAPI StaticFiles 托管目录 `../app/static`,
+    // 本地 `npm run build` 即就位(无需 docker 拷贝),uvicorn 起服务即可托管 SPA。
+    // Dockerfile 多阶段则仍 COPY web/dist→app/static(node 阶段 outDir 仍是相对 /web 的
+    // `../app/static` 会落到镜像内不可控位置,故镜像内构建用默认 dist 再 COPY,见 Dockerfile 注释)。
+    outDir: '../app/static',
+    // 清空旧产物,避免上次构建残留文件混入(StaticFiles 会原样托管)。
+    emptyOutDir: true,
+    // ⚠️ CSP 关键:关掉 modulepreload polyfill。Vite 默认会向 index.html 注入一段**内联**
+    // <script> polyfill,会被 `script-src 'self'`(不放 unsafe-inline)直接挡掉 → 白屏。
+    // 现代浏览器(Chrome/Edge/Firefox/Safari)均原生支持 modulepreload,本控制台为内网
+    // 运维 admin,关掉 polyfill 安全且使产物**零内联脚本**,与 CSP 严格策略相容。
+    modulePreload: { polyfill: false },
   },
   test: {
     globals: true,
