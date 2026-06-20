@@ -100,3 +100,61 @@ export async function uploadPluginVersion(file: File): Promise<UploadPluginVersi
 export async function listPluginVersions<T>(params: ListParams = {}): Promise<ListEnvelope<T>> {
   return list<T>('plugin-versions', params);
 }
+
+// ── 插件发布(releases,旧 t_service_plugin_version) ────────────────────────────
+// 发布主表 + 历史版本 + 重新激活 + 回滚。P1a `GET /api/releases` 单端点服务两种视图:
+//  - 不传 filter   → 每绑定当前 active 行(主表视图,后端按 isActive=yes 聚合)。
+//  - 传 serviceId+pluginId → 该 service+plugin 的全部 spv 历史(历史抽屉视图)。
+// 写动作走 /api/releases/{publish,reactivate,rollback}。
+
+/** 发布请求体(三 id 定位:服务 + 插件 + 该插件的某版本)。 */
+export interface PublishReleaseParams {
+  serviceId: string | number;
+  pluginId: string | number;
+  pluginVersionId: string | number;
+}
+
+/**
+ * 发布:POST /api/releases/publish(body `{serviceId, pluginId, pluginVersionId}`)。
+ * 旧 `pluginPublisher`:校验绑定存在 + 版本未发过(已发过提示去历史版本),全灭活后新建 isActive 行。
+ */
+export async function publish<T = unknown>(params: PublishReleaseParams): Promise<T> {
+  const r = await client.post<T>('/api/releases/publish', params);
+  return r.data;
+}
+
+/**
+ * 重新激活历史版本:POST /api/releases/reactivate(body `{spvId}`)。
+ * 旧 `updateVersion`(实读=把目标历史 spv 置为唯一 active + 刷新 publishTime),非编辑。
+ */
+export async function reactivate<T = unknown>(params: { spvId: string | number }): Promise<T> {
+  const r = await client.post<T>('/api/releases/reactivate', params);
+  return r.data;
+}
+
+/**
+ * 回滚:POST /api/releases/rollback(body `{spvId}`)。
+ * 旧 `pluginRollback`:当前 active 版回滚到上一未回滚版本;非 active 版报「无需回滚」。
+ */
+export async function rollback<T = unknown>(params: { spvId: string | number }): Promise<T> {
+  const r = await client.post<T>('/api/releases/rollback', params);
+  return r.data;
+}
+
+/**
+ * 发布主表(服务端分页,统一信封):GET /api/releases(**不传 filter**)。
+ * 后端按 isActive=yes 回每个 service+plugin 绑定当前激活的那一行。
+ */
+export async function listReleases<T>(params: ListParams = {}): Promise<ListEnvelope<T>> {
+  return list<T>('releases', params);
+}
+
+/**
+ * 历史版本(服务端过滤):GET /api/releases?serviceId=&pluginId=。
+ * 取该 service+plugin 的**全部 spv 历史**(不止 active),供历史抽屉展示 + 重新激活。
+ */
+export async function listReleaseHistory<T>(
+  params: { serviceId: string | number; pluginId: string | number } & ListParams,
+): Promise<ListEnvelope<T>> {
+  return list<T>('releases', params);
+}

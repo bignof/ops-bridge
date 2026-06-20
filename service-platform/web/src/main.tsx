@@ -15,6 +15,7 @@ const ServicesPage = lazy(() => import('./pages/ServicesPage'));
 const PluginsPage = lazy(() => import('./pages/PluginsPage'));
 const ServicePluginsPage = lazy(() => import('./pages/ServicePluginsPage'));
 const PluginUploadPage = lazy(() => import('./pages/PluginUploadPage'));
+const ReleasesPage = lazy(() => import('./pages/ReleasesPage'));
 
 // 懒加载页面统一的 Suspense fallback(居中 loading)。
 const lazyPage = (node: React.ReactNode) => (
@@ -47,6 +48,7 @@ const router = createHashRouter([
       { path: 'plugins', element: lazyPage(<PluginsPage />) },
       { path: 'service-plugins', element: lazyPage(<ServicePluginsPage />) },
       { path: 'plugin-upload', element: lazyPage(<PluginUploadPage />) },
+      { path: 'releases', element: lazyPage(<ReleasesPage />) },
     ],
   },
 ]);
