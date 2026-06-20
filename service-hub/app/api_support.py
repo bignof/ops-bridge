@@ -176,6 +176,22 @@ def _require_admin_token(admin_token: str | None) -> None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid admin token")
 
 
+# 服务端据 admin token 派生的固定审计身份(单 admin 模型)。
+PLATFORM_ADMIN_IDENTITY = "platform-admin"
+
+
+def _derive_requested_by(admin_token: str | None) -> str:
+    """据 admin token 服务端派生 requested_by(审计权威身份)。
+
+    安全:requested_by 决不能信客户端自报的 X-Requested-By 头——任何持 hub admin token 的
+    调用方都能伪造。本函数据 token 派生真实身份,由调用方强制覆盖客户端值。
+
+    当前为单 admin 模型(settings.admin_token),token 已由 _require_admin_token 在调用前校验
+    通过(非法即 403),故此处直接返回固定常量。函数独立存在是为将来多 token 各自映射身份留位。
+    """
+    return PLATFORM_ADMIN_IDENTITY
+
+
 async def _build_command_list_response(
     *,
     agent_id: str | None,

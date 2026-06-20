@@ -357,7 +357,7 @@ def test_dispatch_command_success_includes_image(monkeypatch: pytest.MonkeyPatch
             request=request,
             agent_id="agent-a",
             admin_token=main_module.settings.admin_token,
-            requested_by=None,
+            requested_by_hint=None,  # 形参随服务端派生改名(X-Requested-By 仅作 hint)
             request_source=None,
         )
     )

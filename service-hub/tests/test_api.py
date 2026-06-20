@@ -240,13 +240,79 @@ def test_dispatch_command_creates_record_and_returns_expected_payload(client: Te
     body = response.json()
     assert body["accepted"] is True
     assert body["command"]["requestId"] == "req-dispatch-1"
-    assert body["command"]["requestedBy"] == "platform-api"
+    # requested_by 由 hub 据 admin token 服务端派生(X-Requested-By 仅作 hint,不再原样落库)
+    assert body["command"]["requestedBy"] == "platform-admin"
+    # request_source 维持客户端 X-Requested-Source 原样(本次范围不动)
     assert body["command"]["requestSource"] == "ops-console"
     assert socket.messages[0]["requestId"] == "req-dispatch-1"
 
     get_response = client.get("/api/commands/req-dispatch-1", headers={"X-Admin-Token": "test-admin-token"})
     assert get_response.status_code == 200
     assert get_response.json()["requestId"] == "req-dispatch-1"
+
+
+def test_dispatch_derives_requested_by_from_admin_token_ignoring_client_header(
+    client: TestClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # 安全:客户端自报的 X-Requested-By 不可信,requested_by 必须由 hub 据 admin token 服务端派生。
+    # 持有合法 admin token 的调用方即便伪造 X-Requested-By: attacker,落库的 requested_by 也应是派生身份。
+    import app.main as main_module
+
+    state = main_module.hub_state
+    attach_agent(state, "agent-a")
+
+    with caplog.at_level("INFO", logger="app.main"):
+        response = client.post(
+            "/api/agents/agent-a/commands",
+            headers={
+                "X-Admin-Token": "test-admin-token",
+                "X-Requested-By": "attacker",
+            },
+            json={
+                "requestId": "req-derive-1",
+                "action": "restart",
+                "dir": "/srv/a",
+            },
+        )
+
+    assert response.status_code == 202
+    # 响应体即为落库结果:requested_by 是派生身份而非客户端伪造值
+    assert response.json()["command"]["requestedBy"] == "platform-admin"
+
+    # 读回 GET /api/commands/{id} 二次确认持久化的是派生值,不是 "attacker"
+    get_response = client.get("/api/commands/req-derive-1", headers={"X-Admin-Token": "test-admin-token"})
+    assert get_response.status_code == 200
+    assert get_response.json()["requestedBy"] == "platform-admin"
+
+    # 客户端自报值仅作 hint 记入日志(便于审计追溯),但不作权威、不入 requested_by
+    assert any("attacker" in record.getMessage() for record in caplog.records)
+
+
+def test_retry_derives_requested_by_from_admin_token_ignoring_client_header(client: TestClient) -> None:
+    # retry 同理:重试生成的新命令 requested_by 也必须是派生身份,忽略客户端 X-Requested-By
+    import app.main as main_module
+
+    state = main_module.hub_state
+    fake_socket = attach_agent(state, "agent-a")
+    asyncio.run(state.store_command("agent-a", {"type": "command", "requestId": "req-retry-src", "action": "restart", "dir": "/srv/a"}))
+    asyncio.run(state.mark_result("req-retry-src", "failed", error="boom"))
+
+    response = client.post(
+        "/api/commands/req-retry-src/retry",
+        headers={
+            "X-Admin-Token": "test-admin-token",
+            "X-Requested-By": "attacker",
+        },
+    )
+
+    assert response.status_code == 202
+    new_request_id = response.json()["command"]["requestId"]
+    assert response.json()["command"]["requestedBy"] == "platform-admin"
+
+    get_response = client.get(f"/api/commands/{new_request_id}", headers={"X-Admin-Token": "test-admin-token"})
+    assert get_response.status_code == 200
+    assert get_response.json()["requestedBy"] == "platform-admin"
 
 
 def test_dispatch_requires_admin_token(client: TestClient) -> None:
