@@ -24,3 +24,13 @@ def match_instance(instance, containers):
         if ip in _bridge_ips(c):
             return c
     return None
+
+
+def compose_project(container):
+    """读容器 docker inspect 的 com.docker.compose.project label（compose 工程名）。
+
+    供上层把 nacos 实例落到的容器工程名与 Service.dir 推得的工程名比对：
+    优雅操作按 containerId（实例级），force compose 按目录（工程级），两套寻址
+    必须指向同一组容器，否则寻址漂移、危险。Config / Labels / 键任一层缺失返回 None。
+    """
+    return ((container.get("Config") or {}).get("Labels") or {}).get("com.docker.compose.project")

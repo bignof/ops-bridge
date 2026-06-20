@@ -17,6 +17,15 @@ class FakeWS:
         self.sent.append(json.loads(payload))
 
 
+def _container(cid, host_port, project=None):
+    """构造一个带宿主端口、可选 compose project label 的 docker inspect 容器。"""
+    c = {"Id": cid, "NetworkSettings":
+         {"Ports": {"80/tcp": [{"HostPort": str(host_port)}]}, "Networks": {}}}
+    if project is not None:
+        c["Config"] = {"Labels": {"com.docker.compose.project": project}}
+    return c
+
+
 def test_list_instances_success(monkeypatch):
     monkeypatch.setattr(nacos_client, "list_healthy_instances",
                         lambda s: [{"ip": "192.168.0.30", "port": 18029}])
@@ -27,8 +36,53 @@ def test_list_instances_success(monkeypatch):
     rolling.handle_list_instances(ws, {"requestId": "r1", "serviceName": "memory-share"})
     msg = ws.sent[-1]
     assert msg["type"] == "list-instances-result" and msg["status"] == "success"
+    # 未传 expectedComposeProject：向后兼容；容器无 label → composeProject=None，matched 仍按端口
     assert msg["instances"] == [{"address": "192.168.0.30:18029",
-                                 "containerId": "abcdef123456", "healthy": True, "matched": True}]
+                                 "containerId": "abcdef123456", "healthy": True,
+                                 "matched": True, "composeProject": None}]
+
+
+def test_list_instances_includes_compose_project(monkeypatch):
+    # 不传 expected：每实例带回容器的 compose project label，matched 仍按端口/IP（向后兼容）
+    monkeypatch.setattr(nacos_client, "list_healthy_instances",
+                        lambda s: [{"ip": "192.168.0.30", "port": 18029}])
+    monkeypatch.setattr(docker_cli, "list_running_containers",
+                        lambda: [_container("abcdef1234567890", 18029, project="memory-share-1")])
+    ws = FakeWS()
+    rolling.handle_list_instances(ws, {"requestId": "r1", "serviceName": "memory-share"})
+    inst = ws.sent[-1]["instances"][0]
+    assert inst["composeProject"] == "memory-share-1"
+    assert inst["matched"] is True
+
+
+def test_list_instances_expected_project_mismatch_unmatched(monkeypatch):
+    # 传 expectedComposeProject 且容器 project 不符 → 寻址漂移，matched=False（composeProject 仍如实回传）
+    monkeypatch.setattr(nacos_client, "list_healthy_instances",
+                        lambda s: [{"ip": "192.168.0.30", "port": 18029}])
+    monkeypatch.setattr(docker_cli, "list_running_containers",
+                        lambda: [_container("abcdef1234567890", 18029, project="other-project")])
+    ws = FakeWS()
+    rolling.handle_list_instances(ws, {"requestId": "r1", "serviceName": "memory-share",
+                                       "expectedComposeProject": "memory-share-1"})
+    inst = ws.sent[-1]["instances"][0]
+    assert inst["matched"] is False
+    assert inst["composeProject"] == "other-project"
+    # 端口命中，容器仍可寻址，故 containerId 照常带回（供上层定位漂移容器）
+    assert inst["containerId"] == "abcdef123456"
+
+
+def test_list_instances_expected_project_match(monkeypatch):
+    # 传 expectedComposeProject 且相符 → matched=True
+    monkeypatch.setattr(nacos_client, "list_healthy_instances",
+                        lambda s: [{"ip": "192.168.0.30", "port": 18029}])
+    monkeypatch.setattr(docker_cli, "list_running_containers",
+                        lambda: [_container("abcdef1234567890", 18029, project="memory-share-1")])
+    ws = FakeWS()
+    rolling.handle_list_instances(ws, {"requestId": "r1", "serviceName": "memory-share",
+                                       "expectedComposeProject": "memory-share-1"})
+    inst = ws.sent[-1]["instances"][0]
+    assert inst["matched"] is True
+    assert inst["composeProject"] == "memory-share-1"
 
 
 def test_list_instances_unmatched_flagged(monkeypatch):
@@ -39,6 +93,7 @@ def test_list_instances_unmatched_flagged(monkeypatch):
     rolling.handle_list_instances(ws, {"requestId": "r1", "serviceName": "svc"})
     inst = ws.sent[-1]["instances"][0]
     assert inst["matched"] is False and inst["containerId"] is None
+    assert inst["composeProject"] is None
 
 
 def test_list_instances_failure(monkeypatch):

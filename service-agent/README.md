@@ -223,7 +223,8 @@ INFO - Health server listening on http://0.0.0.0:18081/health
 {
   "type": "list-instances",
   "requestId": "req-123",
-  "serviceName": "memory-share"
+  "serviceName": "memory-share",
+  "expectedComposeProject": "memory-share-1"
 }
 ```
 
@@ -232,6 +233,7 @@ INFO - Health server listening on http://0.0.0.0:18081/health
 | `type`        | string | ✅   | 固定为 `"list-instances"`  |
 | `requestId`   | string | ✅   | 请求唯一 ID，原样返回      |
 | `serviceName` | string | ✅   | 要查询的 Nacos 服务名      |
+| `expectedComposeProject` | string | ❌ | 期望的 compose 工程名（由 `Service.dir` 推得）；传则做寻址漂移校验，容器工程名不符的实例标 `matched=false`。不传则不校验（向后兼容） |
 
 Agent 回复 `list-instances-result`：
 
@@ -241,7 +243,7 @@ Agent 回复 `list-instances-result`：
   "requestId": "req-123",
   "status": "success",
   "instances": [
-    { "address": "192.168.0.30:18029", "containerId": "abcdef123456", "healthy": true, "matched": true }
+    { "address": "192.168.0.30:18029", "containerId": "abcdef123456", "healthy": true, "matched": true, "composeProject": "memory-share-1" }
   ]
 }
 ```
@@ -252,9 +254,12 @@ Agent 回复 `list-instances-result`：
 | `instances[].address`   | string  | Nacos 上报的 `ip:port`                                              |
 | `instances[].containerId` | string\|null | 与该实例匹配上的本机容器短 ID；未匹配为 `null`                |
 | `instances[].healthy`   | boolean | Nacos 视角是否健康（已过滤，恒 `true`）                            |
-| `instances[].matched`   | boolean | 是否在本机找到对应的运行中容器                                      |
+| `instances[].matched`   | boolean | 是否在本机找到对应的运行中容器；传了 `expectedComposeProject` 且容器工程名不符时为 `false`（寻址漂移） |
+| `instances[].composeProject` | string\|null | 匹配容器的 `com.docker.compose.project` label；未匹配或容器无该 label 为 `null`。供上层与 `Service.dir` 推得的工程名比对 |
 
 失败时回 `{ "status": "failed", "error": "..." }`（error 已对 `accessToken` 脱敏）。
+
+> **为什么要校验工程名**：优雅操作是实例级（按 `containerId`，经 nacos serviceName 匹配），force compose 是目录级（按 `Service.dir` 作用该目录全部容器）。若某 service 的 nacos 实例容器与 `Service.dir` 推得的 compose 工程不是同一组容器，优雅与 force 会作用到不同容器，危险。`composeProject` / `matched` 让上层（BFF/hub）据此拒绝漂移实例。
 
 ### 服务端 → Agent（滚动重启：优雅重启单个容器）
 

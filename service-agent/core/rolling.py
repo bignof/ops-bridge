@@ -5,7 +5,7 @@ import time
 from core.graceful import _validate_health_base_url
 from core.handlers import send_message
 from services import docker_cli, http_client, nacos_client
-from services.instance_match import match_instance
+from services.instance_match import compose_project, match_instance
 
 logger = logging.getLogger(__name__)
 
@@ -24,17 +24,27 @@ def _redact(text):
 def handle_list_instances(ws, data):
     request_id = data.get("requestId")
     service_name = data.get("serviceName")
+    # 可选：上层（BFF/hub）传期望的 compose 工程名做寻址漂移校验；不传则不比对（向后兼容：
+    # 现有 hub 滚动重启编排不传此字段，行为完全不变，仅回包多一个 composeProject 字段）。
+    expected = data.get("expectedComposeProject")
     try:
         instances = nacos_client.list_healthy_instances(service_name)
         containers = docker_cli.list_running_containers()
         result = []
         for inst in instances:
             container = match_instance(inst, containers)
+            proj = compose_project(container) if container else None
+            matched = container is not None
+            # 容器可寻址但其 compose 工程名与期望不符 → 寻址漂移，标 matched=False，
+            # 让上层据此拒绝（优雅按实例、force 按目录会作用到不同容器组，危险）。
+            if matched and expected and proj != expected:
+                matched = False
             result.append({
                 "address": f"{inst['ip']}:{inst['port']}",
                 "containerId": container["Id"][:12] if container else None,
                 "healthy": True,
-                "matched": container is not None,
+                "matched": matched,
+                "composeProject": proj,
             })
         send_message(ws, {"type": "list-instances-result", "requestId": request_id,
                           "status": "success", "instances": result})
