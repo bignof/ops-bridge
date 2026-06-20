@@ -181,6 +181,131 @@ def test_rotate_agent_key_non_json_body_raises_hub_error(monkeypatch) -> None:
 #    `..` → 下列断言转红。
 
 
+# --- Task 9b:list_agents / list_instances(节点页消费)单测 ---
+#    list_agents → GET {hub}/api/agents,透传 X-Admin-Token,返回 hub 的 AgentSnapshot 列表。
+#    list_instances → POST {hub}/api/agents/{quote(id)}/list-instances,body {serviceName},短超时。
+
+
+def test_list_agents(monkeypatch) -> None:
+    calls: dict = {}
+
+    def fake_get(url, headers=None, timeout=None):
+        calls["url"] = url
+        calls["headers"] = headers
+        calls["timeout"] = timeout
+        return _Resp([{"agentId": "a1", "online": True}, {"agentId": "a2", "online": False}])
+
+    monkeypatch.setattr(hc, "settings", _fake_settings())
+    monkeypatch.setattr(hc.httpx, "get", fake_get)
+
+    agents = hc.list_agents()
+    assert [a["agentId"] for a in agents] == ["a1", "a2"]
+    assert calls["url"] == "http://hub:8080/api/agents"
+    assert calls["headers"]["X-Admin-Token"] == "T"
+    assert calls["timeout"] == 15  # 列表用通用 _HUB_TIMEOUT
+
+
+def test_list_agents_missing_hub_url_raises(monkeypatch) -> None:
+    called = {"hit": False}
+
+    def fake_get(*a, **k):
+        called["hit"] = True
+        return _Resp([])
+
+    monkeypatch.setattr(hc, "settings", _fake_settings(url=""))
+    monkeypatch.setattr(hc.httpx, "get", fake_get)
+
+    with pytest.raises(hc.HubError):
+        hc.list_agents()
+    assert called["hit"] is False  # 未配置 hub 时不应发起请求
+
+
+def test_list_agents_propagates_http_error(monkeypatch) -> None:
+    # 非 2xx → raise_for_status 抛 HTTPStatusError(向上抛,路由层退化为空 map,不在此吞)。
+    monkeypatch.setattr(hc, "settings", _fake_settings())
+    monkeypatch.setattr(hc.httpx, "get", lambda *a, **k: _Resp([], status_ok=False))
+    with pytest.raises(hc.httpx.HTTPStatusError):
+        hc.list_agents()
+
+
+def test_list_instances(monkeypatch) -> None:
+    calls: dict = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002
+        calls["url"] = url
+        calls["headers"] = headers
+        calls["json"] = json
+        calls["timeout"] = timeout
+        return _Resp({"status": "success", "instances": [{"healthy": True}]})
+
+    monkeypatch.setattr(hc, "settings", _fake_settings())
+    monkeypatch.setattr(hc.httpx, "post", fake_post)
+
+    out = hc.list_instances("a1", "svc-nacos")
+    assert out["status"] == "success"
+    assert calls["url"] == "http://hub:8080/api/agents/a1/list-instances"
+    assert calls["headers"]["X-Admin-Token"] == "T"
+    assert calls["json"] == {"serviceName": "svc-nacos"}
+    assert calls["timeout"] == 5.0  # 短超时(默认),保证节点页响应
+
+
+def test_list_instances_custom_timeout(monkeypatch) -> None:
+    calls: dict = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002
+        calls["timeout"] = timeout
+        return _Resp({"status": "success", "instances": []})
+
+    monkeypatch.setattr(hc, "settings", _fake_settings())
+    monkeypatch.setattr(hc.httpx, "post", fake_post)
+
+    hc.list_instances("a1", "svc", timeout=2.5)
+    assert calls["timeout"] == 2.5
+
+
+def test_list_instances_missing_hub_url_raises(monkeypatch) -> None:
+    called = {"hit": False}
+
+    def fake_post(*a, **k):
+        called["hit"] = True
+        return _Resp({"status": "success"})
+
+    monkeypatch.setattr(hc, "settings", _fake_settings(url=""))
+    monkeypatch.setattr(hc.httpx, "post", fake_post)
+
+    with pytest.raises(hc.HubError):
+        hc.list_instances("a1", "svc")
+    assert called["hit"] is False
+
+
+def test_list_instances_propagates_http_error(monkeypatch) -> None:
+    # hub 返非 2xx(如 agent 离线 409 / 未应答 502)→ HTTPStatusError 向上抛,路由层标该行 degraded。
+    monkeypatch.setattr(hc, "settings", _fake_settings())
+    monkeypatch.setattr(hc.httpx, "post", lambda *a, **k: _Resp({}, status_ok=False))
+    with pytest.raises(hc.httpx.HTTPStatusError):
+        hc.list_instances("a1", "svc")
+
+
+def test_list_instances_quotes_agent_id_in_url(monkeypatch) -> None:
+    # 纵深防御第二道闸:agent_id 拼进路径段必须 quote(safe='')(同 rotate 的路径注入护栏)。
+    # 变异验证:删掉 quote(直接拼 agent_id),路径段残留裸 / 与 .. → 下列断言转红。
+    calls: dict = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002
+        calls["url"] = url
+        return _Resp({"status": "success", "instances": []})
+
+    monkeypatch.setattr(hc, "settings", _fake_settings())
+    monkeypatch.setattr(hc.httpx, "post", fake_post)
+
+    hc.list_instances("a/b/../c", "svc")
+    url = calls["url"]
+    assert "/api/agents/" in url and "/list-instances" in url, url
+    seg = url.split("/api/agents/", 1)[1].rsplit("/list-instances", 1)[0]
+    assert "/" not in seg, f"agent_id 未编码进 URL 路径段(残留裸 /,可路径注入): {seg!r}"
+    assert "%2F" in seg.upper()  # `/` → %2F(证明编码确实发生)
+
+
 def test_rotate_agent_key_quotes_agent_id_in_url(monkeypatch) -> None:
     calls: dict = {}
 

@@ -363,3 +363,36 @@ class FetchRecordOut(BaseModel):
 
 class FetchRecordListOut(ListEnvelope[FetchRecordOut]):
     """获取记录列表响应(具体子类,避开泛型 response_model 的 Pydantic 警告路径)。"""
+
+
+# --- 节点聚合(Task 9b,节点页) -------------------------------------------
+
+
+class NodeOut(BaseModel):
+    """节点行响应:权威源 = 平台 Service 表(每行 = (agent×service)),叠加 hub 实时态。
+
+    - 静态(Service 表 + LEFT JOIN namespace.code → `agentId`/`namespaceCode`):
+      `serviceCode` / `dir` / `defaultImage` / `nacosServiceName`。
+    - 实时(hub `list_agents`):`online` / `lastSeen`(= AgentSnapshot.lastSeenAt)。
+    - 健康(hub `list_instances`):`healthyCount`(健康实例数)。
+
+    降级语义:某行的 `list_instances` 超时 / 失败 → `healthyCount=None` 且 `degraded=True`;
+    离线行 / 无 `nacosServiceName` 的行不发 fan-out → `healthyCount=None`、`degraded=False`。
+    """
+
+    model_config = MODEL_CONFIG
+
+    agent_id: str
+    service_code: str
+    namespace_code: str | None = None
+    dir: str | None = None
+    default_image: str | None = None
+    nacos_service_name: str | None = None
+    online: bool
+    last_seen: datetime | None = None
+    healthy_count: int | None = None
+    degraded: bool
+
+
+class NodeListOut(ListEnvelope[NodeOut]):
+    """节点列表响应(具体子类,避开泛型 response_model 的 Pydantic 警告路径)。"""
