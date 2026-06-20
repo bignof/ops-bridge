@@ -37,6 +37,9 @@ class CommandDispatchRequest(BaseModel):
     # force stop 护栏入参(本 model 沿用 camelCase 入参风格,与 requestId 一致)。
     serviceName: str | None = Field(default=None, title="服务名(force stop 最后健康实例校验用)")
     allowLastInstance: bool = Field(default=False, title="允许停最后健康实例")
+    # 优雅 stop / pull-redeploy 的 drain 入参(透传给 agent,由 agent 调本机 worker /api/k8s/shutdown)。
+    healthBaseUrl: str | None = Field(default=None, title="优雅 drain 的 worker 健康基址(内网)")
+    shutdownTimeoutSec: int | None = Field(default=None, title="优雅 drain 超时(秒)")
 
     @property
     def request_id(self) -> str:

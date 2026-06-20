@@ -86,6 +86,11 @@ async def dispatch_command(
         payload["mode"] = request.mode
     if request.image:
         payload["image"] = request.image
+    # 优雅 drain 入参透传(仅 graceful stop/pull-redeploy 用;agent 读 healthBaseUrl 调 worker drain)。
+    if request.healthBaseUrl:
+        payload["healthBaseUrl"] = request.healthBaseUrl
+    if request.shutdownTimeoutSec is not None:
+        payload["shutdownTimeoutSec"] = request.shutdownTimeoutSec
 
     await main_module.hub_state.store_command(
         agent_id,

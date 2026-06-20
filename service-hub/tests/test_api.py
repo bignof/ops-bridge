@@ -251,6 +251,34 @@ def test_dispatch_command_creates_record_and_returns_expected_payload(client: Te
     assert get_response.json()["requestId"] == "req-dispatch-1"
 
 
+def test_dispatch_graceful_stop_forwards_drain_params_to_agent(client: TestClient) -> None:
+    # 优雅 stop:hub 须把 healthBaseUrl + shutdownTimeoutSec 透传进下发帧,供 agent drain。
+    import app.main as main_module
+
+    state = main_module.hub_state
+    socket = attach_agent(state, "agent-a")
+
+    response = client.post(
+        "/api/agents/agent-a/commands",
+        headers={"X-Admin-Token": "test-admin-token"},
+        json={
+            "requestId": "req-graceful-stop-1",
+            "action": "stop",
+            "mode": "graceful",
+            "dir": "/srv/a",
+            "healthBaseUrl": "http://10.0.0.5:13000",
+            "shutdownTimeoutSec": 45,
+        },
+    )
+
+    assert response.status_code == 202
+    sent = socket.messages[0]
+    assert sent["action"] == "stop"
+    assert sent["mode"] == "graceful"
+    assert sent["healthBaseUrl"] == "http://10.0.0.5:13000"
+    assert sent["shutdownTimeoutSec"] == 45
+
+
 def test_dispatch_derives_requested_by_from_admin_token_ignoring_client_header(
     client: TestClient,
     caplog: pytest.LogCaptureFixture,
