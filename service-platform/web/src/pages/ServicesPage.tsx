@@ -4,13 +4,16 @@ import * as resources from '../api/resources';
 
 // 服务行记录(对齐 P1a 契约,全 camelCase)。
 // - namespaceCode:后端 LEFT JOIN 回的命名空间可读名(列直接用,不客户端拼 id→名)。
-// - serviceCode:服务编码;name:服务别名;dir:目录;nacosServiceName:Nacos 服务名(滚动部署用)。
+// - namespaceId:命名空间 id(后端 ServiceOut 回;C5 编辑时回填关联选择必需)。
+// - serviceCode:服务编码;name:服务别名;dir:目录;defaultImage:默认镜像;nacosServiceName:Nacos 服务名(滚动部署用)。
 interface ServiceRow {
   id: string | number;
+  namespaceId?: string | number;
   namespaceCode?: string;
   serviceCode: string;
   name?: string;
   dir?: string;
+  defaultImage?: string;
   nacosServiceName?: string;
 }
 
@@ -21,21 +24,39 @@ interface NamespaceOption {
   name?: string;
 }
 
-// 列(对照基线 §2):namespaceCode(JOIN 名) / serviceCode / name / dir / nacosServiceName。
-const columns: ProColumns<ServiceRow>[] = [
-  { title: '命名空间', dataIndex: 'namespaceCode', key: 'namespaceCode' },
-  { title: '服务编码', dataIndex: 'serviceCode', key: 'serviceCode', copyable: true },
-  { title: '服务别名', dataIndex: 'name', key: 'name' },
-  { title: '目录', dataIndex: 'dir', key: 'dir' },
-  { title: 'Nacos 服务名', dataIndex: 'nacosServiceName', key: 'nacosServiceName' },
-];
-
 // 命名空间关联选择 options:拉 list('namespaces'),value=id、label=code(name 兜底)。
-// 一次取较大 pageSize 覆盖常规规模;选项即时拉取,不缓存(命名空间低频新增)。
+// B4:抬高 pageSize 上限(500)+ 下拉 showSearch 本地过滤,大集合也能检索到(避免旧 100 硬上限不可见)。
+// 选项即时拉取,不缓存(命名空间低频新增)。
+const NS_OPTIONS_PAGE_SIZE = 500;
 const fetchNamespaceOptions = async () => {
-  const env = await resources.list<NamespaceOption>('namespaces', { pageSize: 100 });
+  const env = await resources.list<NamespaceOption>('namespaces', { pageSize: NS_OPTIONS_PAGE_SIZE });
   return env.rows.map((n) => ({ label: n.code || String(n.id), value: n.id }));
 };
+
+// 列(对照基线 §2):namespaceCode(JOIN 名) / serviceCode / name / dir / nacosServiceName。
+// B2:展示列均 `search: false`(JOIN 回的名不是后端过滤键);单独加一个仅查询用的 namespaceId
+// 筛选列(`hideInTable` + select),其值经 ProTable params 透传到后端 ?namespaceId= 服务端过滤。
+const columns: ProColumns<ServiceRow>[] = [
+  // B2 筛选列:仅出现在查询表单(hideInTable)。dataIndex 用 `filterNamespaceId` 避免与下方表单的
+  // namespaceId select 撞 DOM id;经 search.transform 把筛选值映射回后端过滤键 `namespaceId`。
+  // 选项来自 list('namespaces'),B4 下拉 showSearch 可检索。
+  {
+    title: '命名空间',
+    dataIndex: 'filterNamespaceId',
+    key: 'filterNamespaceId',
+    hideInTable: true,
+    valueType: 'select',
+    request: fetchNamespaceOptions,
+    fieldProps: { showSearch: true, placeholder: '按命名空间筛选' },
+    // 透传后端服务端过滤参数:?namespaceId=(对齐 list_services 的 alias)。
+    search: { transform: (value) => ({ namespaceId: value }) },
+  },
+  { title: '命名空间', dataIndex: 'namespaceCode', key: 'namespaceCode', search: false },
+  { title: '服务编码', dataIndex: 'serviceCode', key: 'serviceCode', copyable: true, search: false },
+  { title: '服务别名', dataIndex: 'name', key: 'name', search: false },
+  { title: '目录', dataIndex: 'dir', key: 'dir', search: false },
+  { title: 'Nacos 服务名', dataIndex: 'nacosServiceName', key: 'nacosServiceName', search: false },
+];
 
 // 表单字段(对照基线 §2):namespaceId(必填,关联选择)/ serviceCode(必填)/ name / dir
 // / defaultImage(旧 image → defaultImage)/ nacosServiceName(新增)。
@@ -63,7 +84,9 @@ const formFields: ProFormColumnsType<ServiceRow>[] = [
 /**
  * 服务页(resource `services`):标准 CRUD。
  * - 列用后端 JOIN 回的 `namespaceCode`,不客户端拼 id→名(基线 §2)。
- * - 表单 `namespaceId` 关联选择,选项来自 `list('namespaces')`;唯一冲突 409 由 CrudTable 统一提示。
+ * - B2 筛选:`searchable` 开查询表单,按 `namespaceId` 服务端过滤(透传后端 ?namespaceId=)。
+ * - 表单 `namespaceId` 关联选择,选项来自 `list('namespaces')`;C5 编辑回填靠后端 list 回的 namespaceId/dir/defaultImage。
+ * - B3:409 = 命名空间内 service_code 重复 → conflictMessage「该命名空间下服务编码已存在」(非「编码已存在」)。
  * - P2 不做:命令下发 / 重启服务 / 命令历史(基线 §2「P2 故意不做」)。
  */
 export default function ServicesPage() {
@@ -73,6 +96,10 @@ export default function ServicesPage() {
       title="服务"
       columns={columns}
       formFields={formFields}
+      // B2:开查询表单(命名空间筛选列)。
+      searchable
+      // B3:服务 409 是命名空间内 service_code 重复,文案须贴切(非默认「编码已存在」)。
+      conflictMessage="该命名空间下服务编码已存在"
     />
   );
 }

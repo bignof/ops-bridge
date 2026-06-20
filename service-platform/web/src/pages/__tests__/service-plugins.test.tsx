@@ -91,13 +91,27 @@ const pluginsEnvelope = {
   totalPage: 1,
 };
 
+// 服务全量(B2 筛选区 serviceId 下拉不带 namespaceId 拉全量;含 svc-demo id=2 供筛选断言)。
+const allServicesEnvelope = {
+  count: 2,
+  rows: [
+    { id: 2, serviceCode: 'svc-demo', name: '演示服务' },
+    { id: 20, serviceCode: 'svc-other', name: '另一服务' },
+  ],
+  page: 1,
+  pageSize: 100,
+  totalPage: 1,
+} as never;
+
 // 按 resource 路由 list 返回;services 再按 namespaceId 服务端过滤分流。
 const routeList = (resource: string, params?: Record<string, unknown>) => {
   switch (resource) {
     case 'namespaces':
       return namespacesEnvelope;
     case 'services': {
-      const nsId = Number(params?.namespaceId);
+      // 带 namespaceId:表单级联(按命名空间隔离);不带:B2 筛选区拉全量服务。
+      if (params?.namespaceId === undefined) return allServicesEnvelope;
+      const nsId = Number(params.namespaceId);
       return servicesByNamespace[nsId] ?? { count: 0, rows: [], page: 1, pageSize: 100, totalPage: 1 };
     }
     case 'plugins':
@@ -223,6 +237,51 @@ describe('ServicePluginsPage', () => {
     });
     const payload = create.mock.calls[0]?.[1] as Record<string, unknown>;
     expect(payload).not.toHaveProperty('namespaceId');
+  });
+
+  // B3(409 文案):服务插件无 code 字段,409=重复绑定,文案须为「该插件已绑定该服务…」,非「编码已存在」。
+  it('重复绑定 409 → 提示「该插件已绑定该服务,请勿重复关联」(非「编码已存在」)', async () => {
+    create.mockRejectedValue({ response: { status: 409 } });
+    const user = userEvent.setup();
+    render(<ServicePluginsPage />);
+
+    expect(await screen.findByText('svc-demo')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: byNormalizedName('添加') }));
+
+    await openSelect(user, 'namespaceId');
+    await clickOption(user, 'ns-demo');
+    await openSelect(user, 'serviceId');
+    await clickOption(user, 'svc-demo');
+    await openSelect(user, 'pluginId');
+    await clickOption(user, 'plugin-demo');
+    await user.click(screen.getByRole('button', { name: byNormalizedName('确认') }));
+
+    // B3 关键:重复绑定的 409 文案贴切,不沿用默认「编码已存在」。
+    expect(
+      await screen.findByText((t) => t.includes('该插件已绑定该服务')),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('编码已存在')).not.toBeInTheDocument();
+  });
+
+  // B2(按服务服务端过滤):开查询表单 → 选服务筛选项 → 查询 → list('service-plugins',{serviceId}) 透传后端。
+  it('筛选区按服务过滤:选筛选项 → list("service-plugins", {serviceId}) 带后端过滤参数', async () => {
+    const user = userEvent.setup();
+    render(<ServicePluginsPage />);
+
+    expect(await screen.findByText('svc-demo')).toBeInTheDocument();
+
+    // 筛选项 id=filterServiceId(避开表单 serviceId 撞 id);选项来自 list('services')。
+    await openSelect(user, 'filterServiceId');
+    await clickOption(user, 'svc-demo');
+    await user.click(screen.getByRole('button', { name: byNormalizedName('查询') }));
+
+    // B2 关键:筛选值 serviceId 透传到 list('service-plugins', { serviceId })(后端 ?serviceId= 过滤)。
+    await waitFor(() => {
+      expect(list).toHaveBeenCalledWith(
+        'service-plugins',
+        expect.objectContaining({ serviceId: 2 }),
+      );
+    });
   });
 
   it('A1 级联清空:选命名空间 A → 选其服务 → 改命名空间 B → 服务被清空(不残留 A 的服务,不会错配提交)', async () => {

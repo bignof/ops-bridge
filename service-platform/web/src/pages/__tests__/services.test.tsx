@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import ServicesPage from '../ServicesPage';
 
@@ -51,15 +51,19 @@ const clickOption = async (user: ReturnType<typeof userEvent.setup>, contains: s
 };
 
 // 列表信封:列直接用后端 JOIN 回的 namespaceCode(不客户端拼 id→名)。
+// ⚠️ 对齐后端真实 ServiceOut:含 namespaceId(C5 回填关联选择必需的隐性契约,后端 list 须回 id 列)+
+//    defaultImage(C5 回填断言)。mock 不注入后端不回的字段。
 const servicesEnvelope = {
   count: 1,
   rows: [
     {
       id: 5,
+      namespaceId: 1,
       namespaceCode: 'ns-demo',
       serviceCode: 'svc-demo',
       name: '演示服务',
       dir: '/opt/svc',
+      defaultImage: 'img:1',
       nacosServiceName: 'svc-nacos',
     },
   ],
@@ -124,6 +128,68 @@ describe('ServicesPage', () => {
         'services',
         expect.objectContaining({ namespaceId: 1, serviceCode: 'svc-new' }),
       );
+    });
+  });
+
+  // C5(编辑回填关联字段):渲染 → 点行内「编辑」→ 断言 namespaceId select 预填后端行的当前命名空间、
+  // dir/defaultImage 输入框预填行值 → 改一字段提交 → 断言 update 收到合并 values(守「后端 list 须回 id 列供回填」契约)。
+  it('点行内「编辑」→ 关联字段(namespaceId)与文本字段(dir)按行值预填 → 改一字段 → 提交 update 合并 values', async () => {
+    update.mockResolvedValue({ id: 5 });
+    const user = userEvent.setup();
+    render(<ServicesPage />);
+
+    // 行加载(后端 list 行须含 namespaceId 供回填关联选择)。
+    const cell = await screen.findByText('svc-demo');
+    const row = cell.closest('tr')!;
+    await user.click(within(row).getByText('编辑'));
+
+    // C5 关键:namespaceId 关联选择按行 namespaceId(=1)回填,显示其 code「ns-demo」。
+    const nsField = await waitFor(() => {
+      const el = document.getElementById('namespaceId');
+      if (!el) throw new Error('namespaceId 未渲染');
+      return el.closest('.ant-select')!;
+    });
+    await waitFor(() =>
+      expect(nsField.querySelector('.ant-select-selection-item')?.textContent).toContain('ns-demo'),
+    );
+
+    // 文本字段按行值回填:目录预填 '/opt/svc'、默认镜像预填 'img:1'(后端行携带)。
+    expect((await screen.findByLabelText('目录')).getAttribute('value')).toBe('/opt/svc');
+    expect(screen.getByLabelText('默认镜像').getAttribute('value')).toBe('img:1');
+
+    // 改目录后提交。
+    const dirInput = screen.getByLabelText('目录');
+    await user.clear(dirInput);
+    await user.type(dirInput, '/opt/new');
+    await user.click(screen.getByRole('button', { name: byNormalizedName('确认') }));
+
+    // update 收到合并后的 values:id 定位 + namespaceId 维持原值 + dir 为改后值。
+    await waitFor(() => {
+      expect(update).toHaveBeenCalledWith(
+        'services',
+        5,
+        expect.objectContaining({ namespaceId: 1, dir: '/opt/new', serviceCode: 'svc-demo' }),
+      );
+    });
+  });
+
+  // B2(按命名空间服务端过滤):开查询表单 → 选命名空间筛选项 → 提交 → list('services',{namespaceId}) 透传后端。
+  it('筛选区按命名空间过滤:选筛选项 → list("services", {namespaceId}) 带后端过滤参数', async () => {
+    const user = userEvent.setup();
+    render(<ServicesPage />);
+
+    expect(await screen.findByText('svc-demo')).toBeInTheDocument();
+
+    // 筛选区命名空间下拉选项来自 list('namespaces');筛选项 id=filterNamespaceId(避开表单 namespaceId 撞 id)。
+    await openSelect(user, 'filterNamespaceId');
+    await clickOption(user, 'ns-demo');
+
+    // 点查询表单的「查询」按钮触发 request。
+    await user.click(screen.getByRole('button', { name: byNormalizedName('查询') }));
+
+    // B2 关键:列表 request 把筛选值 namespaceId 透传到 list('services', { namespaceId })(后端 ?namespaceId= 过滤)。
+    await waitFor(() => {
+      expect(list).toHaveBeenCalledWith('services', expect.objectContaining({ namespaceId: 1 }));
     });
   });
 });

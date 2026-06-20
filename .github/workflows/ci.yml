@@ -171,7 +171,9 @@ jobs:
       - name: Lint
         run: npm run lint
 
-      - name: Unit tests
+      - name: Unit tests with coverage gate
+        # 评审 D3(系统性根因:此前 npm test 仅 vitest run,无覆盖率门 → 零覆盖文件永不让 CI 转红)。
+        # npm test 已为 `vitest run --coverage`,阈值在 vite.config.ts test.coverage.thresholds(对齐后端 --cov-fail-under)。
         run: npm test
 
       - name: Build SPA

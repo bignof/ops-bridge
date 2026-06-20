@@ -29,24 +29,50 @@ interface PluginOption {
   code: string;
 }
 
+// 命名空间选项:list('namespaces'),label=code、value=id。B4:抬 pageSize 上限 + 下拉 showSearch 可检索。
+const NS_OPTIONS_PAGE_SIZE = 500;
+const fetchNamespaceOptions = async () => {
+  const env = await resources.list<NamespaceOption>('namespaces', { pageSize: NS_OPTIONS_PAGE_SIZE });
+  return env.rows.map((n) => ({ label: n.code || String(n.id), value: n.id }));
+};
+
+// B2 筛选区服务选项:拉全量服务(不带 namespaceId),label=serviceCode(name 后缀),value=id。
+// B4:下拉 showSearch + 抬高 pageSize 上限,大集合可检索。
+const fetchAllServiceOptions = async () => {
+  const env = await resources.list<ServiceOption>('services', { pageSize: NS_OPTIONS_PAGE_SIZE });
+  return env.rows.map((s) => ({
+    label: s.name ? `${s.serviceCode}(${s.name})` : s.serviceCode,
+    value: s.id,
+  }));
+};
+
 // 列(对照基线 §4):namespaceCode / serviceCode / pluginCode(均后端 JOIN 可读名)。
+// B2:展示列 `search: false`(JOIN 名非后端过滤键);单加一个仅查询用的服务筛选列,
+// 经 search.transform 透传后端 ?serviceId=(service-plugins 仅支持按 serviceId 过滤)。
 const columns: ProColumns<ServicePluginRow>[] = [
-  { title: '命名空间', dataIndex: 'namespaceCode', key: 'namespaceCode' },
+  // B2 筛选列:仅查询表单(hideInTable)。dataIndex=filterServiceId 避开下方表单 serviceId 撞 id,
+  // transform 映射回后端过滤键 serviceId;选项来自全量 services,B4 showSearch 可检索。
+  {
+    title: '服务',
+    dataIndex: 'filterServiceId',
+    key: 'filterServiceId',
+    hideInTable: true,
+    valueType: 'select',
+    request: fetchAllServiceOptions,
+    fieldProps: { showSearch: true, placeholder: '按服务筛选' },
+    search: { transform: (value) => ({ serviceId: value }) },
+  },
+  { title: '命名空间', dataIndex: 'namespaceCode', key: 'namespaceCode', search: false },
   {
     title: '服务',
     // P1a 实际回 serviceCode(非 serviceName);dataIndex 对齐真实字段,render 兜底防未来后端改回 serviceName。
     dataIndex: 'serviceCode',
     key: 'serviceCode',
+    search: false,
     render: (_dom, r) => r.serviceName || r.serviceCode || '-',
   },
-  { title: '插件', dataIndex: 'pluginCode', key: 'pluginCode' },
+  { title: '插件', dataIndex: 'pluginCode', key: 'pluginCode', search: false },
 ];
-
-// 命名空间选项:list('namespaces'),label=code、value=id。
-const fetchNamespaceOptions = async () => {
-  const env = await resources.list<NamespaceOption>('namespaces', { pageSize: 100 });
-  return env.rows.map((n) => ({ label: n.code || String(n.id), value: n.id }));
-};
 
 /**
  * 服务插件页(resource `service-plugins`):服务 ↔ 插件绑定,仅 列表/添加/删除(无编辑)。
@@ -58,7 +84,9 @@ const fetchNamespaceOptions = async () => {
  * - 选服务后,插件下拉调 `list('plugins')`。
  * - 依赖项变化(`dependencies`)时 ProForm 自动重跑对应字段的 request,实现联动。
  *
- * 唯一冲突 409 由 CrudTable 统一提示。无编辑:CrudTable `editable={false}`,仅增删。
+ * B2 筛选:`searchable` 开查询表单,按 `serviceId` 服务端过滤(后端 service-plugins 仅支持 ?serviceId=)。
+ * B3:无 code 字段,409 = 重复绑定 → conflictMessage「该插件已绑定该服务,请勿重复关联」(非「编码已存在」)。
+ * 无编辑:CrudTable `editable={false}`,仅增删。
  */
 export default function ServicePluginsPage() {
   // 表单字段(三级级联,对照基线 §4)。放在组件内:dependencies 的 request 闭包语义更清晰。
@@ -81,7 +109,10 @@ export default function ServicePluginsPage() {
       request: async (params) => {
         const namespaceId = (params as { namespaceId?: string | number }).namespaceId;
         if (namespaceId === undefined || namespaceId === null || namespaceId === '') return [];
-        const env = await resources.list<ServiceOption>('services', { namespaceId, pageSize: 100 });
+        const env = await resources.list<ServiceOption>('services', {
+          namespaceId,
+          pageSize: NS_OPTIONS_PAGE_SIZE,
+        });
         return env.rows.map((s) => ({
           label: s.name ? `${s.serviceCode}(${s.name})` : s.serviceCode,
           value: s.id,
@@ -99,7 +130,7 @@ export default function ServicePluginsPage() {
       request: async (params) => {
         const serviceId = (params as { serviceId?: string | number }).serviceId;
         if (serviceId === undefined || serviceId === null || serviceId === '') return [];
-        const env = await resources.list<PluginOption>('plugins', { pageSize: 100 });
+        const env = await resources.list<PluginOption>('plugins', { pageSize: NS_OPTIONS_PAGE_SIZE });
         return env.rows.map((p) => ({ label: p.code || String(p.id), value: p.id }));
       },
       fieldProps: { showSearch: true, placeholder: '请先选择服务' },
@@ -115,6 +146,10 @@ export default function ServicePluginsPage() {
       formFields={formFields}
       // 关联绑定表只增删,无编辑(基线 §4「本页无编辑」)。
       editable={false}
+      // B2:开查询表单(按服务筛选)。
+      searchable
+      // B3:无 code,409=重复绑定,文案须贴切(非默认「编码已存在」)。
+      conflictMessage="该插件已绑定该服务,请勿重复关联"
       // A1:三级级联(命名空间→服务→插件)父级变更时清空下级,杜绝错配绑定。
       cascadeChildren={{
         namespaceId: ['serviceId', 'pluginId'],

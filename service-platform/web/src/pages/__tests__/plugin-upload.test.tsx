@@ -8,9 +8,12 @@ import PluginUploadPage from '../PluginUploadPage';
 //  - uploadPluginVersion → 拖拽/选 .tgz 后的上传(成功回 { version },失败按状态码区分)
 const listPluginVersions = vi.fn();
 const uploadPluginVersion = vi.fn();
+// B2:插件筛选下拉选项走 list('plugins')。
+const list = vi.fn();
 vi.mock('../../api/resources', () => ({
   listPluginVersions: (...a: unknown[]) => listPluginVersions(...a),
   uploadPluginVersion: (...a: unknown[]) => uploadPluginVersion(...a),
+  list: (...a: unknown[]) => list(...a),
 }));
 
 // jsdom 不实现 ResizeObserver,ProTable / antd 内部会调用,补最小 stub 保证渲染稳定。
@@ -43,6 +46,40 @@ const versionsEnvelope = {
   totalPage: 1,
 };
 
+// B2 筛选区插件下拉选项信封。
+const pluginsEnvelope = {
+  count: 1,
+  rows: [{ id: 3, code: 'plugin-demo', name: '演示插件' }],
+  page: 1,
+  pageSize: 500,
+  totalPage: 1,
+};
+
+// jsdom 缺 scrollIntoView,antd Select 虚拟列表会调用,补 stub。
+if (!HTMLElement.prototype.scrollIntoView) {
+  HTMLElement.prototype.scrollIntoView = () => {};
+}
+
+const byNormalizedName = (text: string) => (name: string) => name.replace(/\s/g, '').includes(text);
+
+// 打开筛选项 Select(按 combobox id 定位)。
+const openSelect = async (user: ReturnType<typeof userEvent.setup>, fieldId: string) => {
+  const combobox = await waitFor(() => {
+    const el = document.getElementById(fieldId);
+    if (!el) throw new Error(`combobox #${fieldId} 未渲染`);
+    return el;
+  });
+  await user.click(combobox);
+};
+const clickOption = async (user: ReturnType<typeof userEvent.setup>, contains: string) => {
+  const option = await screen.findByText(
+    (_t, node) =>
+      node?.classList.contains('ant-select-item-option-content') === true &&
+      node.textContent?.includes(contains) === true,
+  );
+  await user.click(option);
+};
+
 // 取 Upload.Dragger 渲染的隐藏 file input(无 accessible label,按 type 选)。
 const fileInput = (container: HTMLElement) =>
   container.querySelector('input[type="file"]') as HTMLInputElement;
@@ -54,7 +91,9 @@ describe('PluginUploadPage', () => {
   beforeEach(() => {
     listPluginVersions.mockReset();
     uploadPluginVersion.mockReset();
+    list.mockReset();
     listPluginVersions.mockResolvedValue(versionsEnvelope);
+    list.mockResolvedValue(pluginsEnvelope);
   });
 
   it('列表渲染:走 listPluginVersions(服务端分页),列用后端可读名 pluginCode/version/filename', async () => {
@@ -154,5 +193,22 @@ describe('PluginUploadPage', () => {
     });
     // A2:上传请求在资源层 opt-out 全局兜底,页面对非 400/409/413 必须有通用可见提示,不可静默吞。
     expect(await screen.findByText((t) => t.includes('上传失败'))).toBeInTheDocument();
+  });
+
+  // B2(按插件服务端过滤):选插件筛选项 → 查询 → listPluginVersions({pluginId}) 透传后端。
+  it('筛选区按插件过滤:选筛选项 → listPluginVersions({pluginId}) 带后端过滤参数', async () => {
+    const user = userEvent.setup();
+    render(<PluginUploadPage />);
+    expect(await screen.findByText('plugin-demo')).toBeInTheDocument();
+
+    // 筛选项 id=pluginId,选项来自 list('plugins')。
+    await openSelect(user, 'pluginId');
+    await clickOption(user, 'plugin-demo');
+    await user.click(screen.getByRole('button', { name: byNormalizedName('查询') }));
+
+    // B2 关键:筛选值 pluginId 透传到 listPluginVersions({ pluginId })(后端 ?pluginId= 过滤)。
+    await waitFor(() => {
+      expect(listPluginVersions).toHaveBeenCalledWith(expect.objectContaining({ pluginId: 3 }));
+    });
   });
 });

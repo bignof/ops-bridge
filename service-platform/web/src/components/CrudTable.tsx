@@ -34,6 +34,12 @@ export interface CrudTableProps<T extends RowWithId> {
   /** 是否可删除;默认 true。 */
   deletable?: boolean;
   /**
+   * B2:是否开启 ProTable 顶部查询表单(筛选区)。默认 false(无筛选项的字典页如插件/命名空间保持现状)。
+   * 开启后,列上未标 `search: false` 的列会进入查询表单;筛选值随 `params` 透传到后端既有过滤参数
+   * (如服务页按 `namespaceId` 过滤)。筛选列建议用 `valueType:'select'`+`request` 提供可选项。
+   */
+  searchable?: boolean;
+  /**
    * A1 级联清空映射:`{ 父字段: [需清空的下级字段...] }`。父字段值变更时,自动把所有下级字段清空,
    * 避免「换上级后下级残留旧选值」造成错配提交(如 service-plugins 的 命名空间→服务→插件 三级级联)。
    */
@@ -48,6 +54,13 @@ export interface CrudTableProps<T extends RowWithId> {
    * 命名空间页据此在响应含 agentKey 时弹 ShowOnceModal。
    */
   onCreated?: (created: unknown) => void;
+  /**
+   * B3:409 冲突文案(各页语义不同)。不传则回落「编码已存在」(命名空间/插件这类有唯一 code 的页)。
+   * - 服务插件页(无 code,409=重复绑定)传「该插件已绑定该服务,请勿重复关联」;
+   * - 服务页(409=命名空间内 service_code 重复)传「该命名空间下服务编码已存在」。
+   * 注:后端 409 detail 为英文(如 "service-plugin link already exists"),不直接回显,统一用本中文文案。
+   */
+  conflictMessage?: string;
 }
 
 /**
@@ -57,7 +70,10 @@ export interface CrudTableProps<T extends RowWithId> {
  * 关键约束(对齐 P1a 契约):
  * - 服务端分页:ProTable `request` 把 antd 的 `current`/`pageSize` 映射为后端 `page`/`pageSize`,
  *   读统一信封 `{count, rows}` 后返回 `{ data: rows, total: count, success: true }`。
- * - 唯一冲突 409 → message.error('编码已存在');其它错误由 client 拦截器既有提示兜底。
+ * - B2 筛选:列上配 `search`(或返回带筛选项的 select 列)即开 ProTable 查询表单;筛选值随
+ *   `params` 平铺透传到后端既有过滤参数(如 `?namespaceId=` / `?serviceId=`,后端服务端过滤)。
+ * - 唯一冲突 409 → message.error(`conflictMessage`,默认「编码已存在」,各页按语义传贴切文案,B3);
+ *   其它错误由 create/update 自管兜底(资源层 opt-out 全局拦截,见 handleWriteError)。
  */
 export default function CrudTable<T extends RowWithId>({
   resource,
@@ -68,9 +84,11 @@ export default function CrudTable<T extends RowWithId>({
   rowExtraActions,
   editable = true,
   deletable = true,
+  searchable = false,
   cascadeChildren,
   transformValues,
   onCreated,
+  conflictMessage = '编码已存在',
 }: CrudTableProps<T>) {
   const actionRef = useRef<ActionType>();
   const [messageApi, contextHolder] = message.useMessage();
@@ -103,7 +121,7 @@ export default function CrudTable<T extends RowWithId>({
       typeof e === 'object' && e && 'response' in e
         ? (e as { response?: { status?: number } }).response?.status
         : undefined;
-    if (status === 409) messageApi.error('编码已存在');
+    if (status === 409) messageApi.error(conflictMessage);
     else if (status !== 401) messageApi.error('操作失败,请稍后重试');
     return false;
   };
@@ -200,7 +218,9 @@ export default function CrudTable<T extends RowWithId>({
           return { data: env.rows, total: env.count, success: true };
         }}
         pagination={{ showSizeChanger: true }}
-        search={false}
+        // B2:searchable=true 时开查询表单(配 collapsed:false 默认展开,labelWidth auto 适配中文 label),
+        // 否则保持 false(无筛选项的字典页)。筛选值经上面 request 的 ...filter 透传到后端过滤参数。
+        search={searchable ? { labelWidth: 'auto', defaultCollapsed: false } : false}
         options={{ reload: true, density: false, setting: false }}
         toolBarRender={() => [
           toolBarExtra,

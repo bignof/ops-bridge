@@ -1,7 +1,7 @@
 import { lazy, StrictMode, Suspense } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createHashRouter, Navigate, RouterProvider } from 'react-router-dom';
-import { ConfigProvider, Spin } from 'antd';
+import { App as AntdApp, ConfigProvider, Spin } from 'antd';
 import zhCN from 'antd/locale/zh_CN';
 import 'antd/dist/reset.css';
 import { AuthProvider } from './auth/AuthContext';
@@ -55,12 +55,16 @@ const router = createHashRouter([
   },
 ]);
 
+// G2 遗留(A2):用 antd <App> 包裹,为静态 message/notification 提供上下文,消「static function
+// can not consume context」告警(client.ts 拦截器仍用静态 message.error,<App> 在则上下文可用)。
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <ConfigProvider locale={zhCN}>
-      <AuthProvider>
-        <RouterProvider router={router} />
-      </AuthProvider>
+      <AntdApp>
+        <AuthProvider>
+          <RouterProvider router={router} />
+        </AuthProvider>
+      </AntdApp>
     </ConfigProvider>
   </StrictMode>,
 );

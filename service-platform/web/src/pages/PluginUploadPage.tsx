@@ -13,11 +13,36 @@ interface PluginVersionRow {
   filename?: string;
 }
 
+// 插件筛选下拉选项行最小约束。
+interface PluginOption {
+  id: string | number;
+  code: string;
+}
+
+// B4:筛选下拉一次取较大上限 + showSearch 本地过滤,大集合可检索。
+const PLUGIN_OPTIONS_PAGE_SIZE = 500;
+const fetchPluginOptions = async () => {
+  const env = await resources.list<PluginOption>('plugins', { pageSize: PLUGIN_OPTIONS_PAGE_SIZE });
+  return env.rows.map((p) => ({ label: p.code || String(p.id), value: p.id }));
+};
+
 // 列(对照基线 §5):pluginCode / version / filename(均后端回的可读名)。
+// B2:展示列 `search: false`;单加一个仅查询用的 pluginId 筛选列(dataIndex 对齐后端 ?pluginId=,
+// 本页无表单无 id 撞键之虞),其值经 ProTable params 透传到 listPluginVersions。
 const columns: ProColumns<PluginVersionRow>[] = [
-  { title: '插件编码', dataIndex: 'pluginCode', key: 'pluginCode', copyable: true },
-  { title: '版本', dataIndex: 'version', key: 'version' },
-  { title: '文件名', dataIndex: 'filename', key: 'filename', ellipsis: true },
+  // B2 筛选列:仅查询表单;B4 下拉 showSearch 可检索。
+  {
+    title: '插件',
+    dataIndex: 'pluginId',
+    key: 'pluginId',
+    hideInTable: true,
+    valueType: 'select',
+    request: fetchPluginOptions,
+    fieldProps: { showSearch: true, placeholder: '按插件筛选' },
+  },
+  { title: '插件编码', dataIndex: 'pluginCode', key: 'pluginCode', copyable: true, search: false },
+  { title: '版本', dataIndex: 'version', key: 'version', search: false },
+  { title: '文件名', dataIndex: 'filename', key: 'filename', ellipsis: true, search: false },
 ];
 
 // 从 axios 异常中取 HTTP 状态码(无 response 时返回 undefined)。
@@ -30,7 +55,8 @@ const statusOf = (e: unknown): number | undefined =>
  * 插件上传页(resource `plugin-versions` 的 upload):
  * - 上方 antd Upload 拖拽 / 选 `.tgz` → `POST /api/plugin-versions/upload`(字段 file);
  *   成功后 message 回显后端解析出的 `version`(包内 package.json.version),并刷新下方列表。
- * - 下方 ProTable 服务端分页列出已上传版本(`GET /api/plugin-versions`,统一信封 `{count, rows}`)。
+ * - 下方 ProTable 服务端分页列出已上传版本(`GET /api/plugin-versions`,统一信封 `{count, rows}`);
+ *   B2:查询表单按 `pluginId` 服务端过滤(透传后端 ?pluginId=)。
  *
  * 失败按 HTTP 状态码明确提示(读 `e.response.status`):
  * - 400 未匹配 / 匹配多个插件 → 「未匹配到插件…」
@@ -105,7 +131,8 @@ export default function PluginUploadPage() {
             return { data: env.rows, total: env.count, success: true };
           }}
           pagination={{ showSizeChanger: true }}
-          search={false}
+          // B2:开查询表单(按插件筛选),筛选值经上面 request 的 ...filter 透传给 listPluginVersions。
+          search={{ labelWidth: 'auto', defaultCollapsed: false }}
           options={{ reload: true, density: false, setting: false }}
           dateFormatter="string"
         />

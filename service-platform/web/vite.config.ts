@@ -35,5 +35,24 @@ export default defineConfig({
     environment: 'jsdom',
     setupFiles: './src/test/setup.ts',
     css: false,
+    // 评审 D3(系统性根因:此前 vitest run 无 thresholds → 零覆盖文件永不让 CI 转红,假绿是结构必然)。
+    // 覆盖率门:v8 provider;阈值取当前实测水位整数下限(实测 lines/statements 90.97、functions 89.15、
+    // branches 84.95,均稳定;下取整 + 1pt 余量 → 90/89/84),锁住覆盖率防回退又不卡边(对齐后端
+    // --cov-fail-under 思路)。注:resources.ts 是被各页 mock 的薄 client 包装层(0% 行覆盖,运行期无
+    // 字段映射逻辑,映射仅在编译期 TS interface),纳入 include 后整体水位仍 90%+;它若回退引入运行
+    // 逻辑会拉低覆盖率而被门挡住。
+    coverage: {
+      provider: 'v8',
+      include: ['src/**'],
+      // 排除:bootstrap 入口(main.tsx,挂 React 根,非单测目标)、类型声明、测试/测试基座本身。
+      exclude: ['src/main.tsx', 'src/vite-env.d.ts', 'src/test/**', '**/__tests__/**'],
+      reporter: ['text', 'json-summary'],
+      thresholds: {
+        lines: 90,
+        functions: 89,
+        branches: 84,
+        statements: 90,
+      },
+    },
   },
 });
