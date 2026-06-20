@@ -112,6 +112,9 @@ class AgentSnapshot(BaseModel):
     queued_commands: int = Field(default=0, title="排队中的命令数")
     processing_commands: int = Field(default=0, title="执行中的命令数")
     last_command_created_at: datetime | None = Field(default=None, title="最近命令创建时间")
+    # register 帧上报的纯内存在线态(离线为 None,不落 DB);供节点页展示与将来能力门控。
+    capabilities: list[str] | None = Field(default=None, title="Agent 能力集", description="agent 上报的可执行动作集合，离线时为空。")
+    agent_version: str | None = Field(default=None, title="Agent 版本", description="agent 上报的版本号，离线时为空。")
 
 
 class AgentCredentialResponse(BaseModel):

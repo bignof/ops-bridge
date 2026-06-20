@@ -29,9 +29,13 @@ class RecordingState:
         self.retried: tuple[dict[str, Any], dict[str, Any]] | None = None
         self.auth_result = True
         self.auth_calls: list[tuple[str, str]] = []
+        self.runtime_calls: list[tuple[str, Any, Any]] = []
 
     async def touch_agent(self, agent_id: str, event_type: str) -> None:
         self.touched.append((agent_id, event_type))
+
+    async def set_agent_runtime(self, agent_id: str, capabilities: Any, agent_version: Any) -> None:
+        self.runtime_calls.append((agent_id, capabilities, agent_version))
 
     async def mark_ack(self, request_id: str) -> None:
         self.acked.append(request_id)
@@ -312,6 +316,38 @@ def test_handle_agent_message_branches(monkeypatch: pytest.MonkeyPatch) -> None:
     ]
     assert recording_state.acked == ["req-1"]
     assert recording_state.results == [("req-2", "success", "ok", "done", None)]
+
+
+def test_handle_agent_message_register_consumes_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # #4/#10:register 帧须被消费——capabilities/agentVersion 存进在线态,
+    # 且不再落到末尾 "Unhandled message type" 日志。
+    import app.main as main_module
+
+    recording_state = RecordingState()
+    monkeypatch.setattr(main_module, "hub_state", recording_state)
+
+    with caplog.at_level(logging.INFO, logger="app.api_support"):
+        asyncio.run(
+            _handle_agent_message(
+                "agent-a",
+                {
+                    "type": "register",
+                    "agentId": "agent-a",
+                    "capabilities": ["restart", "stop", "start"],
+                    "agentVersion": "1.2.3",
+                },
+            )
+        )
+
+    # capabilities/agentVersion 被写入在线态。
+    assert recording_state.runtime_calls == [("agent-a", ["restart", "stop", "start"], "1.2.3")]
+    # 不得落 Unhandled。
+    assert not any("Unhandled message type" in record.getMessage() for record in caplog.records)
+    # register 也算一次活跃。
+    assert ("agent-a", "register") in recording_state.touched
 
 
 def test_dispatch_command_error_branches(monkeypatch: pytest.MonkeyPatch) -> None:

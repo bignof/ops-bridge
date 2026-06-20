@@ -17,6 +17,7 @@ os.environ.setdefault("ADMIN_TOKEN", "test-admin-token")
 from app.db import Database
 from app.db_models import AgentModel
 from app.main import app
+from app.api_support import _handle_agent_message
 from app.store import HubState, utc_now
 
 
@@ -97,6 +98,46 @@ def test_list_agents_and_get_agent_return_expected_shape(client: TestClient) -> 
 
     assert agent_response.status_code == 200
     assert agent_response.json()["agentId"] == "agent-a"
+
+
+def test_register_frame_exposes_capabilities_in_agent_snapshot(client: TestClient) -> None:
+    # #4/#10:agent 发 register(capabilities/agentVersion)后,这些纯内存态须经 get_agent 暴露。
+    import app.main as main_module
+
+    state = main_module.hub_state
+    attach_agent(state, "agent-a")
+    asyncio.run(
+        _handle_agent_message(
+            "agent-a",
+            {
+                "type": "register",
+                "agentId": "agent-a",
+                "capabilities": ["restart", "start", "stop"],
+                "agentVersion": "9.9.9",
+            },
+        )
+    )
+
+    response = client.get("/api/agents/agent-a", headers={"X-Admin-Token": "test-admin-token"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["capabilities"] == ["restart", "start", "stop"]
+    assert body["agentVersion"] == "9.9.9"
+
+
+def test_disconnect_clears_agent_runtime_capabilities(client: TestClient) -> None:
+    # #4/#10:断开后在线态(含 capabilities)应被清掉(纯内存态,不残留)。
+    import app.main as main_module
+
+    state = main_module.hub_state
+    attach_agent(state, "agent-a")
+    asyncio.run(state.set_agent_runtime("agent-a", ["restart"], "1.0.0"))
+    assert asyncio.run(state.get_agent_runtime("agent-a")) == {"capabilities": ["restart"], "agent_version": "1.0.0"}
+
+    asyncio.run(state.disconnect_agent("agent-a"))
+
+    assert asyncio.run(state.get_agent_runtime("agent-a")) is None
 
 
 def test_agent_status_includes_queued_and_processing_command_summary(client: TestClient) -> None:
@@ -743,6 +784,8 @@ def test_stream_agent_logs_returns_sse_events(client: TestClient) -> None:
         session_id = response.headers["X-Log-Session-Id"]
 
     assert response.status_code == 200
+    # criticC:requestedBy 由 hub 据 admin token 服务端派生(platform-admin),
+    # 不再原样落客户端 X-Requested-By(与 dispatch/retry 审计模型一致)。
     assert socket.messages == [
         {
             "type": "logs_start",
@@ -750,7 +793,7 @@ def test_stream_agent_logs_returns_sse_events(client: TestClient) -> None:
             "dir": "/srv/a",
             "tail": 20,
             "timestamps": True,
-            "requestedBy": "ops-console",
+            "requestedBy": "platform-admin",
             "requestSource": "manual-operation",
         }
     ]
@@ -759,6 +802,47 @@ def test_stream_agent_logs_returns_sse_events(client: TestClient) -> None:
     assert "event: chunk" in body
     assert "event: finished" in body
     assert '"chunk": "line-1\\n"' in body
+
+
+def test_stream_agent_logs_derives_requested_by_ignoring_client_header(
+    client: TestClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # criticC:带 X-Requested-By: attacker 调 logs/stream → 落审计的 requested_by 须是派生身份,
+    # 不是 attacker(审计可信度模型不留客户端旁路)。
+    import app.main as main_module
+
+    state = main_module.hub_state
+
+    captured: dict[str, Any] = {}
+
+    async def on_send(payload: dict[str, Any]) -> None:
+        captured["start_payload"] = payload
+        await state.publish_log_session_event(
+            payload["sessionId"],
+            "finished",
+            {"exitCode": 0, "stopped": False},
+        )
+
+    attach_agent(state, "agent-a", on_send=on_send)
+
+    with caplog.at_level("INFO", logger="app.main"):
+        with client.stream(
+            "POST",
+            "/api/agents/agent-a/logs/stream",
+            headers={
+                "X-Admin-Token": "test-admin-token",
+                "X-Requested-By": "attacker",
+            },
+            json={"dir": "/srv/a"},
+        ) as response:
+            "".join(response.iter_text())
+
+    assert response.status_code == 200
+    # 下发给 agent 的 logs_start 帧(即审计来源)requestedBy 是派生身份,而非 attacker。
+    assert captured["start_payload"]["requestedBy"] == "platform-admin"
+    # 客户端自报值仅作 hint 记入日志,不作权威。
+    assert any("attacker" in record.getMessage() for record in caplog.records)
 
 
 def test_stream_agent_logs_returns_stream_error_event(client: TestClient) -> None:

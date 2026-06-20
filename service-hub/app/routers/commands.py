@@ -62,19 +62,27 @@ async def dispatch_command(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Agent is offline")
 
     # force stop 服务端护栏(仅 action=stop && mode=force):被拒命令不入库不下发(拒在记录前)。
-    # ① 全局滑窗速率;② 不可停掉某 service 最后一个健康实例(allowLastInstance 可显式跳过)。
+    # 顺序(#6/#14):先过「最后健康实例」闸(及 #2 的 serviceName 必填),全部通过后才记速率账——
+    # 只有真正将下发的 force stop 才占配额,避免被 ② 闸拒的尝试白白消耗配额、把窗口锁满误触 429。
+    # ② 不可停掉某 service 最后一个健康实例(allowLastInstance 可显式跳过)。
+    # ① 全局滑窗速率(置于 force 块末尾)。
     if request.action == "stop" and request.mode == "force":
-        force_guard.check_force_rate_limit(main_module.settings)
         if not request.allow_last_instance:
-            if request.service_name:
-                await force_guard.check_last_healthy_instance(
-                    main_module.hub_state,
-                    agent_id,
-                    request.service_name,
-                    timeout=main_module.settings.rolling_cmd_timeout,
+            # #2 fail-closed:缺 serviceName 无法核实最后健康实例,直接拒(不再无声跳过该安全闸)。
+            if not request.service_name:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="force stop 须提供 serviceName 以核实最后健康实例,或显式 allowLastInstance",
                 )
-            else:
-                main_module.logger.warning("force stop 无 service_name,跳过最后健康实例校验:%s", agent_id)
+            await force_guard.check_last_healthy_instance(
+                main_module.hub_state,
+                agent_id,
+                request.service_name,
+                # #13:用短超时(远小于 BFF 15s),不复用 rolling_cmd_timeout(480s)。
+                timeout=main_module.settings.list_instances_timeout,
+            )
+        # allowLastInstance=true 跳过 ② 后仍走 ① 速率闸;② 通过后也在此统一记账。
+        force_guard.check_force_rate_limit(main_module.settings)
 
     payload = {
         "type": "command",
@@ -153,7 +161,8 @@ async def list_agent_instances(
         result = await main_module.hub_state.call_agent(
             agent_id,
             message,
-            timeout=main_module.settings.rolling_cmd_timeout,
+            # #13:短超时,远小于 BFF dispatch 的 httpx 15s,避免边界超时致"已执行却显失败"。
+            timeout=main_module.settings.list_instances_timeout,
         )
     except asyncio.TimeoutError as exc:
         # agent 未在超时内应答;脱敏,不向调用方暴露内部细节。

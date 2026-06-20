@@ -283,30 +283,66 @@ def test_force_restart_not_guarded_by_this_task(client: TestClient, monkeypatch:
     assert counter["calls"] == 0
 
 
-# === force stop 无 service_name:不阻断,跳过 ②,但告警 ===
+# === #2 force stop 无 service_name:fail-closed 400(不再无声跳过 ②) ===
 
 
-def test_force_stop_without_service_name_passes_but_warns(
+def test_force_stop_without_service_name_fails_closed_400(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    # #2:force stop 缺 serviceName 且未 allowLastInstance → 400(fail-closed),
+    # 不再像旧版那样 warning 跳过「最后健康实例」闸(那是无声绕过安全闸)。
     import app.main as main_module
 
     state = main_module.hub_state
     attach_agent(state, "agent-a")
     counter = _mock_call_agent(state, monkeypatch, healthy=1)
 
-    with caplog.at_level("WARNING", logger="app.main"):
-        r = _post(client, _force_stop_body("req-nosvc-1", service_name=None))
+    r = _post(client, _force_stop_body("req-nosvc-1", service_name=None))
 
+    assert r.status_code == 400, r.text
+    assert "serviceName" in r.json()["detail"]
+    assert counter["calls"] == 0  # 直接 400,不去查 list-instances
+    # 被拒不入库
+    got = client.get("/api/commands/req-nosvc-1", headers={"X-Admin-Token": "test-admin-token"})
+    assert got.status_code == 404
+
+
+def test_force_stop_without_service_name_not_rate_charged(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    # #2 + #6/#14:无 serviceName 被 400 拒的尝试不应消耗速率配额。
+    # 把窗口压到 1:先连发 N 次无 serviceName(全 400),再发一个带 serviceName 的合法 force stop 仍应过(202)。
+    import app.main as main_module
+
+    state = main_module.hub_state
+    attach_agent(state, "agent-a")
+    _mock_call_agent(state, monkeypatch, healthy=2)
+    object.__setattr__(main_module.settings, "force_op_max_per_window", 1)
+
+    for i in range(3):
+        rejected = _post(client, _force_stop_body(f"req-nosvc-rl-{i}", service_name=None))
+        assert rejected.status_code == 400, rejected.text
+
+    # 配额未被上面 3 次 400 消耗:这一个合法 force stop 仍能过。
+    ok = _post(client, _force_stop_body("req-nosvc-rl-ok"))
+    assert ok.status_code == 202, ok.text
+
+
+def test_force_stop_allow_last_without_service_name_passes(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    # #2:allowLastInstance=true 是对 serviceName 必填的显式豁免 → 无 serviceName 也放行(202),
+    # 跳过 last-healthy 但仍走速率闸。
+    import app.main as main_module
+
+    state = main_module.hub_state
+    attach_agent(state, "agent-a")
+    counter = _mock_call_agent(state, monkeypatch, healthy=1)
+
+    r = _post(client, _force_stop_body("req-nosvc-allow", service_name=None, allow_last=True))
     assert r.status_code == 202, r.text
-    assert counter["calls"] == 0  # 无 service_name 跳过最后健康实例校验
-    assert any("service_name" in record.getMessage() for record in caplog.records)
+    assert counter["calls"] == 0  # 显式豁免,不查 list-instances
 
 
-def test_force_stop_without_service_name_still_rate_limited(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    # 无 service_name 只跳过 ②,① 速率仍生效。
+def test_force_stop_allow_last_without_service_name_still_rate_limited(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    # #2 豁免分支仍计速率:allowLastInstance=true + 无 serviceName,把窗口压到 1,第 2 次撞 429。
     import app.main as main_module
 
     state = main_module.hub_state
@@ -314,10 +350,95 @@ def test_force_stop_without_service_name_still_rate_limited(client: TestClient, 
     _mock_call_agent(state, monkeypatch, healthy=1)
     object.__setattr__(main_module.settings, "force_op_max_per_window", 1)
 
-    r1 = _post(client, _force_stop_body("req-nosvc-rl-1", service_name=None))
-    r2 = _post(client, _force_stop_body("req-nosvc-rl-2", service_name=None))
+    r1 = _post(client, _force_stop_body("req-nosvc-allow-rl-1", service_name=None, allow_last=True))
+    r2 = _post(client, _force_stop_body("req-nosvc-allow-rl-2", service_name=None, allow_last=True))
     assert r1.status_code == 202, r1.text
     assert r2.status_code == 429, r2.text
+
+
+# === #6/#14 速率记账后置:被 last-healthy 409 拒的尝试不消耗配额 ===
+
+
+def test_force_stop_rejected_by_last_healthy_does_not_consume_quota(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    # #6/#14:先过 last-healthy 再记账。被 409(最后健康实例)拒的尝试不占配额——
+    # 否则一次 last-healthy 事故会把速率窗口"锁满",令后续合法 force stop 误撞 429。
+    # 窗口压到 2:连发 N(=5)次仅 1 healthy 的 force stop(全 409),配额应仍为满;
+    # 随后两个 2-healthy 的合法 force stop 都应过(202),第 3 个才 429。
+    import app.main as main_module
+
+    state = main_module.hub_state
+    attach_agent(state, "agent-a")
+    object.__setattr__(main_module.settings, "force_op_max_per_window", 2)
+
+    # 阶段一:1 healthy → 全部 409,且不应记账。
+    counter_rejected = _mock_call_agent(state, monkeypatch, healthy=1)
+    for i in range(5):
+        r = _post(client, _force_stop_body(f"req-409-{i}"))
+        assert r.status_code == 409, r.text
+    assert counter_rejected["calls"] == 5  # 每次都查了 list-instances(在记账之前)
+
+    # 阶段二:切到 2 healthy。若上面 5 次 409 误记了账,窗口早已被锁满 → 这里第 1 个就会 429。
+    _mock_call_agent(state, monkeypatch, healthy=2)
+    ok1 = _post(client, _force_stop_body("req-ok-1"))
+    ok2 = _post(client, _force_stop_body("req-ok-2"))
+    blocked = _post(client, _force_stop_body("req-ok-3"))
+    assert ok1.status_code == 202, ok1.text
+    assert ok2.status_code == 202, ok2.text
+    assert blocked.status_code == 429, blocked.text  # 真正记账的是这 2 个合法的,第 3 个才超限
+
+
+# === #13 list-instances 短超时(远小于 BFF 15s,避免"提示失败但已执行") ===
+
+
+def _capture_call_agent_timeout(state: HubState, monkeypatch: pytest.MonkeyPatch, *, healthy: int = 2) -> dict[str, Any]:
+    """stub call_agent 并记录每次传入的 timeout(用于断言两处用的是新短超时)。"""
+    captured: dict[str, Any] = {"timeouts": []}
+    instances = [
+        {"address": f"h:{1800 + i}", "containerId": f"c{i}", "healthy": True, "matched": True}
+        for i in range(healthy)
+    ]
+
+    async def fake_call_agent(agent_id: str, message: dict, timeout: float) -> dict:
+        captured["timeouts"].append(timeout)
+        return {"status": "success", "instances": instances}
+
+    monkeypatch.setattr(state, "call_agent", fake_call_agent)
+    return captured
+
+
+def test_force_stop_last_healthy_uses_short_list_instances_timeout(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    # #13:force stop 的 last-healthy 核实须用新的短超时 list_instances_timeout,
+    # 不再复用 rolling_cmd_timeout(480s,会超过 BFF 15s 致"已执行但显失败")。
+    import app.main as main_module
+
+    state = main_module.hub_state
+    attach_agent(state, "agent-a")
+    captured = _capture_call_agent_timeout(state, monkeypatch, healthy=2)
+    object.__setattr__(main_module.settings, "list_instances_timeout", 10)
+    object.__setattr__(main_module.settings, "rolling_cmd_timeout", 480)
+
+    r = _post(client, _force_stop_body("req-timeout-1"))
+    assert r.status_code == 202, r.text
+    assert captured["timeouts"] == [10]  # 用短超时,不是 480
+
+
+def test_list_instances_endpoint_uses_short_timeout(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    # #13:list-instances REST 端点同样改用短超时。
+    import app.main as main_module
+
+    state = main_module.hub_state
+    attach_agent(state, "agent-a")
+    captured = _capture_call_agent_timeout(state, monkeypatch, healthy=1)
+    object.__setattr__(main_module.settings, "list_instances_timeout", 10)
+    object.__setattr__(main_module.settings, "rolling_cmd_timeout", 480)
+
+    r = client.post(
+        "/api/agents/agent-a/list-instances",
+        headers={"X-Admin-Token": "test-admin-token"},
+        json={"serviceName": "memory-share"},
+    )
+    assert r.status_code == 200, r.text
+    assert captured["timeouts"] == [10]
 
 
 # === force_guard 单元:滑窗剪枝与 reset ===

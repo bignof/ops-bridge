@@ -164,6 +164,9 @@ class HubState:
         self.command_history_limit = command_history_limit
         self.database = database
         self._connections: dict[str, WebSocket] = {}
+        # agent 在线运行态(纯内存,不落 DB):register 帧上报的 capabilities/agentVersion。
+        # 离线即清(随连接生命周期),供平台节点页展示与将来的能力门控读取。
+        self._agent_runtime: dict[str, dict[str, Any]] = {}
         self._log_streams_by_session: dict[str, dict[str, Any]] = {}
         self._log_streams_by_key: dict[tuple[str, str, bool], str] = {}
         self._log_subscribers: dict[str, str] = {}
@@ -191,6 +194,8 @@ class HubState:
 
             if agent_id in self._connections:
                 self._connections.pop(agent_id, None)
+                # 连接关闭即清在线运行态(capabilities/agentVersion 是纯内存态,不残留)。
+                self._agent_runtime.pop(agent_id, None)
                 should_persist = True
 
             stale_session_ids = [
@@ -218,6 +223,19 @@ class HubState:
     async def get_connection(self, agent_id: str) -> WebSocket | None:
         async with self._lock:
             return self._connections.get(agent_id)
+
+    async def set_agent_runtime(self, agent_id: str, capabilities: Any, agent_version: Any) -> None:
+        """记录 agent register 帧上报的能力 / 版本(纯内存在线态)。"""
+        async with self._lock:
+            self._agent_runtime[agent_id] = {
+                "capabilities": capabilities,
+                "agent_version": agent_version,
+            }
+
+    async def get_agent_runtime(self, agent_id: str) -> dict[str, Any] | None:
+        """取 agent 的在线运行态(capabilities/agent_version);未注册或已离线返回 None。"""
+        async with self._lock:
+            return self._agent_runtime.get(agent_id)
 
     async def call_agent(self, agent_id: str, message: dict, timeout: float) -> dict:
         request_id = message["requestId"]
@@ -461,23 +479,33 @@ class HubState:
         return await asyncio.to_thread(self._provision_agent_sync, agent_id)
 
     async def list_agents(self) -> list[dict[str, Any]]:
-        connection_ids = await self._connection_ids()
+        connection_ids, runtime_map = await self._connections_and_runtime()
         agents, summaries = await asyncio.to_thread(self._list_agents_with_summaries_sync)
-        snapshots = [self._snapshot_agent(agent, connection_ids, summaries.get(agent["agent_id"], {})) for agent in agents]
+        snapshots = [
+            self._snapshot_agent(agent, connection_ids, summaries.get(agent["agent_id"], {}), runtime_map.get(agent["agent_id"]))
+            for agent in agents
+        ]
         return sorted(snapshots, key=lambda item: item["agent_id"])
 
     async def get_agent(self, agent_id: str) -> dict[str, Any] | None:
-        connection_ids = await self._connection_ids()
+        connection_ids, runtime_map = await self._connections_and_runtime()
         record, summary = await asyncio.to_thread(self._get_agent_with_summary_sync, agent_id)
         if record is None:
             return None
-        return self._snapshot_agent(record, connection_ids, summary)
+        return self._snapshot_agent(record, connection_ids, summary, runtime_map.get(agent_id))
 
-    async def _connection_ids(self) -> set[str]:
+    async def _connections_and_runtime(self) -> tuple[set[str], dict[str, dict[str, Any]]]:
+        # 一次持锁同时取在线集与运行态副本,保证两者一致(同一快照点)。
         async with self._lock:
-            return set(self._connections.keys())
+            return set(self._connections.keys()), dict(self._agent_runtime)
 
-    def _snapshot_agent(self, record: dict[str, Any], connection_ids: set[str], summary: dict[str, Any]) -> dict[str, Any]:
+    def _snapshot_agent(
+        self,
+        record: dict[str, Any],
+        connection_ids: set[str],
+        summary: dict[str, Any],
+        runtime: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         last_seen_at = record["last_seen_at"]
         connected = record["agent_id"] in connection_ids
         online = bool(
@@ -485,6 +513,7 @@ class HubState:
             and last_seen_at is not None
             and utc_now() - last_seen_at <= timedelta(seconds=self.heartbeat_timeout)
         )
+        runtime = runtime or {}
         return {
             "agent_id": record["agent_id"],
             "connected": connected,
@@ -501,6 +530,9 @@ class HubState:
             "queued_commands": summary.get("queued_commands", 0),
             "processing_commands": summary.get("processing_commands", 0),
             "last_command_created_at": summary.get("last_command_created_at"),
+            # register 帧上报的纯内存态(离线时为 None,不落 DB)。
+            "capabilities": runtime.get("capabilities"),
+            "agent_version": runtime.get("agent_version"),
         }
 
     def _command_summary_map_sync(self, agent_id: str | None = None) -> dict[str, dict[str, Any]]:

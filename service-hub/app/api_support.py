@@ -254,6 +254,20 @@ async def _handle_agent_message(agent_id: str, payload: dict[str, Any]) -> None:
     if msg_type == "heartbeat":
         return
 
+    if msg_type == "register":
+        # #4/#10:消费 agent 连上首帧上报的能力 / 版本,存进在线态(纯内存,随连接生命周期)。
+        # 供平台节点页展示;能力门控(BFF 据 capabilities 拒不支持的 action)为后续。
+        capabilities = payload.get("capabilities")
+        agent_version = payload.get("agentVersion")
+        await main_module.hub_state.set_agent_runtime(agent_id, capabilities, agent_version)
+        logger.info(
+            "Agent %s registered: capabilities=%s agentVersion=%s",
+            agent_id,
+            capabilities,
+            agent_version,
+        )
+        return
+
     if msg_type == "ack":
         request_id = payload.get("requestId")
         if request_id:

@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import APIRouter, Header, HTTPException, Path, status
 from fastapi.responses import StreamingResponse
 
-from app.api_support import _require_admin_token
+from app.api_support import _derive_requested_by, _require_admin_token
 from app.models import AgentLogsStreamRequest
 
 
@@ -27,12 +27,16 @@ async def stream_agent_logs(
     request: AgentLogsStreamRequest,
     agent_id: str = Path(title="Agent 标识", description="要查看日志的 Agent 唯一标识。"),
     admin_token: str | None = Header(default=None, alias="X-Admin-Token", title="管理令牌", description="管理操作鉴权令牌。"),
-    requested_by: str | None = Header(default=None, alias="X-Requested-By", title="请求发起方", description="调用该接口的系统或用户标识。"),
+    requested_by_hint: str | None = Header(default=None, alias="X-Requested-By", title="请求发起方提示", description="调用方自报的发起方标识，仅作审计提示，requested_by 由 hub 据 admin token 服务端派生。"),
     request_source: str | None = Header(default=None, alias="X-Requested-Source", title="请求来源", description="调用来源，例如控制台、调度器。"),
 ) -> StreamingResponse:
     import app.main as main_module
 
     _require_admin_token(admin_token)
+    # criticC:requested_by 据 admin token 服务端派生强制覆盖,客户端 X-Requested-By 仅作 hint(记日志,不入审计),
+    # 与 dispatch/retry 一致,不给日志流审计留客户端旁路。
+    requested_by = _derive_requested_by(admin_token)
+    main_module.logger.info("日志流授权身份=%s,客户端 X-Requested-By 提示=%s", requested_by, requested_by_hint)
     agent = await main_module.hub_state.get_agent(agent_id)
     if agent is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
