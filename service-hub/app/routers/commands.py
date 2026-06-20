@@ -154,6 +154,11 @@ async def list_agent_instances(
         # agent 未在超时内应答;脱敏,不向调用方暴露内部细节。
         main_module.logger.warning("Agent %s 未应答 list-instances(requestId=%s)", agent_id, req)
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="agent 未应答 list-instances") from exc
+    except RuntimeError as exc:
+        # check→call 竞态:online 判定通过后、发送前 agent 恰好断开,call_agent 抛 RuntimeError。
+        # 归一化为脱敏 502(对齐「失败一律 502」契约,不让 RuntimeError 逃逸成未脱敏 500)。
+        main_module.logger.warning("Agent %s 连接不可用,list-instances 失败(requestId=%s)", agent_id, req)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="agent 连接不可用") from exc
 
     if result.get("status") != "success":
         # agent 端执行失败,回传其 error(脱敏:仅取 error 字段)。

@@ -1091,3 +1091,23 @@ def test_list_instances_agent_timeout_returns_502(client: TestClient, monkeypatc
     )
 
     assert response.status_code == 502
+
+
+def test_list_instances_agent_connection_lost_returns_502(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    # check→call 竞态:online 判定通过后 call_agent 抛 RuntimeError(连接不可用)→ 502 脱敏,
+    # 不得逃逸成未脱敏 500。
+    import app.main as main_module
+
+    state = main_module.hub_state
+    attach_agent(state, "agent-a")
+    _stub_call_agent(state, monkeypatch, raises=RuntimeError("connection unavailable"))
+
+    response = client.post(
+        "/api/agents/agent-a/list-instances",
+        headers={"X-Admin-Token": "test-admin-token"},
+        json={"serviceName": "memory-share"},
+    )
+
+    assert response.status_code == 502
+    # 脱敏:不向调用方暴露内部异常原文。
+    assert "connection unavailable" not in response.json().get("detail", "")

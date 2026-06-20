@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from typing import Any
 
@@ -36,6 +37,8 @@ from app.auth import require_session
 from app.db_models import Namespace, Service
 from app.models import NodeListOut, NodeOut
 
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/nodes", tags=["节点控制"])
 
@@ -59,7 +62,10 @@ def _load_agents_map() -> dict[str, dict[str, Any]]:
     """
     try:
         agents = hub_client.list_agents()
-    except Exception:  # noqa: BLE001 —— hub 任意失败都不得拖垮整页,统一退化为空 map
+    except Exception as exc:  # noqa: BLE001 —— hub 任意失败都不得拖垮整页,统一退化为空 map
+        # 退化不崩页,但留一条脱敏告警(仅异常类型名,绝不记 token/完整消息),便于运维区分
+        # 「hub 全程不可达」与「确实全部离线」。
+        logger.warning("加载 hub agents 失败,节点页降级为全离线: %s", type(exc).__name__)
         return {}
     return {a.get("agentId"): a for a in agents if isinstance(a, dict) and a.get("agentId")}
 
