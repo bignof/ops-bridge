@@ -356,6 +356,88 @@ def test_handle_update_restores_after_up_failure(monkeypatch: pytest.MonkeyPatch
     assert restore_calls == [("compose.yml", "services: {}\n")]
 
 
+# ─────────────────────────────────────────────
+# handle_update — 镜像 registry 白名单闸（pull 之前拦截）
+# ─────────────────────────────────────────────
+
+def test_handle_update_rejects_image_outside_allowlist_without_pulling(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """非白名单 image → failed，且绝不调用 run_compose（pull 未发生）、不改写 compose。"""
+    ws = FakeWebSocket()
+    compose_calls: list[list[str]] = []
+    update_calls = {"n": 0}
+
+    monkeypatch.setattr(handlers.config, "IMAGE_REGISTRY_ALLOWLIST", ["registry.example.com"])
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "read_compose_file", lambda compose_file: "services: {}\n")
+    monkeypatch.setattr(handlers, "update_image_in_compose", lambda *args: update_calls.__setitem__("n", update_calls["n"] + 1) or ["api"])
+    monkeypatch.setattr(handlers, "run_compose", lambda project_dir, args: (compose_calls.append(args) or (True, "ok")))
+
+    handlers.handle_update(ws, {"image": "evil.com/x:1"}, "req-1", str(tmp_path))
+
+    decoded = _decode_messages(ws)
+    assert decoded[-1]["status"] == "failed"
+    assert "白名单" in decoded[-1]["error"]
+    assert "evil.com/x:1" in decoded[-1]["error"]
+    # 关键：拦截在 pull 之前——既没跑 run_compose，也没改写 compose
+    assert compose_calls == []
+    assert update_calls["n"] == 0
+
+
+def test_handle_update_allows_whitelisted_image_and_proceeds(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """白名单内 image → 放行，走到 update_image_in_compose 与 run_compose(['pull'])。"""
+    ws = FakeWebSocket()
+    compose_calls: list[list[str]] = []
+
+    monkeypatch.setattr(handlers.config, "IMAGE_REGISTRY_ALLOWLIST", ["registry.example.com"])
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "read_compose_file", lambda compose_file: "services: {}\n")
+    monkeypatch.setattr(handlers, "update_image_in_compose", lambda *args: ["api"])
+    monkeypatch.setattr(handlers, "run_compose", lambda project_dir, args: (compose_calls.append(args) or (True, "ok")))
+
+    handlers.handle_update(ws, {"image": "registry.example.com/app:9"}, "req-1", str(tmp_path))
+
+    decoded = _decode_messages(ws)
+    assert decoded[-1]["status"] == "success"
+    # 放行后正常进入 pull → down → up -d 流程
+    assert compose_calls == [["pull"], ["down"], ["up", "-d"]]
+
+
+def test_handle_update_empty_allowlist_does_not_block(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """空 allowlist = 不限制：任意 image 都放行（不被白名单闸拦）。"""
+    ws = FakeWebSocket()
+    compose_calls: list[list[str]] = []
+
+    monkeypatch.setattr(handlers.config, "IMAGE_REGISTRY_ALLOWLIST", [])
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "read_compose_file", lambda compose_file: "services: {}\n")
+    monkeypatch.setattr(handlers, "update_image_in_compose", lambda *args: ["api"])
+    monkeypatch.setattr(handlers, "run_compose", lambda project_dir, args: (compose_calls.append(args) or (True, "ok")))
+
+    handlers.handle_update(ws, {"image": "any-registry.io/x:1"}, "req-1", str(tmp_path))
+
+    assert _decode_messages(ws)[-1]["status"] == "success"
+    assert compose_calls == [["pull"], ["down"], ["up", "-d"]]
+
+
+def test_handle_pull_redeploy_force_blocked_by_allowlist(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """pull-redeploy(force) 复用 handle_update，非白名单 image 同样被拦在 pull 之前。"""
+    ws = FakeWebSocket()
+    compose_calls: list[list[str]] = []
+
+    monkeypatch.setattr(handlers.config, "IMAGE_REGISTRY_ALLOWLIST", ["registry.example.com"])
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "read_compose_file", lambda compose_file: "services: {}\n")
+    monkeypatch.setattr(handlers, "update_image_in_compose", lambda *args: ["api"])
+    monkeypatch.setattr(handlers, "run_compose", lambda project_dir, args: (compose_calls.append(args) or (True, "ok")))
+
+    handlers.handle_pull_redeploy(ws, {"mode": "force", "image": "evil.com/x:1"}, "req-1", str(tmp_path))
+
+    decoded = _decode_messages(ws)
+    assert decoded[-1]["status"] == "failed"
+    assert "白名单" in decoded[-1]["error"]
+    assert compose_calls == []
+
+
 def test_handle_restart_paths(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     ws = FakeWebSocket()
     monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: None)

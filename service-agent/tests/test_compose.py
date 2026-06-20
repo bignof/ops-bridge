@@ -120,3 +120,74 @@ def test_open_compose_process_uses_cached_command(monkeypatch: pytest.MonkeyPatc
     assert process.stdout is None
     assert calls == [(["docker", "compose", "logs", "-f", "--tail", "10", "api"], "/tmp/app")]
     compose._compose_cmd = None
+
+
+# ─────────────────────────────────────────────
+# is_image_registry_allowed — 镜像 registry 白名单（按 registry 边界，绝不裸 startswith）
+# ─────────────────────────────────────────────
+
+def test_is_image_registry_allowed_empty_allowlist_passes_everything() -> None:
+    """空 allowlist = 不限制：任何镜像都放行。"""
+    assert compose.is_image_registry_allowed("evil.com/x:1", []) is True
+    assert compose.is_image_registry_allowed("registry.example.com/app:1", []) is True
+    assert compose.is_image_registry_allowed("nginx:latest", []) is True
+
+
+def test_is_image_registry_allowed_matches_registry_host() -> None:
+    """白名单内 registry 主机（含 . 或 :）的镜像放行。"""
+    allowlist = ["registry.example.com"]
+    assert compose.is_image_registry_allowed("registry.example.com/app:1.0", allowlist) is True
+    assert compose.is_image_registry_allowed("registry.example.com/team/app:1.0", allowlist) is True
+
+
+def test_is_image_registry_allowed_matches_registry_host_with_port() -> None:
+    """带端口的 registry 主机（首段含 :）按主机精确匹配。"""
+    allowlist = ["registry.example.com:5000"]
+    assert compose.is_image_registry_allowed("registry.example.com:5000/app:1.0", allowlist) is True
+    assert compose.is_image_registry_allowed("registry.example.com:5001/app:1.0", allowlist) is False
+
+
+def test_is_image_registry_allowed_rejects_non_whitelisted_registry() -> None:
+    """非白名单 registry 必须拒绝。"""
+    allowlist = ["registry.example.com"]
+    assert compose.is_image_registry_allowed("evil.com/x:1", allowlist) is False
+
+
+def test_is_image_registry_allowed_rejects_suffix_lookalike_boundary() -> None:
+    """边界反例（核心安全要点）：registry.example.com.evil 不得被误判为白名单内。
+
+    裸 startswith('registry.example.com') 会误放，必须按 registry 主机精确相等判定。
+    """
+    allowlist = ["registry.example.com"]
+    assert compose.is_image_registry_allowed("registry.example.com.evil/x:1", allowlist) is False
+    # 反向：前缀作为子串嵌在别处也不能放行
+    assert compose.is_image_registry_allowed("evil-registry.example.com/x:1", allowlist) is False
+
+
+def test_is_image_registry_allowed_docker_io_default_library() -> None:
+    """无 registry 主机分量（首段不含 . : 且非 localhost）→ registry 视为 docker.io。"""
+    allowlist = ["docker.io"]
+    # 官方库镜像（单段）
+    assert compose.is_image_registry_allowed("nginx:latest", allowlist) is True
+    # 带命名空间但仍是 docker.io（首段 library 不是 registry 主机）
+    assert compose.is_image_registry_allowed("library/nginx:latest", allowlist) is True
+    # docker.io 不在白名单时拒绝
+    assert compose.is_image_registry_allowed("nginx:latest", ["registry.example.com"]) is False
+
+
+def test_is_image_registry_allowed_localhost_is_registry_host() -> None:
+    """首段等于 localhost 时视为 registry 主机。"""
+    assert compose.is_image_registry_allowed("localhost/app:1", ["localhost"]) is True
+    assert compose.is_image_registry_allowed("localhost:5000/app:1", ["localhost:5000"]) is True
+    assert compose.is_image_registry_allowed("localhost/app:1", ["registry.example.com"]) is False
+
+
+def test_is_image_registry_allowed_prefix_match_with_boundary() -> None:
+    """allowlist 项为完整镜像前缀（带 / 边界或精确相等）时也放行。"""
+    allowlist = ["registry.example.com/team"]
+    # 带 / 边界：前缀后必须是 / 才算命中
+    assert compose.is_image_registry_allowed("registry.example.com/team/app:1", allowlist) is True
+    # 精确相等（无 tag 场景）
+    assert compose.is_image_registry_allowed("registry.example.com/team", allowlist) is True
+    # 边界反例：team-evil 不得被前缀 team 误放
+    assert compose.is_image_registry_allowed("registry.example.com/team-evil/app:1", allowlist) is False

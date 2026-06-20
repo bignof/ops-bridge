@@ -26,6 +26,13 @@ HEARTBEAT_INTERVAL = int(os.getenv('HEARTBEAT_INTERVAL', '30'))
 HEALTH_HOST        = os.getenv('HEALTH_HOST', '0.0.0.0')
 HEALTH_PORT        = int(os.getenv('HEALTH_PORT', '18081'))
 
+# agent 自报版本（平台据此对旧 agent 禁用其不支持的操作，滚动升级期兼容）。
+AGENT_VERSION      = os.getenv('AGENT_VERSION', '1.0.0')
+
+# --- 镜像 registry 白名单（防供应链：pull/重部署前在 agent 这个不可绕过的执行点校验镜像来源）---
+# 逗号分隔；空列表 = 不限制（放行全部），非空 = 强制。匹配语义见 services.compose.is_image_registry_allowed。
+IMAGE_REGISTRY_ALLOWLIST = [x.strip() for x in os.getenv('IMAGE_REGISTRY_ALLOWLIST', '').split(',') if x.strip()]
+
 # --- 节点控制安全闸（compose 命令目录守卫）---
 MANAGED_PROJECTS_ROOT = os.getenv('MANAGED_PROJECTS_ROOT', '/data')  # 受管 compose 根目录，所有命令 dir 必须在其下
 SELF_PROJECT_DIR      = os.getenv('SELF_PROJECT_DIR', '')            # agent 自身 compose 目录，禁止被操作（防自杀/越权）

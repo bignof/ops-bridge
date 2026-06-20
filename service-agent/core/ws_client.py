@@ -5,8 +5,8 @@ import time
 
 import websocket
 
-from config import AGENT_ID, AGENT_KEY, HEARTBEAT_INTERVAL, WS_URL
-from core.handlers import dispatch, send_message
+from config import AGENT_ID, AGENT_KEY, AGENT_VERSION, HEARTBEAT_INTERVAL, WS_URL
+from core.handlers import HANDLERS, dispatch, send_message
 from core.log_sessions import start_log_session, stop_log_session
 from core.rolling import handle_graceful_restart, handle_list_instances
 
@@ -43,6 +43,14 @@ def _on_open(ws):
         last_message_ts=now,
         last_error=None,
     )
+    # 上报能力 + 版本：供平台对旧 agent 禁用其不支持的操作（滚动升级期兼容）。
+    # capabilities 取命令动作集（HANDLERS keys）；graceful-restart/list-instances 是独立 message type，不在此列。
+    send_message(ws, {
+        'type': 'register',
+        'agentId': AGENT_ID,
+        'capabilities': sorted(HANDLERS.keys()),
+        'agentVersion': AGENT_VERSION,
+    })
     _start_heartbeat(ws)
 
 

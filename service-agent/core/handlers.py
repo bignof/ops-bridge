@@ -13,7 +13,7 @@ from typing import TypedDict, cast
 
 import config
 from core import graceful
-from services.compose import find_compose_file, read_compose_file, restore_compose_file, run_compose, update_image_in_compose
+from services.compose import find_compose_file, is_image_registry_allowed, read_compose_file, restore_compose_file, run_compose, update_image_in_compose
 
 logger = logging.getLogger(__name__)
 
@@ -221,6 +221,12 @@ def handle_update(ws, data, request_id, project_dir):
     image = data.get('image')
     if not image:
         send_error(ws, request_id, "Action 'update' requires the 'image' field")
+        return
+
+    # 镜像 registry 白名单闸：在 pull / 任何 compose 改写之前拦截非白名单来源。
+    # pull-redeploy(force) 复用 handle_update，因此该校验同样覆盖重部署路径。
+    if not is_image_registry_allowed(image, config.IMAGE_REGISTRY_ALLOWLIST):
+        send_error(ws, request_id, f"镜像来源不在白名单: {image}")
         return
 
     compose_file = find_compose_file(project_dir)

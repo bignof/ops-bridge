@@ -8,6 +8,43 @@ import yaml
 logger = logging.getLogger(__name__)
 
 
+def _image_registry_host(image):
+    """提取镜像的 registry 主机分量（按 Docker 规则）。
+
+    单段镜像（不含 `/`，如 `nginx:latest`）一律是 docker.io 官方库——首段里的 `:` 是 tag 而非端口，
+    不能当 registry 主机。仅当镜像含 `/` 且首段含 `.` 或 `:` 或等于 `localhost` 时，首段才算 registry 主机；
+    否则（如 `library/nginx`）首段是 docker.io 上的命名空间，registry 视为 `docker.io`。
+    """
+    if '/' not in image:
+        return 'docker.io'
+    first = image.split('/', 1)[0]
+    if '.' in first or ':' in first or first == 'localhost':
+        return first
+    return 'docker.io'
+
+
+def is_image_registry_allowed(image, allowlist):
+    """校验镜像来源是否在白名单内（按 registry 边界匹配，绝不裸 startswith）。
+
+    - 空 allowlist → True（不限制，放行全部）。
+    - 非空 allowlist：满足任一即放行——
+      ① 镜像的 registry 主机分量 == 某 allowlist 项（精确相等）；
+      ② image == prefix（精确相等）或 image.startswith(prefix + '/')（带 `/` 边界，防 `foo` 误放 `foo-evil`）。
+
+    反例必须被拒：allowlist=["registry.example.com"] 时 "registry.example.com.evil/x:1" → False。
+    """
+    if not allowlist:
+        return True
+
+    registry_host = _image_registry_host(image)
+    for prefix in allowlist:
+        if registry_host == prefix:
+            return True
+        if image == prefix or image.startswith(prefix + '/'):
+            return True
+    return False
+
+
 def get_compose_cmd():
     """
     仅使用 Docker Compose v2 插件。
