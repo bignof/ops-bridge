@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Generic, TypeVar
+from typing import Generic, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
@@ -396,3 +396,68 @@ class NodeOut(BaseModel):
 
 class NodeListOut(ListEnvelope[NodeOut]):
     """节点列表响应(具体子类,避开泛型 response_model 的 Pydantic 警告路径)。"""
+
+
+# --- 节点操作下发 + 操作审计(Task 10b) -----------------------------------
+
+
+class NodeActionIn(BaseModel):
+    """节点操作请求 body:`{mode?, allowLastInstance?}`。
+
+    寻址(agentId / serviceCode / action)走 URL 路径段,**dir / nacosServiceName /
+    defaultImage 一律由平台 Service 表权威派生**,故 body 不含路径与 image(防客户端传任意路径
+    或镜像)。`mode`:restart 缺省按 graceful;stop / redeploy 必填(路由层校验,缺省 → 400)。
+    `allowLastInstance` 仅 force stop 透传给 hub 护栏(允许停最后一个健康实例)。
+    """
+
+    model_config = MODEL_CONFIG
+
+    mode: Literal["graceful", "force"] | None = None
+    allow_last_instance: bool = False
+
+
+class NodeActionOut(BaseModel):
+    """节点操作下发响应:区分两条派发路径(评审冲突 3)。
+
+    - `kind="rolling"`:优雅 restart 走 hub `/api/rolling-restart`,返回异步 `taskId`
+      (`requestId=None`);SPA 后续可按 taskId 单查 `/api/rolling-restart/{taskId}` 看进度。
+    - `kind="command"`:其余操作走 hub dispatch,返回 hub 生成的 `requestId`(`taskId=None`)
+      + `accepted`;该命令会出现在 `/api/node-operations` 审计列表。
+    """
+
+    model_config = MODEL_CONFIG
+
+    kind: Literal["command", "rolling"]
+    request_id: str | None = None
+    task_id: str | None = None
+    accepted: bool = False
+
+
+class NodeOperationOut(BaseModel):
+    """操作审计行响应:hub `CommandSnapshot` 子集(评审冲突 2,用 `dir` 非 targetDir)。
+
+    取审计页关心字段:谁(`requestedBy` 派生 + `requestSource`)/做了什么(`action` / `mode`)
+    / 目标(`dir` / `image`)/ 结果(`status` / `output` / `error`)/ 时间。`output` 与 `error`
+    超 1000 字符在路由层截尾(保留末尾,结果通常在尾部),避免审计列表 payload 膨胀。
+    本期只代理 hub dispatch 命令;优雅 restart 走 rolling、不进此列表(已知缺口,见报告)。
+    """
+
+    model_config = MODEL_CONFIG
+
+    request_id: str
+    agent_id: str
+    action: str
+    mode: str | None = None
+    status: str
+    requested_by: str | None = None
+    request_source: str | None = None
+    dir: str | None = None
+    image: str | None = None
+    output: str | None = None
+    error: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class NodeOperationsListOut(ListEnvelope[NodeOperationOut]):
+    """操作审计列表响应(平台标准信封;BFF 把 hub limit/offset 换算成 page/pageSize)。"""

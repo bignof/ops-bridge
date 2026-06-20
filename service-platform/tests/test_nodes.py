@@ -277,3 +277,466 @@ def test_nodes_pagination(client: TestClient, monkeypatch) -> None:
 def test_nodes_requires_auth(client: TestClient) -> None:
     # 无 Bearer → default-deny 中间件 / require_session 401。
     assert client.get("/api/nodes").status_code == 401
+
+
+# =====================================================================================
+# Task 10b:节点操作下发 POST /api/nodes/{agentId}/{serviceCode}/{action} + 操作审计
+# =====================================================================================
+#
+# 寻址权威源 = 平台 Service 表(dir / nacosServiceName / defaultImage),BFF 不接受客户端
+# 传路径/任意 image。优雅 restart 走 hub /api/rolling-restart;其余 dispatch。
+# requested_by 由 hub 服务端派生 —— BFF **绝不传 X-Requested-By**,只带 admin token
+# (由 hub_client._headers() 注入)。打桩纪律同上:patch nodes.hub_client.* 模块引用。
+
+
+def _dispatch_ok(request_id: str = "req-123", accepted: bool = True) -> dict:
+    """造一条 hub dispatch 成功响应(202 CommandDispatchResponse,camelCase)。"""
+    return {"accepted": accepted, "command": {"requestId": request_id, "status": "queued"}}
+
+
+def _capture_dispatch(store_box: dict):
+    """返回一个 dispatch_command 替身,把 (agent_id, payload) 记到 store_box 并回成功。"""
+
+    def _fake(agent_id, payload, **kw):
+        store_box["agent_id"] = agent_id
+        store_box["payload"] = payload
+        return _dispatch_ok()
+
+    return _fake
+
+
+def test_op_restart_graceful_uses_rolling(client: TestClient, monkeypatch) -> None:
+    # restart + graceful(或 mode 缺省)→ 走 hub rolling_restart(agentId, nacosServiceName, force=False),
+    # 返回 kind=rolling + taskId(不走 dispatch)。
+    h = _h(client)
+    ns = _mk_ns("agent-r")
+    _mk_svc(ns, "svc-roll", nacos="roll-nacos")
+
+    box = {}
+
+    def fake_rolling(agent_id, service_name, force=False, **kw):
+        box["agent_id"] = agent_id
+        box["service_name"] = service_name
+        box["force"] = force
+        return {"taskId": "task-xyz"}
+
+    monkeypatch.setattr(nodes.hub_client, "rolling_restart", fake_rolling)
+    # dispatch 不应被调用
+    monkeypatch.setattr(
+        nodes.hub_client, "dispatch_command", lambda *a, **k: (_ for _ in ()).throw(AssertionError("不应调 dispatch"))
+    )
+
+    resp = client.post("/api/nodes/agent-r/svc-roll/restart", json={"mode": "graceful"}, headers=h)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["kind"] == "rolling"
+    assert body["taskId"] == "task-xyz"
+    assert body["requestId"] is None
+    assert box["agent_id"] == "agent-r"
+    assert box["service_name"] == "roll-nacos"
+    assert box["force"] is False
+    # 响应 camel:无 snake key
+    assert "request_id" not in body and "task_id" not in body
+
+
+def test_op_restart_default_mode_is_graceful(client: TestClient, monkeypatch) -> None:
+    # restart 不传 mode → 按 graceful 走 rolling。
+    h = _h(client)
+    ns = _mk_ns("agent-rd")
+    _mk_svc(ns, "svc-rd", nacos="rd-nacos")
+
+    box = {}
+    monkeypatch.setattr(
+        nodes.hub_client, "rolling_restart", lambda a, s, force=False, **k: (box.update(force=force) or {"taskId": "t-rd"})
+    )
+    resp = client.post("/api/nodes/agent-rd/svc-rd/restart", json={}, headers=h)
+    assert resp.status_code == 200
+    assert resp.json()["kind"] == "rolling"
+    assert resp.json()["taskId"] == "t-rd"
+    assert box["force"] is False
+
+
+def test_op_restart_graceful_no_nacos_400(client: TestClient, monkeypatch) -> None:
+    # restart + graceful 但 service 无 nacosServiceName → 400(滚动必须有 serviceName)。
+    h = _h(client)
+    ns = _mk_ns("agent-rn")
+    _mk_svc(ns, "svc-rn", nacos=None)
+
+    monkeypatch.setattr(nodes.hub_client, "rolling_restart", lambda *a, **k: {"taskId": "x"})
+    resp = client.post("/api/nodes/agent-rn/svc-rn/restart", json={"mode": "graceful"}, headers=h)
+    assert resp.status_code == 400
+
+
+def test_op_restart_force_dispatches_force_restart(client: TestClient, monkeypatch) -> None:
+    # restart + force → dispatch action=force-restart + dir(不走 rolling)。
+    h = _h(client)
+    ns = _mk_ns("agent-rf")
+    _mk_svc(ns, "svc-rf", nacos="rf-nacos")
+
+    box = {}
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch(box))
+    monkeypatch.setattr(
+        nodes.hub_client, "rolling_restart", lambda *a, **k: (_ for _ in ()).throw(AssertionError("force 不应走 rolling"))
+    )
+
+    resp = client.post("/api/nodes/agent-rf/svc-rf/restart", json={"mode": "force"}, headers=h)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["kind"] == "command"
+    assert body["requestId"] == "req-123"
+    assert body["accepted"] is True
+    assert box["agent_id"] == "agent-rf"
+    assert box["payload"]["action"] == "force-restart"
+    assert box["payload"]["dir"] == "/opt/svc-rf"
+
+
+def test_op_start_dispatches_start(client: TestClient, monkeypatch) -> None:
+    # start → dispatch action=start + dir(mode 忽略)。
+    h = _h(client)
+    ns = _mk_ns("agent-s")
+    _mk_svc(ns, "svc-start", nacos="start-nacos")
+
+    box = {}
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch(box))
+    resp = client.post("/api/nodes/agent-s/svc-start/start", json={}, headers=h)
+    assert resp.status_code == 200
+    assert box["payload"]["action"] == "start"
+    assert box["payload"]["dir"] == "/opt/svc-start"
+    # start 不带 mode/image/healthBaseUrl
+    assert "mode" not in box["payload"]
+
+
+def test_op_stop_force_dispatches_with_servicename_and_allowlast(client: TestClient, monkeypatch) -> None:
+    # stop + force → dispatch action=stop mode=force + dir + serviceName + allowLastInstance 透传。
+    h = _h(client)
+    ns = _mk_ns("agent-sf")
+    _mk_svc(ns, "svc-sf", nacos="sf-nacos")
+
+    box = {}
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch(box))
+    resp = client.post(
+        "/api/nodes/agent-sf/svc-sf/stop", json={"mode": "force", "allowLastInstance": True}, headers=h
+    )
+    assert resp.status_code == 200
+    p = box["payload"]
+    assert p["action"] == "stop"
+    assert p["mode"] == "force"
+    assert p["dir"] == "/opt/svc-sf"
+    assert p["serviceName"] == "sf-nacos"
+    assert p["allowLastInstance"] is True
+
+
+def test_op_stop_graceful_derives_health_base_url(client: TestClient, monkeypatch) -> None:
+    # stop + graceful → list_instances 返 1 healthy → dispatch 含 healthBaseUrl=http://<addr> + mode=graceful
+    # + shutdownTimeoutSec=60 + serviceName。
+    h = _h(client)
+    ns = _mk_ns("agent-sg")
+    _mk_svc(ns, "svc-sg", nacos="sg-nacos")
+
+    box = {}
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch(box))
+    # 第一个 unhealthy、第二个 healthy → 应取第一个 healthy 的 address(10.0.0.1)
+    monkeypatch.setattr(
+        nodes.hub_client,
+        "list_instances",
+        lambda agent_id, service_name, **kw: {
+            "status": "success",
+            "instances": [
+                {"address": "10.0.0.0", "healthy": False},
+                {"address": "10.0.0.1", "healthy": True},
+            ],
+        },
+    )
+    resp = client.post("/api/nodes/agent-sg/svc-sg/stop", json={"mode": "graceful"}, headers=h)
+    assert resp.status_code == 200
+    p = box["payload"]
+    assert p["action"] == "stop"
+    assert p["mode"] == "graceful"
+    assert p["dir"] == "/opt/svc-sg"
+    assert p["serviceName"] == "sg-nacos"
+    assert p["healthBaseUrl"] == "http://10.0.0.1"
+    assert p["shutdownTimeoutSec"] == 60
+
+
+def test_op_stop_graceful_no_healthy_409(client: TestClient, monkeypatch) -> None:
+    # stop + graceful 但 0 healthy → 409(无健康实例可优雅 drain;请用 force)。
+    h = _h(client)
+    ns = _mk_ns("agent-sg0")
+    _mk_svc(ns, "svc-sg0", nacos="sg0-nacos")
+
+    monkeypatch.setattr(
+        nodes.hub_client,
+        "list_instances",
+        lambda *a, **k: {"status": "success", "instances": [{"address": "10.0.0.0", "healthy": False}]},
+    )
+    monkeypatch.setattr(
+        nodes.hub_client, "dispatch_command", lambda *a, **k: (_ for _ in ()).throw(AssertionError("无健康实例不应 dispatch"))
+    )
+    resp = client.post("/api/nodes/agent-sg0/svc-sg0/stop", json={"mode": "graceful"}, headers=h)
+    assert resp.status_code == 409
+
+
+def test_op_stop_graceful_no_nacos_400(client: TestClient, monkeypatch) -> None:
+    # stop + graceful 但无 nacosServiceName → 400(优雅操作需配置 nacosServiceName,不发 list_instances)。
+    h = _h(client)
+    ns = _mk_ns("agent-sgn")
+    _mk_svc(ns, "svc-sgn", nacos=None)
+
+    monkeypatch.setattr(
+        nodes.hub_client, "list_instances", lambda *a, **k: (_ for _ in ()).throw(AssertionError("无 nacos 不应查实例"))
+    )
+    resp = client.post("/api/nodes/agent-sgn/svc-sgn/stop", json={"mode": "graceful"}, headers=h)
+    assert resp.status_code == 400
+
+
+def test_op_stop_requires_mode(client: TestClient, monkeypatch) -> None:
+    # stop 缺省 mode → 400(stop/redeploy 须指定 mode)。
+    h = _h(client)
+    ns = _mk_ns("agent-snm")
+    _mk_svc(ns, "svc-snm", nacos="snm-nacos")
+    resp = client.post("/api/nodes/agent-snm/svc-snm/stop", json={}, headers=h)
+    assert resp.status_code == 400
+
+
+def test_op_redeploy_force_uses_default_image(client: TestClient, monkeypatch) -> None:
+    # redeploy + force → dispatch action=pull-redeploy mode=force + dir + image=defaultImage。
+    h = _h(client)
+    ns = _mk_ns("agent-rdf")
+    _mk_svc(ns, "svc-rdf", nacos="rdf-nacos")
+
+    box = {}
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch(box))
+    resp = client.post("/api/nodes/agent-rdf/svc-rdf/redeploy", json={"mode": "force"}, headers=h)
+    assert resp.status_code == 200
+    p = box["payload"]
+    assert p["action"] == "pull-redeploy"
+    assert p["mode"] == "force"
+    assert p["dir"] == "/opt/svc-rdf"
+    assert p["image"] == "registry/svc-rdf:1.0"
+
+
+def test_op_redeploy_graceful_derives_health_and_image(client: TestClient, monkeypatch) -> None:
+    # redeploy + graceful → 派生 healthBaseUrl + dispatch pull-redeploy + image=defaultImage。
+    h = _h(client)
+    ns = _mk_ns("agent-rdg")
+    _mk_svc(ns, "svc-rdg", nacos="rdg-nacos")
+
+    box = {}
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch(box))
+    monkeypatch.setattr(
+        nodes.hub_client,
+        "list_instances",
+        lambda *a, **k: {"status": "success", "instances": [{"address": "10.0.0.7", "healthy": True}]},
+    )
+    resp = client.post("/api/nodes/agent-rdg/svc-rdg/redeploy", json={"mode": "graceful"}, headers=h)
+    assert resp.status_code == 200
+    p = box["payload"]
+    assert p["action"] == "pull-redeploy"
+    assert p["mode"] == "graceful"
+    assert p["image"] == "registry/svc-rdg:1.0"
+    assert p["healthBaseUrl"] == "http://10.0.0.7"
+
+
+def test_op_redeploy_force_no_default_image_400(client: TestClient, monkeypatch) -> None:
+    # redeploy + force 但 service 无 defaultImage → 400。
+    h = _h(client)
+    ns = _mk_ns("agent-rdni")
+    # 直接造一条无 default_image 的 service(_mk_svc 默认填了 image,这里覆盖为 None)
+    store.create_row(
+        Service,
+        {"namespace_id": ns, "service_code": "svc-rdni", "dir": "/opt/svc-rdni", "default_image": None, "nacos_service_name": "rdni-nacos"},
+    )
+    monkeypatch.setattr(
+        nodes.hub_client, "dispatch_command", lambda *a, **k: (_ for _ in ()).throw(AssertionError("无 image 不应 dispatch"))
+    )
+    resp = client.post("/api/nodes/agent-rdni/svc-rdni/redeploy", json={"mode": "force"}, headers=h)
+    assert resp.status_code == 400
+
+
+def test_op_redeploy_graceful_no_default_image_400(client: TestClient, monkeypatch) -> None:
+    # redeploy + graceful 但无 defaultImage → 400(早于派生 healthBaseUrl;list_instances 不应被调)。
+    h = _h(client)
+    ns = _mk_ns("agent-rdgn")
+    store.create_row(
+        Service,
+        {"namespace_id": ns, "service_code": "svc-rdgn", "dir": "/opt/svc-rdgn", "default_image": None, "nacos_service_name": "rdgn-nacos"},
+    )
+    monkeypatch.setattr(
+        nodes.hub_client, "list_instances", lambda *a, **k: (_ for _ in ()).throw(AssertionError("无 image 应先 400,不查实例"))
+    )
+    resp = client.post("/api/nodes/agent-rdgn/svc-rdgn/redeploy", json={"mode": "graceful"}, headers=h)
+    assert resp.status_code == 400
+
+
+def test_op_redeploy_requires_mode(client: TestClient) -> None:
+    # redeploy 缺省 mode → 400。
+    h = _h(client)
+    ns = _mk_ns("agent-rdm")
+    _mk_svc(ns, "svc-rdm", nacos="rdm-nacos")
+    resp = client.post("/api/nodes/agent-rdm/svc-rdm/redeploy", json={}, headers=h)
+    assert resp.status_code == 400
+
+
+def test_op_unknown_action_422(client: TestClient) -> None:
+    # 未知 action(不在 {start,stop,restart,redeploy})→ 422(路径枚举校验)。
+    h = _h(client)
+    ns = _mk_ns("agent-ua")
+    _mk_svc(ns, "svc-ua", nacos="ua-nacos")
+    resp = client.post("/api/nodes/agent-ua/svc-ua/blowup", json={"mode": "force"}, headers=h)
+    assert resp.status_code == 422
+
+
+def test_op_unknown_service_404(client: TestClient) -> None:
+    # (agent_id, service_code) 不在台账 → 404(节点服务不在台账)。
+    h = _h(client)
+    _mk_ns("agent-known")  # namespace 存在,但无该 service
+    resp = client.post("/api/nodes/agent-known/no-such-svc/start", json={}, headers=h)
+    assert resp.status_code == 404
+    # agent(namespace)本身不存在 → 也 404
+    resp2 = client.post("/api/nodes/ghost-agent/whatever/start", json={}, headers=h)
+    assert resp2.status_code == 404
+
+
+def test_op_dispatch_failure_maps_502(client: TestClient, monkeypatch) -> None:
+    # dispatch 抛 HubError → 502 脱敏(不泄漏内部细节)。
+    h = _h(client)
+    ns = _mk_ns("agent-502")
+    _mk_svc(ns, "svc-502", nacos="n502")
+
+    def boom(*a, **k):
+        raise hc.HubError("内部 hub 细节-不该泄漏")
+
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", boom)
+    resp = client.post("/api/nodes/agent-502/svc-502/start", json={}, headers=h)
+    assert resp.status_code == 502
+    assert "内部 hub 细节" not in resp.text  # 脱敏:不回显内部消息
+
+
+def test_op_rolling_failure_maps_502(client: TestClient, monkeypatch) -> None:
+    # rolling_restart 抛 → 502 脱敏。
+    h = _h(client)
+    ns = _mk_ns("agent-r502")
+    _mk_svc(ns, "svc-r502", nacos="nr502")
+
+    monkeypatch.setattr(
+        nodes.hub_client, "rolling_restart", lambda *a, **k: (_ for _ in ()).throw(httpx.ConnectError("connrefused-内部"))
+    )
+    resp = client.post("/api/nodes/agent-r502/svc-r502/restart", json={"mode": "graceful"}, headers=h)
+    assert resp.status_code == 502
+    assert "connrefused-内部" not in resp.text
+
+
+def test_op_requires_auth(client: TestClient) -> None:
+    # 无 Bearer → 401(纵深防御 + require_session)。
+    assert client.post("/api/nodes/a/b/start", json={}).status_code == 401
+
+
+# --- 操作审计 GET /api/node-operations(代理 hub /api/commands,limit/offset↔page/pageSize) --------
+
+
+def _hub_commands(*, total: int, items: list[dict], limit: int, offset: int) -> dict:
+    """造一条 hub CommandListResponse 风格响应(camelCase)。"""
+    return {
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "hasMore": offset + len(items) < total,
+        "sortBy": "createdAt",
+        "order": "desc",
+    }
+
+
+def _cmd_row(request_id: str = "c1", **over) -> dict:
+    """造一条 hub CommandSnapshot 风格行(camelCase),含审计页关心字段。"""
+    base = {
+        "requestId": request_id,
+        "agentId": "agent-x",
+        "status": "succeeded",
+        "action": "stop",
+        "mode": "force",
+        "dir": "/opt/x",
+        "image": None,
+        "requestedBy": "platform-admin",
+        "requestSource": "console",
+        "output": "ok",
+        "error": None,
+        "createdAt": "2026-06-21T00:00:00Z",
+        "updatedAt": "2026-06-21T00:00:01Z",
+        "payload": {"action": "stop"},
+    }
+    base.update(over)
+    return base
+
+
+def test_node_operations_lists_audit_envelope(client: TestClient, monkeypatch) -> None:
+    # GET /api/node-operations → 调 list_commands、返平台标准信封 {count, rows, page, pageSize, totalPage}。
+    h = _h(client)
+
+    box = {}
+
+    def fake_list_commands(page, page_size, **kw):
+        box["page"] = page
+        box["page_size"] = page_size
+        return _hub_commands(total=3, items=[_cmd_row("c1"), _cmd_row("c2")], limit=page_size, offset=0)
+
+    monkeypatch.setattr(nodes.hub_client, "list_commands", fake_list_commands)
+
+    body = client.get("/api/node-operations?page=1&pageSize=2", headers=h).json()
+    assert box["page"] == 1 and box["page_size"] == 2
+    assert body["count"] == 3
+    assert body["page"] == 1 and body["pageSize"] == 2
+    assert body["totalPage"] == 2  # ceil(3/2)
+    assert len(body["rows"]) == 2
+    r0 = body["rows"][0]
+    assert r0["requestId"] == "c1"
+    assert r0["agentId"] == "agent-x"
+    assert r0["action"] == "stop"
+    assert r0["mode"] == "force"
+    assert r0["status"] == "succeeded"
+    assert r0["requestedBy"] == "platform-admin"
+    assert r0["requestSource"] == "console"
+    assert r0["dir"] == "/opt/x"
+    assert r0["output"] == "ok"
+    # camel 契约:无 snake key
+    for snake in ("request_id", "agent_id", "requested_by", "request_source"):
+        assert snake not in r0
+
+
+def test_node_operations_truncates_output(client: TestClient, monkeypatch) -> None:
+    # output / error 超 1000 字符 → 截尾保留后 1000 字符 + 前缀标记(结果通常在尾部)。
+    h = _h(client)
+    long_out = "A" * 500 + "B" * 1000  # 1500 字符,尾部是 1000 个 B
+    long_err = "E" * 2000
+    monkeypatch.setattr(
+        nodes.hub_client,
+        "list_commands",
+        lambda page, page_size, **kw: _hub_commands(
+            total=1, items=[_cmd_row("ct", output=long_out, error=long_err)], limit=page_size, offset=0
+        ),
+    )
+    row = client.get("/api/node-operations", headers=h).json()["rows"][0]
+    # 截断后:长度 = 1000 + 前缀标记长度;尾部保留(末尾是 B,不是 A)
+    assert row["output"].endswith("B" * 1000)
+    assert "已截断" in row["output"]
+    assert len(row["output"]) < len(long_out)  # 确实被截短
+    assert row["error"].endswith("E" * 1000)
+    assert "已截断" in row["error"]
+
+
+def test_node_operations_hub_failure_502(client: TestClient, monkeypatch) -> None:
+    # hub 调用失败 → 502 脱敏。
+    h = _h(client)
+
+    def boom(*a, **k):
+        raise hc.HubError("hub 列表内部错误-勿泄漏")
+
+    monkeypatch.setattr(nodes.hub_client, "list_commands", boom)
+    resp = client.get("/api/node-operations", headers=h)
+    assert resp.status_code == 502
+    assert "勿泄漏" not in resp.text
+
+
+def test_node_operations_requires_auth(client: TestClient) -> None:
+    # 无 Bearer → 401。
+    assert client.get("/api/node-operations").status_code == 401

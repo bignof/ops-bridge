@@ -28,19 +28,34 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 
 from app import hub_client, store
 from app.auth import require_session
 from app.db_models import Namespace, Service
-from app.models import NodeListOut, NodeOut
+from app.models import (
+    NodeActionIn,
+    NodeActionOut,
+    NodeListOut,
+    NodeOperationOut,
+    NodeOperationsListOut,
+    NodeOut,
+)
 
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/nodes", tags=["节点控制"])
+# 操作审计端点路径是 `/api/node-operations`(与 `/api/nodes` 平级,非其子路径),故单列一个
+# 无 prefix 的 router 承载,由 main.py 一并 include。仍在 `/api/` 前缀下 → SessionGuard
+# default-deny 照样覆盖(无/坏 JWT 401)。
+operations_router = APIRouter(tags=["节点控制"])
+
+# 操作审计 output / error 单字段截断上限:超过则保留**末尾** N 字符(结果通常在尾部),
+# 加前缀标记,避免审计列表整页 payload 膨胀(评审冲突 2,用户定 D)。
+_AUDIT_FIELD_MAX = 1000
 
 # SELECT 列:Service 本行字段 + LEFT JOIN 回 namespace.code(label=namespace_code → camel namespaceCode）。
 _LIST_COLUMNS = (
@@ -163,4 +178,182 @@ async def list_nodes(
         page=page,
         page_size=page_size,
         total_page=math.ceil(count / page_size) if page_size else 0,
+    )
+
+
+# =====================================================================================
+# Task 10b:节点操作下发 + 操作审计
+# =====================================================================================
+#
+# 寻址权威源 = 平台 Service 表:agentId(=namespace.code)+ serviceCode 反查得
+# dir / nacosServiceName / defaultImage。**BFF 绝不接受客户端传路径或任意 image**——
+# 这些一律由台账派生(防越权操作非授权目录 / 拉非白名单镜像)。requested_by 由 hub 据
+# admin token 服务端派生:BFF **绝不传 X-Requested-By**(hub_client._headers 只注入 token)。
+
+
+def _resolve_service(agent_id: str, service_code: str) -> Service:
+    """按 (agentId=namespace.code, serviceCode) 反查台账 Service;任一缺失 → 404。
+
+    两步走(复用 store.find_rows,不新增 join 查询):① namespace.code==agent_id 定位
+    namespace_id;② Service(namespace_id, service_code)。返回 ORM 行(取 dir /
+    nacos_service_name / default_image)。**404 文案统一**(不区分是 agent 还是 service 缺失,
+    避免泄漏台账存在性)。
+    """
+    ns_rows = store.find_rows(Namespace, filters=[Namespace.code == agent_id], limit=1)
+    if not ns_rows:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "节点服务不在台账")
+    svc_rows = store.find_rows(
+        Service,
+        filters=[Service.namespace_id == ns_rows[0].id, Service.service_code == service_code],
+        limit=1,
+    )
+    if not svc_rows:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "节点服务不在台账")
+    return svc_rows[0]
+
+
+def _derive_health_base_url(agent_id: str, nacos_service_name: str | None) -> str:
+    """优雅 stop / redeploy 的 healthBaseUrl 派生(单 drain 近似)。
+
+    `nacos_service_name` 缺失 → 400(优雅操作需配置 nacosServiceName);经 hub
+    `list_instances` 取实例,无健康实例 → 409(请用 force);否则取**第一个**健康实例的
+    address 拼 `http://<addr>`。
+
+    ⚠️ 近似性说明(评审已知):compose `stop` 是**目录级**(停该 compose 项目下全部容器),
+    而这里只 drain 第一个健康实例的 worker。多实例同目录场景下,其余实例不会被逐一 drain
+    即随目录一起停 —— 这是 P1 可接受的近似(真正逐实例零中断走 restart+graceful 的 rolling
+    路径)。`list_instances` 失败由调用方的 502 兜底捕获。
+    """
+    if not nacos_service_name:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "优雅操作需配置 nacosServiceName")
+    r = hub_client.list_instances(agent_id, nacos_service_name)
+    healthy = [i for i in (r.get("instances") or []) if isinstance(i, dict) and i.get("healthy")]
+    if not healthy:
+        raise HTTPException(status.HTTP_409_CONFLICT, "无健康实例可优雅 drain;请用 force")
+    return f"http://{healthy[0]['address']}"
+
+
+@router.post(
+    "/{agent_id}/{service_code}/{action}",
+    response_model=NodeActionOut,
+    summary="节点操作下发",
+    description="对某 (agent×service) 下发 启动/停止/重启/重部署;dir/nacosServiceName/image 由 Service 表权威派生;优雅 restart 走 hub 滚动重启,其余走 hub dispatch;requested_by 由 hub 派生。",
+)
+async def dispatch_node_action(
+    body: NodeActionIn,
+    agent_id: str = Path(title="Agent 标识(=namespace.code)"),
+    service_code: str = Path(title="服务编码"),
+    action: Literal["start", "stop", "restart", "redeploy"] = Path(title="操作(start/stop/restart/redeploy)"),
+    _: str = Depends(require_session),
+) -> NodeActionOut:
+    # ① 台账寻址(404 早返,先于任何 hub 调用)。
+    svc = _resolve_service(agent_id, service_code)
+    dir_ = svc.dir
+    nacos = svc.nacos_service_name
+    default_image = svc.default_image
+    mode = body.mode
+
+    # ② mode 必填校验:stop / redeploy 须显式 mode;restart 缺省按 graceful;start 忽略 mode。
+    if action in ("stop", "redeploy") and mode is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "stop/redeploy 须指定 mode")
+    effective_mode = mode or "graceful"  # restart 缺省 graceful;start 下不参与决策
+
+    # ③ action → hub 端点路由 + payload 组装。纯校验阶段(400/409/404)抛 HTTPException;
+    #    真正的 hub 网络调用集中到下方 try 块,统一 HubError/httpx → 502 脱敏。
+    try:
+        if action == "restart" and effective_mode == "graceful":
+            # 优雅 restart 复用 hub 零中断滚动重启(逐实例 drain);必须有 nacosServiceName。
+            if not nacos:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, "优雅 restart 需配置 nacosServiceName")
+            resp = hub_client.rolling_restart(agent_id, nacos, force=False)
+            return NodeActionOut(kind="rolling", task_id=resp["taskId"])
+
+        # 其余路径走 dispatch:先把 payload 备齐(graceful stop/redeploy 需先派生 healthBaseUrl)。
+        payload: dict[str, Any] = {"action": "", "dir": dir_}
+        if action == "restart":  # force restart
+            payload["action"] = "force-restart"
+        elif action == "start":
+            payload["action"] = "start"
+        elif action == "stop" and effective_mode == "force":
+            payload.update(action="stop", mode="force", serviceName=nacos, allowLastInstance=body.allow_last_instance)
+        elif action == "stop":  # graceful stop
+            health_base_url = _derive_health_base_url(agent_id, nacos)
+            payload.update(action="stop", mode="graceful", healthBaseUrl=health_base_url, shutdownTimeoutSec=60, serviceName=nacos)
+        elif action == "redeploy" and effective_mode == "force":
+            if not default_image:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, "重部署需配置 defaultImage")
+            payload.update(action="pull-redeploy", mode="force", image=default_image)
+        else:  # redeploy graceful
+            if not default_image:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, "重部署需配置 defaultImage")
+            health_base_url = _derive_health_base_url(agent_id, nacos)
+            payload.update(action="pull-redeploy", mode="graceful", image=default_image, healthBaseUrl=health_base_url)
+
+        resp = hub_client.dispatch_command(agent_id, payload)
+        # dispatch 成功:返回 hub 生成的 requestId(该命令进 /api/node-operations 审计列表)。
+        # 取值放 try 内:hub 响应畸形(缺 command.requestId)同样收敛成脱敏 502,不逃逸成裸 500。
+        return NodeActionOut(
+            kind="command",
+            request_id=resp["command"]["requestId"],
+            accepted=resp.get("accepted", True),
+        )
+    except HTTPException:
+        raise  # 业务校验(400/409/404)原样上抛,不被 502 吞掉
+    except Exception as exc:  # noqa: BLE001
+        # hub 调用失败(HubError / httpx 连接超时 / 畸形响应 / 任意异常)→ 502 脱敏:仅记异常
+        # 类型名,绝不把内部消息(可能含 hub URL / token 上下文)回显给前端。
+        logger.warning("节点操作下发失败 agent=%s service=%s action=%s: %s", agent_id, service_code, action, type(exc).__name__)
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "下发命令失败") from exc
+
+
+def _truncate_tail(value: str | None) -> str | None:
+    """审计字段截尾:超 `_AUDIT_FIELD_MAX` 保留**末尾**字符 + 前缀标记(结果通常在尾部)。"""
+    if value is None or len(value) <= _AUDIT_FIELD_MAX:
+        return value
+    return f"…(已截断)\n{value[-_AUDIT_FIELD_MAX:]}"
+
+
+@operations_router.get(
+    "/api/node-operations",
+    response_model=NodeOperationsListOut,
+    summary="操作审计列表",
+    description="代理 hub /api/commands(start/stop/force-restart/redeploy 等 dispatch 命令)的操作审计;limit/offset 换算成平台 page/pageSize 信封。优雅 restart 走 rolling,本期不在此列表。",
+)
+async def list_node_operations(
+    _: str = Depends(require_session),
+    page: int = Query(default=1, ge=1, title="页码"),
+    page_size: int = Query(default=20, ge=1, le=200, alias="pageSize", title="每页条数"),
+) -> NodeOperationsListOut:
+    try:
+        resp = hub_client.list_commands(page, page_size)
+    except Exception as exc:  # noqa: BLE001 —— hub 任意失败(HubError/httpx/畸形)统一脱敏 502
+        logger.warning("拉取操作审计失败 page=%s pageSize=%s: %s", page, page_size, type(exc).__name__)
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "拉取操作审计失败") from exc
+
+    items = resp.get("items") or []
+    total = int(resp.get("total") or 0)
+    rows = [
+        NodeOperationOut(
+            request_id=it.get("requestId"),
+            agent_id=it.get("agentId"),
+            action=it.get("action"),
+            mode=it.get("mode"),
+            status=it.get("status"),
+            requested_by=it.get("requestedBy"),
+            request_source=it.get("requestSource"),
+            dir=it.get("dir"),
+            image=it.get("image"),
+            output=_truncate_tail(it.get("output")),
+            error=_truncate_tail(it.get("error")),
+            created_at=it.get("createdAt"),
+            updated_at=it.get("updatedAt"),
+        )
+        for it in items
+    ]
+    return NodeOperationsListOut(
+        count=total,
+        rows=rows,
+        page=page,
+        page_size=page_size,
+        total_page=math.ceil(total / page_size) if page_size else 0,
     )

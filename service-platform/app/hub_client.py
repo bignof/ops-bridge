@@ -124,6 +124,82 @@ def list_instances(agent_id: str, service_name: str, timeout: float = 5.0) -> di
     return r.json()
 
 
+def dispatch_command(agent_id: str, payload: dict, timeout: float = 15.0) -> dict:
+    """向指定 Agent 下发一条命令(start/stop/force-restart/pull-redeploy 等),返回 hub 202 响应。
+
+    `POST {hub}/api/agents/{agentId}/commands`,body 直传 `payload`(camelCase:`action` /
+    `mode?` / `dir` / `image?` / `serviceName?` / `allowLastInstance?` / `healthBaseUrl?` /
+    `shutdownTimeoutSec?`;`requestId` 不传由 hub 默认生成)。返回 hub `CommandDispatchResponse`
+    (`{accepted, command:{requestId, status, ...}}`,camelCase)。
+
+    **requested_by 由 hub 服务端据 admin token 派生**——本函数 `_headers()` 只注入 X-Admin-Token,
+    **绝不发 X-Requested-By**(任何持 token 的调用方都能伪造该头,故 hub 不信它作权威身份)。
+
+    `agent_id` 拼进 hub URL 路径段,**必须** `quote(safe="")` 编码(纵深防御第二道闸,仿
+    `rotate_agent_key` / `list_instances`:含 `/` `..` `#` `?` 的 code 会改变请求路径 → 存储型
+    路径注入)。SERVICE_HUB_URL 未配置 → 直接抛 `HubError`(与本模块其余函数一致)。失败(配置
+    缺失 / 连接 / 超时 / 非 2xx)向上抛,由路由层 catch → 502 脱敏。本函数不打印 / log token。
+    """
+    if not settings.service_hub_url:
+        raise HubError("SERVICE_HUB_URL 未配置")
+    r = httpx.post(
+        f"{settings.service_hub_url}/api/agents/{quote(agent_id, safe='')}/commands",
+        headers=_headers(),
+        json=payload,
+        timeout=timeout,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def rolling_restart(agent_id: str, service_name: str, force: bool = False, timeout: float = 15.0) -> dict:
+    """触发某 (agent×service) 的零中断滚动重启(优雅 restart 复用此 hub 端点),返回 `{taskId}`。
+
+    `POST {hub}/api/rolling-restart`,body `{agentId, serviceName, force}`(camelCase)。返回
+    `{taskId}`(异步任务句柄,后续可 `GET {hub}/api/rolling-restart/{taskId}` 单查进度)。
+
+    `agent_id` 经 body 传(非 URL 路径段),无需 quote;但 BFF 路由层仍只接受台账内 (agent×service)
+    的 nacosServiceName,不接受客户端传任意 serviceName。SERVICE_HUB_URL 未配置 → 抛 `HubError`。
+    失败(连接 / 超时 / 非 2xx)向上抛,由路由层 catch → 502 脱敏。`_headers()` 注入 admin token。
+    """
+    if not settings.service_hub_url:
+        raise HubError("SERVICE_HUB_URL 未配置")
+    r = httpx.post(
+        f"{settings.service_hub_url}/api/rolling-restart",
+        headers=_headers(),
+        json={"agentId": agent_id, "serviceName": service_name, "force": force},
+        timeout=timeout,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def list_commands(page: int, page_size: int, timeout: float = 15.0) -> dict:
+    """拉取 hub 全局命令历史(操作审计),返回 hub `CommandListResponse`(camelCase)。
+
+    **分页换算(评审冲突 1)**:hub `/api/commands` 是 limit/offset 风格(返回
+    `{items, total, limit, offset, hasMore, sortBy, order}`),平台侧统一 page/pageSize 信封。
+    本函数在此做转换层:`limit=page_size, offset=(page-1)*page_size`,**对平台保持 page/pageSize
+    语义**(与 services/nodes 一致,SPA 审计页才好复用);BFF 路由再把 hub 的 limit/offset 响应
+    映射成 `{count, rows, page, pageSize, totalPage}`。
+
+    SERVICE_HUB_URL 未配置 → 抛 `HubError`。失败(连接 / 超时 / 非 2xx)向上抛,由路由层 catch →
+    502 脱敏。`_headers()` 注入 admin token(hub 读端点不可匿名)。
+    """
+    if not settings.service_hub_url:
+        raise HubError("SERVICE_HUB_URL 未配置")
+    page = max(1, page)
+    page_size = max(1, page_size)
+    r = httpx.get(
+        f"{settings.service_hub_url}/api/commands",
+        headers=_headers(),
+        params={"limit": page_size, "offset": (page - 1) * page_size},
+        timeout=timeout,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
 def rotate_agent_key(agent_id: str) -> str:
     """轮换指定 Agent 的连接密钥,返回新的 agentKey(旧密钥在 hub 侧立即失效)。
 

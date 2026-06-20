@@ -17,6 +17,7 @@ from app.routers.auth import router as auth_router
 from app.routers.distribution import router as distribution_router
 from app.routers.fetch_records import router as fetch_records_router
 from app.routers.namespaces import router as namespaces_router
+from app.routers.nodes import operations_router as node_operations_router
 from app.routers.nodes import router as nodes_router
 from app.routers.plugin_versions import router as plugin_versions_router
 from app.routers.plugins import router as plugins_router
@@ -83,3 +84,4 @@ app.include_router(releases_router)
 app.include_router(distribution_router)
 app.include_router(fetch_records_router)
 app.include_router(nodes_router)
+app.include_router(node_operations_router)  # Task 10b:/api/node-operations(与 /api/nodes 平级)

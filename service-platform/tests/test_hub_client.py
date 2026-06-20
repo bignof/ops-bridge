@@ -326,3 +326,159 @@ def test_rotate_agent_key_quotes_agent_id_in_url(monkeypatch) -> None:
     assert "/" not in seg, f"agent_id 未编码进 URL 路径段(残留裸 /,可路径注入): {seg!r}"
     assert "/../" not in url.split("/api/agents/", 1)[1], "残留真正的 /../ 穿越段"
     assert "%2F" in seg.upper()  # `/` → %2F(证明编码确实发生)
+
+
+# --- Task 10b:dispatch_command / rolling_restart / list_commands(节点操作下发 + 审计)单测 ---
+#    dispatch_command → POST {hub}/api/agents/{quote(id)}/commands,body=payload,默认 15s。
+#    rolling_restart  → POST {hub}/api/rolling-restart,body {agentId, serviceName, force}。
+#    list_commands    → GET {hub}/api/commands,params {limit=pageSize, offset=(page-1)*pageSize}。
+
+
+def test_dispatch_command(monkeypatch) -> None:
+    calls: dict = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002
+        calls["url"] = url
+        calls["headers"] = headers
+        calls["json"] = json
+        calls["timeout"] = timeout
+        return _Resp({"accepted": True, "command": {"requestId": "r1"}})
+
+    monkeypatch.setattr(hc, "settings", _fake_settings())
+    monkeypatch.setattr(hc.httpx, "post", fake_post)
+
+    payload = {"action": "start", "dir": "/opt/x"}
+    out = hc.dispatch_command("a1", payload)
+    assert out["command"]["requestId"] == "r1"
+    assert calls["url"] == "http://hub:8080/api/agents/a1/commands"
+    assert calls["headers"]["X-Admin-Token"] == "T"
+    # 安全:绝不发 X-Requested-By(requested_by 由 hub 据 admin token 派生)。
+    assert "X-Requested-By" not in calls["headers"]
+    assert calls["json"] == payload  # payload 原样直传
+    assert calls["timeout"] == 15.0
+
+
+def test_dispatch_command_quotes_agent_id_in_url(monkeypatch) -> None:
+    # 纵深防御第二道闸:agent_id 拼进路径段必须 quote(safe='')(同 rotate/list_instances)。
+    calls: dict = {}
+    monkeypatch.setattr(hc, "settings", _fake_settings())
+    monkeypatch.setattr(
+        hc.httpx, "post", lambda url, **k: (calls.__setitem__("url", url), _Resp({"accepted": True, "command": {}}))[1]
+    )
+    hc.dispatch_command("a/b/../c", {"action": "start", "dir": "/x"})
+    url = calls["url"]
+    seg = url.split("/api/agents/", 1)[1].rsplit("/commands", 1)[0]
+    assert "/" not in seg, f"agent_id 未编码进路径段(可路径注入): {seg!r}"
+    assert "%2F" in seg.upper()
+
+
+def test_dispatch_command_missing_hub_url_raises(monkeypatch) -> None:
+    called = {"hit": False}
+    monkeypatch.setattr(hc, "settings", _fake_settings(url=""))
+    monkeypatch.setattr(hc.httpx, "post", lambda *a, **k: called.__setitem__("hit", True))
+    with pytest.raises(hc.HubError):
+        hc.dispatch_command("a1", {"action": "start", "dir": "/x"})
+    assert called["hit"] is False  # 未配置 hub 不发起请求
+
+
+def test_dispatch_command_propagates_http_error(monkeypatch) -> None:
+    monkeypatch.setattr(hc, "settings", _fake_settings())
+    monkeypatch.setattr(hc.httpx, "post", lambda *a, **k: _Resp({}, status_ok=False))
+    with pytest.raises(hc.httpx.HTTPStatusError):
+        hc.dispatch_command("a1", {"action": "start", "dir": "/x"})
+
+
+def test_rolling_restart(monkeypatch) -> None:
+    calls: dict = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002
+        calls["url"] = url
+        calls["headers"] = headers
+        calls["json"] = json
+        calls["timeout"] = timeout
+        return _Resp({"taskId": "t1"})
+
+    monkeypatch.setattr(hc, "settings", _fake_settings())
+    monkeypatch.setattr(hc.httpx, "post", fake_post)
+
+    out = hc.rolling_restart("a1", "svc-nacos", force=True)
+    assert out["taskId"] == "t1"
+    assert calls["url"] == "http://hub:8080/api/rolling-restart"
+    assert calls["headers"]["X-Admin-Token"] == "T"
+    assert calls["json"] == {"agentId": "a1", "serviceName": "svc-nacos", "force": True}
+    assert calls["timeout"] == 15.0
+
+
+def test_rolling_restart_default_force_false(monkeypatch) -> None:
+    calls: dict = {}
+    monkeypatch.setattr(hc, "settings", _fake_settings())
+    monkeypatch.setattr(
+        hc.httpx, "post", lambda url, json=None, **k: (calls.__setitem__("json", json), _Resp({"taskId": "t"}))[1]
+    )
+    hc.rolling_restart("a1", "svc")
+    assert calls["json"]["force"] is False
+
+
+def test_rolling_restart_missing_hub_url_raises(monkeypatch) -> None:
+    called = {"hit": False}
+    monkeypatch.setattr(hc, "settings", _fake_settings(url=""))
+    monkeypatch.setattr(hc.httpx, "post", lambda *a, **k: called.__setitem__("hit", True))
+    with pytest.raises(hc.HubError):
+        hc.rolling_restart("a1", "svc")
+    assert called["hit"] is False
+
+
+def test_rolling_restart_propagates_http_error(monkeypatch) -> None:
+    monkeypatch.setattr(hc, "settings", _fake_settings())
+    monkeypatch.setattr(hc.httpx, "post", lambda *a, **k: _Resp({}, status_ok=False))
+    with pytest.raises(hc.httpx.HTTPStatusError):
+        hc.rolling_restart("a1", "svc")
+
+
+def test_list_commands_paging_to_limit_offset(monkeypatch) -> None:
+    # 转换层:page/pageSize → hub limit/offset(limit=pageSize, offset=(page-1)*pageSize)。
+    calls: dict = {}
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        calls["url"] = url
+        calls["headers"] = headers
+        calls["params"] = params
+        calls["timeout"] = timeout
+        return _Resp({"items": [], "total": 0, "limit": 10, "offset": 20})
+
+    monkeypatch.setattr(hc, "settings", _fake_settings())
+    monkeypatch.setattr(hc.httpx, "get", fake_get)
+
+    out = hc.list_commands(page=3, page_size=10)
+    assert out["total"] == 0
+    assert calls["url"] == "http://hub:8080/api/commands"
+    assert calls["headers"]["X-Admin-Token"] == "T"
+    assert calls["params"] == {"limit": 10, "offset": 20}  # (3-1)*10
+    assert calls["timeout"] == 15.0
+
+
+def test_list_commands_clamps_page_floor(monkeypatch) -> None:
+    # page/pageSize < 1 被夹到 1(offset 不为负)。
+    calls: dict = {}
+    monkeypatch.setattr(hc, "settings", _fake_settings())
+    monkeypatch.setattr(
+        hc.httpx, "get", lambda url, params=None, **k: (calls.__setitem__("params", params), _Resp({"items": [], "total": 0}))[1]
+    )
+    hc.list_commands(page=0, page_size=0)
+    assert calls["params"] == {"limit": 1, "offset": 0}
+
+
+def test_list_commands_missing_hub_url_raises(monkeypatch) -> None:
+    called = {"hit": False}
+    monkeypatch.setattr(hc, "settings", _fake_settings(url=""))
+    monkeypatch.setattr(hc.httpx, "get", lambda *a, **k: called.__setitem__("hit", True))
+    with pytest.raises(hc.HubError):
+        hc.list_commands(page=1, page_size=20)
+    assert called["hit"] is False
+
+
+def test_list_commands_propagates_http_error(monkeypatch) -> None:
+    monkeypatch.setattr(hc, "settings", _fake_settings())
+    monkeypatch.setattr(hc.httpx, "get", lambda *a, **k: _Resp({}, status_ok=False))
+    with pytest.raises(hc.httpx.HTTPStatusError):
+        hc.list_commands(page=1, page_size=20)
