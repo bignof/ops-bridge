@@ -133,8 +133,11 @@ async def publish_release(
         record = store.publish(body.service_id, body.plugin_id, body.plugin_version_id)
     except store.NotFound as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
-    except store.Conflict:
-        raise HTTPException(status.HTTP_409_CONFLICT, "并发发布冲突,请重试")
+    except store.Conflict as exc:
+        # 复审 Minor-1:与 rollback_release 一致用 str(exc) 透传 store 层的可读中文文案,
+        # 不再硬编码「并发发布冲突,请重试」——否则会抹平 B1 守卫的「该版本已发布过」语义。
+        # store.publish 两条 Conflict 文案均为可读中文(B1 重复守卫 + 并发 spv_active_key 撞键)。
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
     return _to_out(record)
 
 

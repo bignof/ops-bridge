@@ -269,6 +269,9 @@ def test_publish_endpoint_duplicate_same_version_409(client: TestClient) -> None
         headers=h,
     )
     assert dup.status_code == 409, dup.text
+    # 复审 Minor-1:detail 须透传 B1 守卫的可读中文文案(含「已发布过」),
+    # 不能被硬编码的「并发发布冲突,请重试」抹平(否则前端拿不到真实重复语义)。
+    assert "已发布过" in dup.json()["detail"], dup.json()
 
     # 对照:发布不同版本(pv2)仍 201(守卫不误伤正常追加新版本)
     other = client.post(
@@ -277,6 +280,56 @@ def test_publish_endpoint_duplicate_same_version_409(client: TestClient) -> None
         headers=h,
     )
     assert other.status_code == 201, other.text
+
+
+def test_publish_dup_guard_scoped_by_service_and_plugin_not_sp_id(client: TestClient) -> None:
+    """复审 Minor-2:B1 重复守卫作用域必须是 (service_id, plugin_id, plugin_version_id),不是 service_plugin_id。
+
+    背景:MySQL 下「删建同 (service_id,plugin_id) 绑定」后 service_plugin.id 会变化;若守卫按当前
+    sp.id 查重,就查不到 rebind 前用旧 service_plugin_id 写下的历史行 → 漏判而追加重复历史行。
+
+    sqlite 上 id 复用挡不住该语义,故这里**显式构造**一条 stray 历史行:它带与当前绑定**相同的
+    (service_id, plugin_id, plugin_version_id)**,但 service_plugin_id 取一个**不同**的值(模拟 rebind
+    前的旧绑定 id)。然后 publish 同一版本:
+      - 旧守卫(service_plugin_id == sp.id):查不到 stray 行(其 sp_id 不同)→ 误放行(红)。
+      - 新守卫(service_id + plugin_id + plugin_version_id):命中 stray 行 → Conflict(绿)。
+    """
+    svc_id, plg_id, sp_id = _mk_binding("dupscope-ns", "dupscope-svc", "dupscope-plg")
+    pv = _mk_version(plg_id, "1.0")
+
+    # 取一个与当前 sp_id 不同的 service_plugin_id(模拟 rebind 前的旧绑定行号);+1000 必不冲突。
+    stale_sp_id = sp_id + 1000
+    assert stale_sp_id != sp_id
+    # stray 历史行:同 (service_id, plugin_id, plugin_version_id),但挂在旧 service_plugin_id 上,
+    # 且非 active(spv_active_key=None,不占单活键,避免干扰后续 publish 置活)。
+    store.create_row(
+        ServicePluginVersion,
+        {
+            "service_plugin_id": stale_sp_id,
+            "service_id": svc_id,
+            "plugin_id": plg_id,
+            "plugin_version_id": pv,
+            "version_order": 1,
+            "is_active": False,
+            "is_rolled_back": False,
+            "spv_active_key": None,
+        },
+    )
+
+    # 新守卫按 (service_id, plugin_id, plugin_version_id) 判重 → 命中 stray 行 → Conflict。
+    with pytest.raises(store.Conflict):
+        store.publish(svc_id, plg_id, pv)
+
+    # 守卫拒后未追加任何新行:该 (service_id, plugin_id, version) 仍只有最初那条 stray 行。
+    rows = store.find_rows(
+        ServicePluginVersion,
+        filters=[
+            ServicePluginVersion.service_id == svc_id,
+            ServicePluginVersion.plugin_id == plg_id,
+            ServicePluginVersion.plugin_version_id == pv,
+        ],
+    )
+    assert len(rows) == 1, rows
 
 
 def test_publish_cross_plugin_version_raises_not_found(client: TestClient) -> None:

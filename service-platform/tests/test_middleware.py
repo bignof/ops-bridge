@@ -275,13 +275,19 @@ def test_whitelist_matches_real_public_api_routes(client: TestClient) -> None:
         )
 
 
-# ── B5:CSP / 安全响应头(评审确认「零测试」缺口)─────────────────────────────────
+# ── B5:CSP / 安全响应头(评审确认「零测试」缺口;复审:去自指假绿)──────────────────
 #    SecurityHeadersMiddleware 给**所有**响应注入 CSP + 安全头,此前无任何断言 → 可被静默
 #    改坏(误加 unsafe-inline/摘中间件)CI 不红。本组钉死:① 全部安全头逐一存在且等于常量;
-#    ② CSP 含 script-src 'self' 且**不含** unsafe-inline/unsafe-eval(钉死严格策略防回归);
-#    ③ 401/异常响应也带 CSP(验证 SecurityHeaders 在最外层,连鉴权失败响应都被注入)。
+#    ② CSP **逐条**含下方测试侧**期望指令字面表**(EXPECTED_CSP_DIRECTIVES);③ 401/异常响应
+#    也带 CSP(验证 SecurityHeaders 在最外层,连鉴权失败响应都被注入)。
 #
-#    变异验证:把 CSP_POLICY 加上 'unsafe-inline' / 删掉某安全头 / 摘掉中间件 → 本组转红。
+#    ⚠️ 复审 B5(自指假绿):此前 CSP 多指令用 `actual == 模块 CSP_POLICY`(两侧同源),弱化
+#    default-src/object-src/frame-ancestors 等会**两侧同时变**而假绿溜过。本版改为在测试侧写一份
+#    **独立期望字面表**(以当前 middleware.py 实际 CSP_POLICY 为准核对),逐条 `assert d in csp`,
+#    **不再** `== 模块 CSP_POLICY` 自指。
+#
+#    变异自证(报告 B5):逐一弱化 default-src→`*`、删 object-src、frame-ancestors→'self' →
+#    对应 `d in csp` 断言各自转红;把 CSP_POLICY 加 'unsafe-inline' / 删某安全头 / 摘中间件 → 本组转红。
 
 EXPECTED_SECURITY_HEADERS = {
     "X-Frame-Options": "DENY",
@@ -289,28 +295,47 @@ EXPECTED_SECURITY_HEADERS = {
     "Referrer-Policy": "no-referrer",
 }
 
+# 期望 CSP 指令字面表(测试侧常量,**独立**于 middleware.CSP_POLICY;以当前 middleware.py 为准核对)。
+# 任一指令被弱化(如 default-src→`*`、删 object-src、frame-ancestors→'self')→ 对应 `in` 断言转红。
+EXPECTED_CSP_DIRECTIVES = [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "font-src 'self' data:",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+]
+
+
+def _assert_csp_directives(csp: str) -> None:
+    """逐条断言期望指令字面表都出现在实际 CSP 头中(非 `== 模块常量` 自指)。"""
+    directives = [d.strip() for d in csp.split(";") if d.strip()]
+    for expected in EXPECTED_CSP_DIRECTIVES:
+        assert expected in directives, f"CSP 缺/弱化指令 {expected!r}:{directives}"
+
 
 def test_security_headers_present_on_200(client: TestClient) -> None:
-    """GET /health(200,白名单非 /api):CSP == CSP_POLICY + 三个安全头逐一精确匹配。"""
-    from app.middleware import CSP_POLICY
-
+    """GET /health(200,白名单非 /api):CSP 逐条含期望指令字面表 + 三个安全头逐一精确匹配。"""
     r = client.get("/health")
     assert r.status_code == 200, r.text
-    assert r.headers.get("Content-Security-Policy") == CSP_POLICY
+    _assert_csp_directives(r.headers.get("Content-Security-Policy", ""))
     for header, value in EXPECTED_SECURITY_HEADERS.items():
         assert r.headers.get(header) == value, f"{header} 缺失/不符:{r.headers.get(header)!r}"
 
 
 def test_security_headers_csp_is_strict_no_unsafe(client: TestClient) -> None:
-    """CSP 严格性钉死(防回归):含 script-src 'self',且**不含** unsafe-inline / unsafe-eval。
+    """CSP 严格性钉死(防回归):script-src 恰为 'self',且**不含** unsafe-inline / unsafe-eval。
 
     Vite 产物为外链 module JS、index.html 零内联脚本,故 script-src 严格可行;一旦有人为图省事
     加回 'unsafe-inline'/'unsafe-eval',XSS 缓解被掏空 —— 本断言转红拦住。
     """
-    from app.middleware import CSP_POLICY
-
     csp = client.get("/health").headers.get("Content-Security-Policy", "")
-    assert csp == CSP_POLICY  # 与常量一致(顺带回归)
+    # 逐条核对期望指令字面表(不自指模块常量)。
+    _assert_csp_directives(csp)
     # 逐指令:script-src 恰为 'self'(无 unsafe-*)
     directives = [d.strip() for d in csp.split(";") if d.strip()]
     script_src = next((d for d in directives if d.startswith("script-src")), None)
@@ -319,8 +344,8 @@ def test_security_headers_csp_is_strict_no_unsafe(client: TestClient) -> None:
     # 不在 script-src 内,故这里精确限定 script-src 已排除;再全局确认无 unsafe-eval)。
     assert "'unsafe-eval'" not in csp, "CSP 含 unsafe-eval(严格策略被破坏)"
     assert "script-src 'self' 'unsafe-inline'" not in csp, "script-src 含 unsafe-inline(严格策略被破坏)"
-    # C4:form-action 'self' 在策略内(登录表单纵深)
-    assert "form-action 'self'" in csp, "CSP 缺 form-action 'self'(评审 C4)"
+    # C4:form-action 'self' 在策略内(登录表单纵深)—— 已在字面表内,这里显式再钉一次。
+    assert "form-action 'self'" in directives, "CSP 缺 form-action 'self'(评审 C4)"
 
 
 def test_security_headers_present_on_401(client: TestClient) -> None:
@@ -328,11 +353,9 @@ def test_security_headers_present_on_401(client: TestClient) -> None:
 
     无 token 请求受保护 /api 路由 → SessionGuard 返 401;该响应仍须带全部安全头。
     """
-    from app.middleware import CSP_POLICY
-
     r = client.get("/api/plugins")  # 无 token → 中间件 401
     assert r.status_code == 401, r.text
-    assert r.headers.get("Content-Security-Policy") == CSP_POLICY
+    _assert_csp_directives(r.headers.get("Content-Security-Policy", ""))
     for header, value in EXPECTED_SECURITY_HEADERS.items():
         assert r.headers.get(header) == value, f"401 响应 {header} 缺失/不符"
 
