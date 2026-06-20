@@ -535,6 +535,8 @@ def test_op_redeploy_graceful_derives_health_and_image(client: TestClient, monke
     assert p["mode"] == "graceful"
     assert p["image"] == "registry/svc-rdg:1.0"
     assert p["healthBaseUrl"] == "http://10.0.0.7"
+    # 评审 T10 Important:优雅 redeploy 须与优雅 stop 对称透传 shutdownTimeoutSec(平台统一 drain 超时)。
+    assert p["shutdownTimeoutSec"] == 60
 
 
 def test_op_redeploy_force_no_default_image_400(client: TestClient, monkeypatch) -> None:

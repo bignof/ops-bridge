@@ -57,6 +57,10 @@ operations_router = APIRouter(tags=["节点控制"])
 # 加前缀标记,避免审计列表整页 payload 膨胀(评审冲突 2,用户定 D)。
 _AUDIT_FIELD_MAX = 1000
 
+# 优雅 stop / pull-redeploy 的 drain 超时(秒),由平台统一下发给 agent(经 hub 透传)。
+# 两条优雅路径(stop / redeploy)共用同一常量,保证 drain 行为对称(评审 T10 Important)。
+_GRACEFUL_SHUTDOWN_TIMEOUT_SEC = 60
+
 # SELECT 列:Service 本行字段 + LEFT JOIN 回 namespace.code(label=namespace_code → camel namespaceCode）。
 _LIST_COLUMNS = (
     Service.id,
@@ -278,7 +282,7 @@ async def dispatch_node_action(
             payload.update(action="stop", mode="force", serviceName=nacos, allowLastInstance=body.allow_last_instance)
         elif action == "stop":  # graceful stop
             health_base_url = _derive_health_base_url(agent_id, nacos)
-            payload.update(action="stop", mode="graceful", healthBaseUrl=health_base_url, shutdownTimeoutSec=60, serviceName=nacos)
+            payload.update(action="stop", mode="graceful", healthBaseUrl=health_base_url, shutdownTimeoutSec=_GRACEFUL_SHUTDOWN_TIMEOUT_SEC, serviceName=nacos)
         elif action == "redeploy" and effective_mode == "force":
             if not default_image:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, "重部署需配置 defaultImage")
@@ -287,7 +291,7 @@ async def dispatch_node_action(
             if not default_image:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, "重部署需配置 defaultImage")
             health_base_url = _derive_health_base_url(agent_id, nacos)
-            payload.update(action="pull-redeploy", mode="graceful", image=default_image, healthBaseUrl=health_base_url)
+            payload.update(action="pull-redeploy", mode="graceful", image=default_image, healthBaseUrl=health_base_url, shutdownTimeoutSec=_GRACEFUL_SHUTDOWN_TIMEOUT_SEC)
 
         resp = hub_client.dispatch_command(agent_id, payload)
         # dispatch 成功:返回 hub 生成的 requestId(该命令进 /api/node-operations 审计列表)。
