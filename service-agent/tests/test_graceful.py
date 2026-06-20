@@ -4,6 +4,7 @@ os.environ.setdefault("AGENT_KEY", "test-key")
 
 import pytest
 
+import config
 from core import graceful
 from services import http_client
 
@@ -111,3 +112,59 @@ def test_drain_rejects_empty_base_without_posting(monkeypatch):
     with pytest.raises(ValueError):
         graceful.drain("", shutdown_timeout=60)
     assert posted["n"] == 0
+
+
+# ─────────────────────────────────────────────
+# shutdown_headers（T4a：opt-in 凭据透传）
+# ─────────────────────────────────────────────
+
+def test_shutdown_headers_none_when_token_unset(monkeypatch):
+    # 未配 K8S_SHUTDOWN_TOKEN（空）→ 返回 None（不带 header，向后兼容）
+    monkeypatch.setattr(config, "K8S_SHUTDOWN_TOKEN", "")
+    assert graceful.shutdown_headers() is None
+
+
+def test_shutdown_headers_set_when_token_present(monkeypatch):
+    # 配了 token → 返回 {'X-Shutdown-Token': <token>}
+    monkeypatch.setattr(config, "K8S_SHUTDOWN_TOKEN", "secret")
+    assert graceful.shutdown_headers() == {"X-Shutdown-Token": "secret"}
+
+
+# ─────────────────────────────────────────────
+# drain 携带凭据（方案 A：配了 token 才带 headers 关键字）
+# ─────────────────────────────────────────────
+
+def test_drain_sends_token_header_when_configured(monkeypatch):
+    """配 K8S_SHUTDOWN_TOKEN：drain 调 http_client.post 带 headers={'X-Shutdown-Token': ...}。"""
+    monkeypatch.setattr(config, "K8S_SHUTDOWN_TOKEN", "secret")
+    captured = {}
+
+    def fake_post(url, timeout=60, headers=None):
+        captured["url"] = url
+        captured["timeout"] = timeout
+        captured["headers"] = headers
+        return 200, "ok"
+
+    monkeypatch.setattr(http_client, "post", fake_post)
+    graceful.drain("http://192.168.0.30:18029", shutdown_timeout=45)
+
+    assert captured["url"] == "http://192.168.0.30:18029/api/k8s/shutdown"
+    assert captured["timeout"] == 45
+    assert captured["headers"] == {"X-Shutdown-Token": "secret"}
+
+
+def test_drain_omits_headers_kwarg_when_token_unset(monkeypatch):
+    """未配 token：drain 调 post 时不传 headers 关键字（逐字节兼容旧调用，桩签名仅 url/timeout）。"""
+    monkeypatch.setattr(config, "K8S_SHUTDOWN_TOKEN", "")
+    captured = {}
+
+    # 桩故意只接受 (url, timeout)：若实现误带 headers= 关键字，这里会 TypeError 而失败
+    def fake_post(url, timeout=60):
+        captured["url"] = url
+        captured["timeout"] = timeout
+        return 200, "ok"
+
+    monkeypatch.setattr(http_client, "post", fake_post)
+    graceful.drain("http://192.168.0.30:18029", shutdown_timeout=60)
+
+    assert captured == {"url": "http://192.168.0.30:18029/api/k8s/shutdown", "timeout": 60}

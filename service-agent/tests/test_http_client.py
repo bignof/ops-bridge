@@ -55,3 +55,29 @@ def test_post_returns_code_and_text(monkeypatch):
     assert http_client.post("http://x") == (200, "ok")
     # H1：post 同样禁止跟随重定向
     assert captured.get("allow_redirects") is False
+
+
+def test_post_forwards_headers_to_requests(monkeypatch):
+    # T4a：post 须把传入的 headers 透传给 requests.post（供 /api/k8s/shutdown 带凭据）
+    captured = {}
+    def fake_post(url, timeout=60, **kwargs):
+        captured.update(kwargs)
+        return FakeResp(status=200, text="ok")
+    monkeypatch.setattr(requests, "post", fake_post)
+    code, text = http_client.post("http://x", headers={"X-Shutdown-Token": "secret"})
+    assert (code, text) == (200, "ok")
+    assert captured.get("headers") == {"X-Shutdown-Token": "secret"}
+    # 透传 headers 不应破坏 H1 禁跳转
+    assert captured.get("allow_redirects") is False
+
+
+def test_post_headers_default_none_passthrough(monkeypatch):
+    # 不传 / 传 None headers 时行为不变（requests 对 headers=None 等同未设）
+    captured = {}
+    def fake_post(url, timeout=60, **kwargs):
+        captured.update(kwargs)
+        return FakeResp(status=200, text="ok")
+    monkeypatch.setattr(requests, "post", fake_post)
+    assert http_client.post("http://x", headers=None) == (200, "ok")
+    assert captured.get("headers") is None
+    assert captured.get("allow_redirects") is False

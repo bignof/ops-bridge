@@ -37,6 +37,11 @@ IMAGE_REGISTRY_ALLOWLIST = [x.strip() for x in os.getenv('IMAGE_REGISTRY_ALLOWLI
 MANAGED_PROJECTS_ROOT = os.getenv('MANAGED_PROJECTS_ROOT', '/data')  # 受管 compose 根目录，所有命令 dir 必须在其下
 SELF_PROJECT_DIR      = os.getenv('SELF_PROJECT_DIR', '')            # agent 自身 compose 目录，禁止被操作（防自杀/越权）
 
+# --- worker /api/k8s/shutdown 鉴权（T4a：opt-in，向后兼容）---
+# 配了非空值，agent 调 worker 优雅停机端点时带 X-Shutdown-Token 头；空=不带（兼容未鉴权端点）。
+# 须与 cnp 侧 /api/k8s/shutdown 校验的 token 一致。
+K8S_SHUTDOWN_TOKEN    = os.getenv('K8S_SHUTDOWN_TOKEN', '')
+
 # --- nacos（滚动重启用，可选能力，勿加 sys.exit 强校验）---
 NACOS_SERVER       = os.getenv('NACOS_SERVER', '')          # 形如 192.168.0.30:8848
 NACOS_NAMESPACE    = os.getenv('NACOS_NAMESPACE', '')       # 空=public

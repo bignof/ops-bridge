@@ -2,7 +2,7 @@ import logging
 import re
 import time
 
-from core.graceful import _validate_health_base_url
+from core.graceful import _validate_health_base_url, shutdown_headers
 from core.handlers import send_message
 from services import docker_cli, http_client, nacos_client
 from services.instance_match import compose_project, match_instance
@@ -79,7 +79,13 @@ def handle_graceful_restart(ws, data):
             _validate_health_base_url(base)
         except ValueError as ve:
             raise RuntimeError(f"healthBaseUrl 非法或非内网地址: {ve}") from None
-        code, _text = http_client.post(f"{base}/api/k8s/shutdown", timeout=shutdown_timeout)
+        # 方案 A：配了 K8S_SHUTDOWN_TOKEN 才带凭据头，未配则不传 headers 关键字（向后兼容）
+        _hdrs = shutdown_headers()
+        code, _text = http_client.post(
+            f"{base}/api/k8s/shutdown",
+            timeout=shutdown_timeout,
+            **({"headers": _hdrs} if _hdrs else {}),
+        )
         if code != 200:
             raise RuntimeError(f"shutdown 返回 {code}")
         ok, out = docker_cli.restart_container(container_id)

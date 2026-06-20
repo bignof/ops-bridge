@@ -17,6 +17,7 @@ def get_status(url, timeout=5):
         return 0
 
 
-def post(url, timeout=60):
-    resp = requests.post(url, timeout=timeout, allow_redirects=False)
+def post(url, timeout=60, headers=None):
+    # headers=None 时 requests 行为与不传一致；用于 /api/k8s/shutdown 透传凭据头（T4a）
+    resp = requests.post(url, timeout=timeout, allow_redirects=False, headers=headers)
     return resp.status_code, resp.text

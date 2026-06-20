@@ -5,6 +5,7 @@ os.environ.setdefault("AGENT_KEY", "test-key")
 import json
 import time
 
+import config
 from core import rolling
 from services import nacos_client, docker_cli, http_client
 
@@ -283,6 +284,51 @@ def test_graceful_restart_rejects_missing_host(monkeypatch):
         "shutdownTimeoutSec": 60, "readyTimeoutSec": 10})
     assert ws.sent[-1]["status"] == "failed"
     assert calls["post"] == 0 and calls["restart"] == 0
+
+
+def test_graceful_restart_sends_shutdown_token_when_configured(monkeypatch):
+    # T4a：配 K8S_SHUTDOWN_TOKEN 时，graceful-restart 调 /api/k8s/shutdown 带 X-Shutdown-Token
+    monkeypatch.setattr(config, "K8S_SHUTDOWN_TOKEN", "secret")
+    captured = {}
+
+    def rec_post(url, timeout=60, headers=None):
+        captured["url"] = url
+        captured["headers"] = headers
+        return (200, "ok")
+
+    monkeypatch.setattr(http_client, "post", rec_post)
+    monkeypatch.setattr(docker_cli, "restart_container", lambda cid, timeout=120: (True, "ok"))
+    monkeypatch.setattr(http_client, "get_status", lambda url, timeout=5: 200)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    ws = FakeWS()
+    rolling.handle_graceful_restart(ws, {"requestId": "g1", "containerId": "abc",
+        "healthBaseUrl": "http://192.168.0.30:18029", "settleSec": 0,
+        "shutdownTimeoutSec": 60, "readyTimeoutSec": 10})
+    assert ws.sent[-1]["status"] == "success"
+    assert captured["url"] == "http://192.168.0.30:18029/api/k8s/shutdown"
+    assert captured["headers"] == {"X-Shutdown-Token": "secret"}
+
+
+def test_graceful_restart_omits_token_header_when_unset(monkeypatch):
+    # T4a 向后兼容：未配 token 时不带 headers 关键字（桩仅接受 url/timeout，误带则 TypeError）
+    monkeypatch.setattr(config, "K8S_SHUTDOWN_TOKEN", "")
+    captured = {}
+
+    def rec_post(url, timeout=60):
+        captured["url"] = url
+        captured["timeout"] = timeout
+        return (200, "ok")
+
+    monkeypatch.setattr(http_client, "post", rec_post)
+    monkeypatch.setattr(docker_cli, "restart_container", lambda cid, timeout=120: (True, "ok"))
+    monkeypatch.setattr(http_client, "get_status", lambda url, timeout=5: 200)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    ws = FakeWS()
+    rolling.handle_graceful_restart(ws, {"requestId": "g1", "containerId": "abc",
+        "healthBaseUrl": "http://192.168.0.30:18029", "settleSec": 0,
+        "shutdownTimeoutSec": 60, "readyTimeoutSec": 10})
+    assert ws.sent[-1]["status"] == "success"
+    assert captured == {"url": "http://192.168.0.30:18029/api/k8s/shutdown", "timeout": 60}
 
 
 def test_wait_ready_polls_then_succeeds(monkeypatch):
