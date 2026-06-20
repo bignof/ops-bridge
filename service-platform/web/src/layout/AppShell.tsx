@@ -4,6 +4,7 @@ import { Avatar, Dropdown, Layout, Menu, Typography, type MenuProps } from 'antd
 import {
   ApiOutlined,
   AppstoreOutlined,
+  ClusterOutlined,
   CloudUploadOutlined,
   DeploymentUnitOutlined,
   HistoryOutlined,
@@ -16,9 +17,10 @@ import { useAuth } from '../auth/AuthContext';
 
 const { Header, Sider, Content } = Layout;
 
-// 左侧栏两组菜单(冻结基线 ui-baseline-p1):
+// 左侧栏三组菜单:
 //   配置:命名空间 / 服务 / 插件 / 服务插件
 //   发布:插件上传 / 插件发布 / 获取记录
+//   运维:节点(启停重启重部署 + 二次确认)
 // key 即对应路由 path(供 createHashRouter 的 children 挂载)。
 const MENU_ITEMS: MenuProps['items'] = [
   {
@@ -41,6 +43,12 @@ const MENU_ITEMS: MenuProps['items'] = [
       { key: '/releases', icon: <RocketOutlined />, label: '插件发布' },
       { key: '/fetch-records', icon: <HistoryOutlined />, label: '获取记录' },
     ],
+  },
+  {
+    key: 'grp-ops',
+    label: '运维',
+    type: 'group',
+    children: [{ key: '/nodes', icon: <ClusterOutlined />, label: '节点' }],
   },
 ];
 

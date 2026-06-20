@@ -37,6 +37,68 @@ export async function get<T>(resource: string, id: string | number): Promise<T> 
   return r.data;
 }
 
+// ── 节点(nodes,Service 台账 × agent 派生)────────────────────────────────────
+// 节点页 = 平台 Service 表驱动的 (agent×service) 列表 + 行级运维操作。
+
+/** 节点行(对齐后端 NodeOut,全 camelCase)。online/degraded 为 bool;lastSeen/healthyCount 可空。 */
+export interface NodeRow {
+  agentId: string;
+  serviceCode: string;
+  /** 命名空间可读名(= agentId,列直接用)。 */
+  namespaceCode: string;
+  dir: string;
+  defaultImage: string;
+  nacosServiceName: string;
+  online: boolean;
+  lastSeen: string | null;
+  /** 健康实例数;degraded 或后端未知时为 null(列显「-」)。 */
+  healthyCount: number | null;
+  /** 降级:健康计数不可信,列以「-」展示。 */
+  degraded: boolean;
+}
+
+/** 行级运维动作。stop/redeploy 须传 mode;restart 缺省 graceful;start 无 mode。 */
+export type NodeAction = 'start' | 'stop' | 'restart' | 'redeploy';
+
+/** 动作请求体:stop/restart/redeploy 带 mode;force stop 可带 allowLastInstance=false。 */
+export interface NodeActionBody {
+  mode?: 'graceful' | 'force';
+  allowLastInstance?: boolean;
+}
+
+/** 动作响应(对齐后端 NodeActionOut):同步命令(requestId)或滚动任务(taskId)。 */
+export interface NodeActionOut {
+  kind: 'command' | 'rolling';
+  requestId?: string;
+  taskId?: string;
+  accepted?: boolean;
+}
+
+/** 节点列表(服务端分页,统一信封):GET /api/nodes?page=&pageSize=。 */
+export async function listNodes<T = NodeRow>(params: ListParams = {}): Promise<ListEnvelope<T>> {
+  return list<T>('nodes', params);
+}
+
+/**
+ * 行级运维动作:POST /api/nodes/{agentId}/{serviceCode}/{action}(body `{mode?, allowLastInstance?}`)。
+ * `suppressGlobalError`:节点页对 400/404/409/502 本地精确提示(各文案不同),opt-out 全局兜底防双 toast。
+ * ⚠️ opt-out 后非预期状态失败的可见性由节点页 catch 自己兜底(不可静默吞,A2);401 仍由拦截器统一处理。
+ * agentId/serviceCode 经 encodeURIComponent 防含特殊字符时路径破裂。返回 NodeActionOut。
+ */
+export async function dispatchNodeAction(
+  agentId: string,
+  serviceCode: string,
+  action: NodeAction,
+  body: NodeActionBody = {},
+): Promise<NodeActionOut> {
+  const r = await client.post<NodeActionOut>(
+    `/api/nodes/${encodeURIComponent(agentId)}/${encodeURIComponent(serviceCode)}/${action}`,
+    body,
+    { suppressGlobalError: true },
+  );
+  return r.data;
+}
+
 /**
  * 新建:POST /api/<resource>(201)。返回响应体(可能含 show-once 明文)。
  * `suppressGlobalError`:CrudTable 对 409「编码已存在」本地精确提示,故 opt-out 全局兜底防双 toast。
