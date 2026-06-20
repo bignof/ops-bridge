@@ -413,7 +413,7 @@ def test_handle_stop_runs_stop_not_down(monkeypatch: pytest.MonkeyPatch, tmp_pat
     monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
     monkeypatch.setattr(handlers, "run_compose", lambda project_dir, args: (calls.append(args) or (True, "stop ok")))
 
-    handlers.handle_stop(ws, {}, "req-1", str(tmp_path))
+    handlers.handle_stop(ws, {"mode": "force"}, "req-1", str(tmp_path))
 
     decoded = _decode_messages(ws)
     assert calls == [["stop"]]
@@ -453,7 +453,7 @@ def test_handle_stop_no_compose_file_sends_error(monkeypatch: pytest.MonkeyPatch
     ws = FakeWebSocket()
     monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: None)
 
-    handlers.handle_stop(ws, {}, "req-1", str(tmp_path))
+    handlers.handle_stop(ws, {"mode": "force"}, "req-1", str(tmp_path))
 
     assert "No docker-compose" in _decode_messages(ws)[0]["error"]
 
@@ -481,17 +481,229 @@ def test_handle_start_reports_failure(monkeypatch: pytest.MonkeyPatch, tmp_path)
 
 
 def test_handle_stop_handles_timeout_and_exception(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
-    """stop 的超时与异常分支：分别回 send_error。"""
+    """stop(force) 的超时与异常分支：分别回 send_error。"""
     ws = FakeWebSocket()
     monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
     monkeypatch.setattr(handlers, "run_compose", lambda *args: (_ for _ in ()).throw(subprocess.TimeoutExpired("cmd", 1)))
-    handlers.handle_stop(ws, {}, "req-1", str(tmp_path))
+    handlers.handle_stop(ws, {"mode": "force"}, "req-1", str(tmp_path))
     assert _decode_messages(ws)[1]["error"] == "Command execution timed out (5 min)"
 
     ws = FakeWebSocket()
     monkeypatch.setattr(handlers, "run_compose", lambda *args: (_ for _ in ()).throw(RuntimeError("explode")))
-    handlers.handle_stop(ws, {}, "req-2", str(tmp_path))
+    handlers.handle_stop(ws, {"mode": "force"}, "req-2", str(tmp_path))
     assert _decode_messages(ws)[1]["error"] == "explode"
+
+
+# ─────────────────────────────────────────────
+# handle_stop — graceful 分流（drain → stop）
+# ─────────────────────────────────────────────
+
+def test_handle_stop_graceful_drains_then_stops(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """graceful（默认）：先 graceful.drain 再 run_compose(['stop'])，且 drain 在 stop 之前。"""
+    ws = FakeWebSocket()
+    order: list[str] = []
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers.graceful, "drain", lambda base, timeout=60: order.append(f"drain:{base}:{timeout}"))
+    monkeypatch.setattr(handlers, "run_compose", lambda project_dir, args: (order.append(f"compose:{args}") or (True, "stop ok")))
+
+    handlers.handle_stop(
+        ws,
+        {"healthBaseUrl": "http://192.168.0.30:18029", "shutdownTimeoutSec": 45},
+        "req-1",
+        str(tmp_path),
+    )
+
+    decoded = _decode_messages(ws)
+    # 次序断言：drain 必须先于 compose stop
+    assert order == ["drain:http://192.168.0.30:18029:45", "compose:['stop']"]
+    assert decoded[0]["type"] == "ack"
+    assert decoded[-1]["status"] == "success"
+    assert "docker compose stop" in decoded[-1]["output"]
+
+
+def test_handle_stop_defaults_to_graceful(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """不传 mode 时默认走 graceful：会调用 drain。"""
+    ws = FakeWebSocket()
+    drained = {"n": 0}
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers.graceful, "drain", lambda base, timeout=60: drained.__setitem__("n", drained["n"] + 1))
+    monkeypatch.setattr(handlers, "run_compose", lambda project_dir, args: (True, "stop ok"))
+
+    handlers.handle_stop(ws, {"healthBaseUrl": "http://10.0.0.5:18029"}, "req-1", str(tmp_path))
+
+    assert drained["n"] == 1
+    assert _decode_messages(ws)[-1]["status"] == "success"
+
+
+def test_handle_stop_graceful_default_shutdown_timeout(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """graceful 未传 shutdownTimeoutSec 时，drain 收到默认 60。"""
+    ws = FakeWebSocket()
+    seen = {}
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers.graceful, "drain", lambda base, timeout=60: seen.update(base=base, timeout=timeout))
+    monkeypatch.setattr(handlers, "run_compose", lambda project_dir, args: (True, "stop ok"))
+
+    handlers.handle_stop(ws, {"healthBaseUrl": "http://10.0.0.5:18029"}, "req-1", str(tmp_path))
+
+    assert seen == {"base": "http://10.0.0.5:18029", "timeout": 60}
+
+
+def test_handle_stop_graceful_rejects_bad_url_without_draining_or_stopping(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """graceful：healthBaseUrl 非法（drain 抛 ValueError）→ send_error，绝不 run_compose(['stop'])。"""
+    ws = FakeWebSocket()
+    compose_calls: list[list[str]] = []
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+
+    def boom(base, timeout=60):
+        raise ValueError(f"host 为公网可路由地址，禁止访问: {base}")
+
+    monkeypatch.setattr(handlers.graceful, "drain", boom)
+    monkeypatch.setattr(handlers, "run_compose", lambda project_dir, args: (compose_calls.append(args) or (True, "stop ok")))
+
+    handlers.handle_stop(ws, {"healthBaseUrl": "http://8.8.8.8:18029"}, "req-1", str(tmp_path))
+
+    decoded = _decode_messages(ws)
+    assert decoded[-1]["status"] == "failed"
+    assert "公网" in decoded[-1]["error"]
+    # 关键：drain 失败时绝不能 compose stop
+    assert compose_calls == []
+
+
+def test_handle_stop_graceful_drain_failure_does_not_stop(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """graceful：drain 抛 RuntimeError（shutdown 非 200）→ send_error，不自动转 force，不 compose stop。"""
+    ws = FakeWebSocket()
+    compose_calls: list[list[str]] = []
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers.graceful, "drain", lambda base, timeout=60: (_ for _ in ()).throw(RuntimeError("shutdown 返回 503")))
+    monkeypatch.setattr(handlers, "run_compose", lambda project_dir, args: (compose_calls.append(args) or (True, "stop ok")))
+
+    handlers.handle_stop(ws, {"healthBaseUrl": "http://192.168.0.30:18029"}, "req-1", str(tmp_path))
+
+    decoded = _decode_messages(ws)
+    assert decoded[-1]["status"] == "failed"
+    assert "shutdown" in decoded[-1]["error"]
+    assert compose_calls == []
+
+
+def test_handle_stop_graceful_no_compose_file_sends_error(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """graceful：无 compose 文件 → 提前 send_error，不应 drain。"""
+    ws = FakeWebSocket()
+    drained = {"n": 0}
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: None)
+    monkeypatch.setattr(handlers.graceful, "drain", lambda base, timeout=60: drained.__setitem__("n", drained["n"] + 1))
+
+    handlers.handle_stop(ws, {"healthBaseUrl": "http://192.168.0.30:18029"}, "req-1", str(tmp_path))
+
+    assert "No docker-compose" in _decode_messages(ws)[0]["error"]
+    assert drained["n"] == 0
+
+
+def test_handle_stop_graceful_handles_timeout_and_exception(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """graceful：drain 成功后 run_compose 超时/异常 → 走兜底 send_error。"""
+    ws = FakeWebSocket()
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers.graceful, "drain", lambda base, timeout=60: None)
+    monkeypatch.setattr(handlers, "run_compose", lambda *args: (_ for _ in ()).throw(subprocess.TimeoutExpired("cmd", 1)))
+    handlers.handle_stop(ws, {"healthBaseUrl": "http://192.168.0.30:18029"}, "req-1", str(tmp_path))
+    assert _decode_messages(ws)[-1]["error"] == "Command execution timed out (5 min)"
+
+    ws = FakeWebSocket()
+    monkeypatch.setattr(handlers, "run_compose", lambda *args: (_ for _ in ()).throw(RuntimeError("explode")))
+    handlers.handle_stop(ws, {"healthBaseUrl": "http://192.168.0.30:18029"}, "req-2", str(tmp_path))
+    assert _decode_messages(ws)[-1]["error"] == "explode"
+
+
+# ─────────────────────────────────────────────
+# handle_pull_redeploy — graceful（drain→update）/ force（复用 handle_update）
+# ─────────────────────────────────────────────
+
+def test_handle_pull_redeploy_force_reuses_update(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """force：直接复用 handle_update，不 drain。"""
+    ws = FakeWebSocket()
+    order: list[str] = []
+    monkeypatch.setattr(handlers.graceful, "drain", lambda base, timeout=60: order.append("drain"))
+    monkeypatch.setattr(handlers, "handle_update", lambda w, d, rid, pd: order.append(f"update:{d.get('image')}"))
+
+    handlers.handle_pull_redeploy(ws, {"mode": "force", "image": "repo/app:9"}, "req-1", str(tmp_path))
+
+    assert order == ["update:repo/app:9"]
+
+
+def test_handle_pull_redeploy_graceful_drains_then_updates(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """graceful（默认）：先 drain 再 handle_update，次序固定。"""
+    ws = FakeWebSocket()
+    order: list[str] = []
+    monkeypatch.setattr(handlers.graceful, "drain", lambda base, timeout=60: order.append(f"drain:{base}:{timeout}"))
+    monkeypatch.setattr(handlers, "handle_update", lambda w, d, rid, pd: order.append(f"update:{d.get('image')}"))
+
+    handlers.handle_pull_redeploy(
+        ws,
+        {"image": "repo/app:9", "healthBaseUrl": "http://192.168.0.30:18029", "shutdownTimeoutSec": 30},
+        "req-1",
+        str(tmp_path),
+    )
+
+    assert order == ["drain:http://192.168.0.30:18029:30", "update:repo/app:9"]
+
+
+def test_handle_pull_redeploy_graceful_drain_failure_skips_update(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """graceful：drain 失败 → send_error，绝不调 handle_update。"""
+    ws = FakeWebSocket()
+    update_calls = {"n": 0}
+    monkeypatch.setattr(handlers.graceful, "drain", lambda base, timeout=60: (_ for _ in ()).throw(RuntimeError("shutdown 返回 500")))
+    monkeypatch.setattr(handlers, "handle_update", lambda w, d, rid, pd: update_calls.__setitem__("n", update_calls["n"] + 1))
+
+    handlers.handle_pull_redeploy(
+        ws,
+        {"image": "repo/app:9", "healthBaseUrl": "http://192.168.0.30:18029"},
+        "req-1",
+        str(tmp_path),
+    )
+
+    decoded = _decode_messages(ws)
+    assert decoded[-1]["status"] == "failed"
+    assert "shutdown" in decoded[-1]["error"]
+    assert update_calls["n"] == 0
+
+
+def test_handle_pull_redeploy_graceful_rejects_bad_url_skips_update(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """graceful：healthBaseUrl 非法（drain ValueError）→ send_error，不 update。"""
+    ws = FakeWebSocket()
+    update_calls = {"n": 0}
+    monkeypatch.setattr(handlers.graceful, "drain", lambda base, timeout=60: (_ for _ in ()).throw(ValueError("host 必须是内网 IP，非域名: evil.example.com")))
+    monkeypatch.setattr(handlers, "handle_update", lambda w, d, rid, pd: update_calls.__setitem__("n", update_calls["n"] + 1))
+
+    handlers.handle_pull_redeploy(
+        ws,
+        {"image": "repo/app:9", "healthBaseUrl": "http://evil.example.com:18029"},
+        "req-1",
+        str(tmp_path),
+    )
+
+    decoded = _decode_messages(ws)
+    assert decoded[-1]["status"] == "failed"
+    assert "内网" in decoded[-1]["error"]
+    assert update_calls["n"] == 0
+
+
+def test_handle_pull_redeploy_graceful_unexpected_drain_error_skips_update(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """graceful：drain 抛非 ValueError/RuntimeError 的异常（兜底分支）→ send_error，不 update。"""
+    ws = FakeWebSocket()
+    update_calls = {"n": 0}
+    monkeypatch.setattr(handlers.graceful, "drain", lambda base, timeout=60: (_ for _ in ()).throw(OSError("socket boom")))
+    monkeypatch.setattr(handlers, "handle_update", lambda w, d, rid, pd: update_calls.__setitem__("n", update_calls["n"] + 1))
+
+    handlers.handle_pull_redeploy(
+        ws,
+        {"image": "repo/app:9", "healthBaseUrl": "http://192.168.0.30:18029"},
+        "req-1",
+        str(tmp_path),
+    )
+
+    decoded = _decode_messages(ws)
+    assert decoded[-1]["status"] == "failed"
+    assert "socket boom" in decoded[-1]["error"]
+    assert update_calls["n"] == 0
 
 
 def test_handle_force_restart_handles_timeout_and_exception(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
@@ -509,10 +721,11 @@ def test_handle_force_restart_handles_timeout_and_exception(monkeypatch: pytest.
 
 
 def test_handlers_registry_includes_node_control_actions() -> None:
-    """HANDLERS 必须注册 start / stop / force-restart（force-restart 为连字符 key）。"""
+    """HANDLERS 必须注册 start / stop / force-restart / pull-redeploy（连字符 key）。"""
     assert handlers.HANDLERS["start"] is handlers.handle_start
     assert handlers.HANDLERS["stop"] is handlers.handle_stop
     assert handlers.HANDLERS["force-restart"] is handlers.handle_force_restart
+    assert handlers.HANDLERS["pull-redeploy"] is handlers.handle_pull_redeploy
 
 
 def test_dispatch_serializes_commands_for_same_directory(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:

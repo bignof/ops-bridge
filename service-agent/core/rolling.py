@@ -1,9 +1,8 @@
-import ipaddress
 import logging
 import re
 import time
-from urllib.parse import urlparse
 
+from core.graceful import _validate_health_base_url
 from core.handlers import send_message
 from services import docker_cli, http_client, nacos_client
 from services.instance_match import match_instance
@@ -13,34 +12,13 @@ logger = logging.getLogger(__name__)
 # 用于把日志/回传文本里的 nacos accessToken 脱敏（H2 纵深防御）
 _TOKEN_RE = re.compile(r"accessToken=[^&\s]+")
 
+# _validate_health_base_url 已抽到 core.graceful（叶子模块），此处 re-export 供
+# 既有调用方 / 测试以 rolling._validate_health_base_url 解析；优雅 stop / pull-redeploy 复用同一守卫。
+
 
 def _redact(text):
     """脱敏：把 accessToken=xxx 替换成 accessToken=***，避免 token 进日志或回 hub。"""
     return _TOKEN_RE.sub("accessToken=***", str(text))
-
-
-def _validate_health_base_url(base):
-    """
-    校验 graceful-restart 的 healthBaseUrl，防 SSRF（H1）。
-    要求：scheme ∈ {http, https}，且 host 必须是非公网（private/loopback/link-local）IP。
-    非法时抛 ValueError（由调用方转成 failed 结果，不冒泡）。
-    """
-    if not base:
-        raise ValueError("healthBaseUrl 为空")
-    parsed = urlparse(base)
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError(f"scheme 非法（仅允许 http/https）: {parsed.scheme or '空'}")
-    host = parsed.hostname
-    if not host:
-        raise ValueError("缺少 host")
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        # 非 IP（如域名）一律拒绝，避免 DNS 解析到公网
-        raise ValueError(f"host 必须是内网 IP，非域名: {host}")
-    if ip.is_global:
-        raise ValueError(f"host 为公网可路由地址，禁止访问: {host}")
-    return base
 
 
 def handle_list_instances(ws, data):

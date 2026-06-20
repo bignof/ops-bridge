@@ -12,6 +12,7 @@ import time
 from typing import TypedDict, cast
 
 import config
+from core import graceful
 from services.compose import find_compose_file, read_compose_file, restore_compose_file, run_compose, update_image_in_compose
 
 logger = logging.getLogger(__name__)
@@ -326,18 +327,17 @@ def handle_start(ws, data, request_id, project_dir):
     _reply(ws, request_id, ok, f"=== docker compose up -d ===\n{out}", 'start', project_dir)
 
 
-def handle_stop(ws, data, request_id, project_dir):
-    """stop（force 语义）: docker compose stop。
+def _force_stop(ws, data, request_id, project_dir):
+    """stop 的 force 语义（T2 实现，原样保留）: docker compose stop。
 
     用 stop 而非 down——down 会删除容器/网络，影响后续 start。
-    优雅停机（graceful）的 mode 分支留待 Task 3，本任务只做 force。
     """
     compose_file = find_compose_file(project_dir)
     if not compose_file:
         send_error(ws, request_id, f"No docker-compose.yaml/yml found in {project_dir}")
         return
 
-    logger.info(f"stop: dir={project_dir}")
+    logger.info(f"stop(force): dir={project_dir}")
     send_message(ws, {'type': 'ack', 'requestId': request_id, 'status': 'processing'})
 
     try:
@@ -351,6 +351,59 @@ def handle_stop(ws, data, request_id, project_dir):
         return
 
     _reply(ws, request_id, ok, f"=== docker compose stop ===\n{out}", 'stop', project_dir)
+
+
+def _graceful_stop(ws, data, request_id, project_dir):
+    """stop 的 graceful 语义: 先 drain（POST /api/k8s/shutdown 阻塞至 worker 排空）再 docker compose stop。
+
+    drain 失败（healthBaseUrl 非法 / shutdown 非 200）→ send_error，**不自动转 force**（人工决定）。
+    """
+    compose_file = find_compose_file(project_dir)
+    if not compose_file:
+        send_error(ws, request_id, f"No docker-compose.yaml/yml found in {project_dir}")
+        return
+
+    logger.info(f"stop(graceful): dir={project_dir}")
+    send_message(ws, {'type': 'ack', 'requestId': request_id, 'status': 'processing'})
+
+    # 先 drain：单独 try，只把 drain 自身的失败（ValueError/RuntimeError）翻成 drain 语义错误，
+    # 避免误把后续 compose 的异常也归类成「drain 失败」。drain 失败时绝不 compose stop、不自动转 force。
+    try:
+        graceful.drain(data.get('healthBaseUrl'), int(data.get('shutdownTimeoutSec', 60)))
+    except ValueError as e:
+        # healthBaseUrl 非法 / 非内网：在发 shutdown 前就被拒，绝不 compose stop
+        send_error(ws, request_id, f"healthBaseUrl 非法或非内网地址: {e}")
+        return
+    except RuntimeError as e:
+        # drain 失败（shutdown 非 200）：不自动转 force，由人工决定
+        send_error(ws, request_id, f"优雅停机 drain 失败: {e}")
+        return
+
+    # drain 成功后再 compose stop，沿用 force 路径同款的超时/异常兜底
+    try:
+        ok, out = run_compose(project_dir, ['stop'])
+    except subprocess.TimeoutExpired:
+        send_error(ws, request_id, "Command execution timed out (5 min)")
+        return
+    except Exception as e:
+        logger.exception("Execution error")
+        send_error(ws, request_id, str(e))
+        return
+
+    _reply(ws, request_id, ok, f"=== drain → docker compose stop ===\n{out}", 'stop', project_dir)
+
+
+def handle_stop(ws, data, request_id, project_dir):
+    """stop: 按 mode 分流。
+
+    - mode='force'   → 直接 docker compose stop（T2 语义）。
+    - 否则（默认 graceful）→ 先 drain（优雅排空）再 docker compose stop。
+    """
+    mode = data.get('mode', 'graceful')
+    if mode == 'force':
+        _force_stop(ws, data, request_id, project_dir)
+    else:
+        _graceful_stop(ws, data, request_id, project_dir)
 
 
 def handle_force_restart(ws, data, request_id, project_dir):
@@ -376,6 +429,37 @@ def handle_force_restart(ws, data, request_id, project_dir):
     _reply(ws, request_id, ok, f"=== docker compose restart ===\n{out}", 'force-restart', project_dir)
 
 
+def handle_pull_redeploy(ws, data, request_id, project_dir):
+    """pull-redeploy: 按 mode 分流，重新拉镜像并重部署（pull → down → up -d，含回滚）。
+
+    - mode='force'   → 直接复用 handle_update（image 重写 → pull → down → up -d + 回滚）。
+    - 否则（默认 graceful）→ 先 drain（优雅排空）再 handle_update；drain 失败则 send_error，**不继续 update、不自动转 force**。
+
+    注：与 update 一样要求 data['image']；handle_update 自带 ack/_reply（label 'update'，requestId 对账）。
+    """
+    mode = data.get('mode', 'graceful')
+    if mode == 'force':
+        handle_update(ws, data, request_id, project_dir)
+        return
+
+    logger.info(f"pull-redeploy(graceful): dir={project_dir}")
+    try:
+        graceful.drain(data.get('healthBaseUrl'), int(data.get('shutdownTimeoutSec', 60)))
+    except ValueError as e:
+        send_error(ws, request_id, f"healthBaseUrl 非法或非内网地址: {e}")
+        return
+    except RuntimeError as e:
+        send_error(ws, request_id, f"优雅停机 drain 失败: {e}")
+        return
+    except Exception as e:
+        logger.exception("Execution error")
+        send_error(ws, request_id, str(e))
+        return
+
+    # drain 成功后再重部署，复用 handle_update 的镜像重写 / pull / down / up -d + 回滚
+    handle_update(ws, data, request_id, project_dir)
+
+
 # ─────────────────────────────────────────────
 # 注册表：新增 action 只需在这里添加一行
 # ─────────────────────────────────────────────
@@ -386,6 +470,7 @@ HANDLERS = {
     'start':         handle_start,
     'stop':          handle_stop,
     'force-restart': handle_force_restart,
+    'pull-redeploy': handle_pull_redeploy,
 }
 
 
