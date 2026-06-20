@@ -379,6 +379,142 @@ def test_handle_restart_paths(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None
     assert _decode_messages(ws)[-1]["status"] == "success"
 
 
+def test_handle_start_runs_up_detached(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """start → docker compose up -d；成功时末条消息 status=success。"""
+    ws = FakeWebSocket()
+    calls: list[list[str]] = []
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "run_compose", lambda project_dir, args: (calls.append(args) or (True, "up ok")))
+
+    handlers.handle_start(ws, {}, "req-1", str(tmp_path))
+
+    decoded = _decode_messages(ws)
+    assert calls == [["up", "-d"]]
+    assert decoded[0]["type"] == "ack"
+    assert decoded[-1]["status"] == "success"
+    assert "docker compose up -d" in decoded[-1]["output"]
+
+
+def test_handle_start_is_idempotent_when_already_running(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """幂等：已在运行时 up -d 为 no-op 返回 ok → success。"""
+    ws = FakeWebSocket()
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "run_compose", lambda *args: (True, "already running"))
+
+    handlers.handle_start(ws, {}, "req-1", str(tmp_path))
+
+    assert _decode_messages(ws)[-1]["status"] == "success"
+
+
+def test_handle_stop_runs_stop_not_down(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """stop(force) → docker compose stop（绝不能是 down，down 会删容器影响后续 start）。"""
+    ws = FakeWebSocket()
+    calls: list[list[str]] = []
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "run_compose", lambda project_dir, args: (calls.append(args) or (True, "stop ok")))
+
+    handlers.handle_stop(ws, {}, "req-1", str(tmp_path))
+
+    decoded = _decode_messages(ws)
+    assert calls == [["stop"]]
+    assert ["down"] not in calls
+    assert decoded[0]["type"] == "ack"
+    assert decoded[-1]["status"] == "success"
+    assert "docker compose stop" in decoded[-1]["output"]
+
+
+def test_handle_force_restart_runs_restart(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """force-restart → docker compose restart；成功时 status=success。"""
+    ws = FakeWebSocket()
+    calls: list[list[str]] = []
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "run_compose", lambda project_dir, args: (calls.append(args) or (True, "restart ok")))
+
+    handlers.handle_force_restart(ws, {}, "req-1", str(tmp_path))
+
+    decoded = _decode_messages(ws)
+    assert calls == [["restart"]]
+    assert decoded[0]["type"] == "ack"
+    assert decoded[-1]["status"] == "success"
+    assert "docker compose restart" in decoded[-1]["output"]
+
+
+def test_handle_start_no_compose_file_sends_error(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """无 compose 文件 → send_error 含「No docker-compose」。"""
+    ws = FakeWebSocket()
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: None)
+
+    handlers.handle_start(ws, {}, "req-1", str(tmp_path))
+
+    assert "No docker-compose" in _decode_messages(ws)[0]["error"]
+
+
+def test_handle_stop_no_compose_file_sends_error(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    ws = FakeWebSocket()
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: None)
+
+    handlers.handle_stop(ws, {}, "req-1", str(tmp_path))
+
+    assert "No docker-compose" in _decode_messages(ws)[0]["error"]
+
+
+def test_handle_force_restart_no_compose_file_sends_error(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    ws = FakeWebSocket()
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: None)
+
+    handlers.handle_force_restart(ws, {}, "req-1", str(tmp_path))
+
+    assert "No docker-compose" in _decode_messages(ws)[0]["error"]
+
+
+def test_handle_start_reports_failure(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """失败路径：run_compose 返回 (False, ...) → _reply status=failed。"""
+    ws = FakeWebSocket()
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "run_compose", lambda *args: (False, "boom"))
+
+    handlers.handle_start(ws, {}, "req-1", str(tmp_path))
+
+    decoded = _decode_messages(ws)
+    assert decoded[-1]["status"] == "failed"
+    assert "boom" in decoded[-1]["output"]
+
+
+def test_handle_stop_handles_timeout_and_exception(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """stop 的超时与异常分支：分别回 send_error。"""
+    ws = FakeWebSocket()
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "run_compose", lambda *args: (_ for _ in ()).throw(subprocess.TimeoutExpired("cmd", 1)))
+    handlers.handle_stop(ws, {}, "req-1", str(tmp_path))
+    assert _decode_messages(ws)[1]["error"] == "Command execution timed out (5 min)"
+
+    ws = FakeWebSocket()
+    monkeypatch.setattr(handlers, "run_compose", lambda *args: (_ for _ in ()).throw(RuntimeError("explode")))
+    handlers.handle_stop(ws, {}, "req-2", str(tmp_path))
+    assert _decode_messages(ws)[1]["error"] == "explode"
+
+
+def test_handle_force_restart_handles_timeout_and_exception(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """force-restart 的超时与异常分支：分别回 send_error。"""
+    ws = FakeWebSocket()
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "run_compose", lambda *args: (_ for _ in ()).throw(subprocess.TimeoutExpired("cmd", 1)))
+    handlers.handle_force_restart(ws, {}, "req-1", str(tmp_path))
+    assert _decode_messages(ws)[1]["error"] == "Command execution timed out (5 min)"
+
+    ws = FakeWebSocket()
+    monkeypatch.setattr(handlers, "run_compose", lambda *args: (_ for _ in ()).throw(RuntimeError("explode")))
+    handlers.handle_force_restart(ws, {}, "req-2", str(tmp_path))
+    assert _decode_messages(ws)[1]["error"] == "explode"
+
+
+def test_handlers_registry_includes_node_control_actions() -> None:
+    """HANDLERS 必须注册 start / stop / force-restart（force-restart 为连字符 key）。"""
+    assert handlers.HANDLERS["start"] is handlers.handle_start
+    assert handlers.HANDLERS["stop"] is handlers.handle_stop
+    assert handlers.HANDLERS["force-restart"] is handlers.handle_force_restart
+
+
 def test_dispatch_serializes_commands_for_same_directory(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     shared_dir = tmp_path / "shared"
     shared_dir.mkdir()

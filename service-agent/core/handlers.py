@@ -303,13 +303,89 @@ def handle_restart(ws, data, request_id, project_dir):
     _reply(ws, request_id, ok, f"=== docker compose restart ===\n{out}", 'restart', project_dir)
 
 
+def handle_start(ws, data, request_id, project_dir):
+    """start: docker compose up -d（幂等，已在运行则为 no-op）"""
+    compose_file = find_compose_file(project_dir)
+    if not compose_file:
+        send_error(ws, request_id, f"No docker-compose.yaml/yml found in {project_dir}")
+        return
+
+    logger.info(f"start: dir={project_dir}")
+    send_message(ws, {'type': 'ack', 'requestId': request_id, 'status': 'processing'})
+
+    try:
+        ok, out = run_compose(project_dir, ['up', '-d'])
+    except subprocess.TimeoutExpired:
+        send_error(ws, request_id, "Command execution timed out (5 min)")
+        return
+    except Exception as e:
+        logger.exception("Execution error")
+        send_error(ws, request_id, str(e))
+        return
+
+    _reply(ws, request_id, ok, f"=== docker compose up -d ===\n{out}", 'start', project_dir)
+
+
+def handle_stop(ws, data, request_id, project_dir):
+    """stop（force 语义）: docker compose stop。
+
+    用 stop 而非 down——down 会删除容器/网络，影响后续 start。
+    优雅停机（graceful）的 mode 分支留待 Task 3，本任务只做 force。
+    """
+    compose_file = find_compose_file(project_dir)
+    if not compose_file:
+        send_error(ws, request_id, f"No docker-compose.yaml/yml found in {project_dir}")
+        return
+
+    logger.info(f"stop: dir={project_dir}")
+    send_message(ws, {'type': 'ack', 'requestId': request_id, 'status': 'processing'})
+
+    try:
+        ok, out = run_compose(project_dir, ['stop'])
+    except subprocess.TimeoutExpired:
+        send_error(ws, request_id, "Command execution timed out (5 min)")
+        return
+    except Exception as e:
+        logger.exception("Execution error")
+        send_error(ws, request_id, str(e))
+        return
+
+    _reply(ws, request_id, ok, f"=== docker compose stop ===\n{out}", 'stop', project_dir)
+
+
+def handle_force_restart(ws, data, request_id, project_dir):
+    """force-restart: docker compose restart"""
+    compose_file = find_compose_file(project_dir)
+    if not compose_file:
+        send_error(ws, request_id, f"No docker-compose.yaml/yml found in {project_dir}")
+        return
+
+    logger.info(f"force-restart: dir={project_dir}")
+    send_message(ws, {'type': 'ack', 'requestId': request_id, 'status': 'processing'})
+
+    try:
+        ok, out = run_compose(project_dir, ['restart'])
+    except subprocess.TimeoutExpired:
+        send_error(ws, request_id, "Command execution timed out (5 min)")
+        return
+    except Exception as e:
+        logger.exception("Execution error")
+        send_error(ws, request_id, str(e))
+        return
+
+    _reply(ws, request_id, ok, f"=== docker compose restart ===\n{out}", 'force-restart', project_dir)
+
+
 # ─────────────────────────────────────────────
 # 注册表：新增 action 只需在这里添加一行
 # ─────────────────────────────────────────────
 
 HANDLERS = {
-    'update':  handle_update,
-    'restart': handle_restart,
+    'update':        handle_update,
+    'restart':       handle_restart,
+    'start':         handle_start,
+    'stop':          handle_stop,
+    'force-restart': handle_force_restart,
 }
 
 
