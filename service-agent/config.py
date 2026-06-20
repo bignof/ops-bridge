@@ -26,6 +26,10 @@ HEARTBEAT_INTERVAL = int(os.getenv('HEARTBEAT_INTERVAL', '30'))
 HEALTH_HOST        = os.getenv('HEALTH_HOST', '0.0.0.0')
 HEALTH_PORT        = int(os.getenv('HEALTH_PORT', '18081'))
 
+# --- 节点控制安全闸（compose 命令目录守卫）---
+MANAGED_PROJECTS_ROOT = os.getenv('MANAGED_PROJECTS_ROOT', '/data')  # 受管 compose 根目录，所有命令 dir 必须在其下
+SELF_PROJECT_DIR      = os.getenv('SELF_PROJECT_DIR', '')            # agent 自身 compose 目录，禁止被操作（防自杀/越权）
+
 # --- nacos（滚动重启用，可选能力，勿加 sys.exit 强校验）---
 NACOS_SERVER       = os.getenv('NACOS_SERVER', '')          # 形如 192.168.0.30:8848
 NACOS_NAMESPACE    = os.getenv('NACOS_NAMESPACE', '')       # 空=public

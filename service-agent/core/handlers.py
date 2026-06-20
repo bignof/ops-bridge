@@ -11,6 +11,7 @@ import threading
 import time
 from typing import TypedDict, cast
 
+import config
 from services.compose import find_compose_file, read_compose_file, restore_compose_file, run_compose, update_image_in_compose
 
 logger = logging.getLogger(__name__)
@@ -179,6 +180,30 @@ def _validate_base(ws, data):
     if not os.path.isdir(project_dir):
         send_error(ws, request_id, f"Directory not found: {project_dir}")
         return None
+
+    # ── 节点控制安全闸 ──
+    # agent 挂载宿主 docker.sock，这里是防越权（任意目录/`..` 穿越）与防自杀（操作 agent 自身 compose）的最终闸。
+    real = os.path.realpath(project_dir)
+    root = os.path.realpath(config.MANAGED_PROJECTS_ROOT)
+    # ① realpath 归一后必须落在受管根之下；commonpath 在跨盘符/混绝对相对时会 raise ValueError，一律视为「在根外」拒绝。
+    try:
+        in_root = os.path.commonpath([real, root]) == root
+    except ValueError:
+        in_root = False
+    if not in_root:
+        send_error(ws, request_id, f"dir 不在受管目录 {root} 内: {project_dir}")
+        return None
+
+    # ② 拒绝命中 agent 自身 compose 目录（含其子目录）；同样把 ValueError 兜底为「命中」以从严拒绝。
+    if config.SELF_PROJECT_DIR:
+        self_dir = os.path.realpath(config.SELF_PROJECT_DIR)
+        try:
+            hits_self = os.path.commonpath([real, self_dir]) == self_dir
+        except ValueError:
+            hits_self = True
+        if hits_self:
+            send_error(ws, request_id, "禁止操作 agent 自身 project")
+            return None
 
     return request_id, action, project_dir
 

@@ -1,3 +1,10 @@
+import os
+
+# handlers 现在会 import config，而 config 在缺少 WS_URL/AGENT_KEY 时会 sys.exit。
+# 与 test_rolling.py / test_nacos_client.py 同款：导入前先注入测试用默认值。
+os.environ.setdefault("WS_URL", "ws://test")
+os.environ.setdefault("AGENT_KEY", "test-key")
+
 import json
 import subprocess
 import threading
@@ -52,10 +59,145 @@ def test_validate_base_and_dispatch_errors(monkeypatch: pytest.MonkeyPatch, tmp_
 
     ws = FakeWebSocket()
     monkeypatch.setattr(handlers.os.path, "isdir", lambda value: True)
+    # /srv/a 须先过 dir 安全闸（受管根设为 /srv、不设自身目录），才能走到「不支持的 action」分支。
+    monkeypatch.setattr(handlers.config, "MANAGED_PROJECTS_ROOT", "/srv")
+    monkeypatch.setattr(handlers.config, "SELF_PROJECT_DIR", "")
     handlers.dispatch(ws, {"requestId": "req-3", "action": "deploy", "dir": "/srv/a"})
 
     assert "Unsupported action 'deploy'" in _decode_messages(ws)[0]["error"]
     assert "Received command: request_id=req-3, action=deploy, dir=/srv/a" in caplog.text
+
+
+def test_validate_base_rejects_dir_outside_root(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """dir 通过 isdir 但 realpath 落在受管根之外时，必须拒绝并提示「不在受管目录」。"""
+    ws = FakeWebSocket()
+    root = tmp_path / "managed"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    monkeypatch.setattr(handlers.config, "MANAGED_PROJECTS_ROOT", str(root))
+    monkeypatch.setattr(handlers.config, "SELF_PROJECT_DIR", "")
+
+    res = handlers._validate_base(
+        ws, {"requestId": "r1", "action": "restart", "dir": str(outside)}
+    )
+
+    assert res is None
+    assert "不在受管目录" in _decode_messages(ws)[0]["error"]
+
+
+def test_validate_base_rejects_self_project(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """命中 agent 自身 compose 目录（SELF_PROJECT_DIR）时，必须拒绝并提示「禁止操作 agent 自身」。"""
+    ws = FakeWebSocket()
+    root = tmp_path / "managed"
+    root.mkdir()
+    self_dir = root / "agent"
+    self_dir.mkdir()
+
+    monkeypatch.setattr(handlers.config, "MANAGED_PROJECTS_ROOT", str(root))
+    monkeypatch.setattr(handlers.config, "SELF_PROJECT_DIR", str(self_dir))
+
+    res = handlers._validate_base(
+        ws, {"requestId": "r1", "action": "stop", "dir": str(self_dir)}
+    )
+
+    assert res is None
+    assert "禁止操作 agent 自身" in _decode_messages(ws)[0]["error"]
+
+
+def test_validate_base_passes_for_dir_inside_root(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """根内、且非自身目录的合法 dir 必须放行，返回 (request_id, action, project_dir) 三元组。"""
+    ws = FakeWebSocket()
+    root = tmp_path / "managed"
+    root.mkdir()
+    project = root / "biz-app"
+    project.mkdir()
+
+    monkeypatch.setattr(handlers.config, "MANAGED_PROJECTS_ROOT", str(root))
+    monkeypatch.setattr(handlers.config, "SELF_PROJECT_DIR", str(root / "agent"))
+
+    res = handlers._validate_base(
+        ws, {"requestId": "r9", "action": "restart", "dir": str(project)}
+    )
+
+    assert res == ("r9", "restart", str(project))
+    assert ws.messages == []
+
+
+def test_validate_base_rejects_path_traversal_escape(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """通过 `..` 穿越逃逸到受管根之外的 dir，realpath 归一后必须被拒绝。"""
+    ws = FakeWebSocket()
+    root = tmp_path / "managed"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    # root 之内构造一个 `..` 穿越到 outside 的路径；isdir 对该路径为真，但 realpath 落在根外。
+    traversal = os.path.join(str(root), "..", "outside")
+
+    monkeypatch.setattr(handlers.config, "MANAGED_PROJECTS_ROOT", str(root))
+    monkeypatch.setattr(handlers.config, "SELF_PROJECT_DIR", "")
+
+    res = handlers._validate_base(
+        ws, {"requestId": "r1", "action": "force-restart", "dir": traversal}
+    )
+
+    assert res is None
+    assert "不在受管目录" in _decode_messages(ws)[0]["error"]
+
+
+def test_validate_base_root_commonpath_valueerror_rejects(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """commonpath 抛 ValueError（如 Windows 跨盘符）时，根判定须从严兜底为「在根外」拒绝。"""
+    ws = FakeWebSocket()
+    project = tmp_path / "biz"
+    project.mkdir()
+
+    monkeypatch.setattr(handlers.config, "MANAGED_PROJECTS_ROOT", str(tmp_path))
+    monkeypatch.setattr(handlers.config, "SELF_PROJECT_DIR", "")
+
+    def boom(_paths):
+        raise ValueError("paths on different drives")
+
+    monkeypatch.setattr(handlers.os.path, "commonpath", boom)
+
+    res = handlers._validate_base(
+        ws, {"requestId": "r1", "action": "restart", "dir": str(project)}
+    )
+
+    assert res is None
+    assert "不在受管目录" in _decode_messages(ws)[0]["error"]
+
+
+def test_validate_base_self_commonpath_valueerror_rejects(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """self 判定的 commonpath 抛 ValueError 时，须从严兜底为「命中自身」拒绝。"""
+    ws = FakeWebSocket()
+    root = tmp_path / "managed"
+    root.mkdir()
+    project = root / "biz"
+    project.mkdir()
+    self_dir = root / "agent"
+    self_dir.mkdir()
+
+    monkeypatch.setattr(handlers.config, "MANAGED_PROJECTS_ROOT", str(root))
+    monkeypatch.setattr(handlers.config, "SELF_PROJECT_DIR", str(self_dir))
+
+    calls = {"n": 0}
+
+    def commonpath_first_ok_then_boom(paths):
+        # 第一次（根判定）放行；第二次（self 判定）抛 ValueError，触发从严兜底。
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return os.path.realpath(str(root))
+        raise ValueError("paths on different drives")
+
+    monkeypatch.setattr(handlers.os.path, "commonpath", commonpath_first_ok_then_boom)
+
+    res = handlers._validate_base(
+        ws, {"requestId": "r1", "action": "stop", "dir": str(project)}
+    )
+
+    assert res is None
+    assert "禁止操作 agent 自身" in _decode_messages(ws)[0]["error"]
 
 
 def test_handle_update_validation_and_errors(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
@@ -240,6 +382,9 @@ def test_handle_restart_paths(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None
 def test_dispatch_serializes_commands_for_same_directory(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     shared_dir = tmp_path / "shared"
     shared_dir.mkdir()
+    # 让 tmp_path 下的业务目录通过 dir 安全闸（否则会在 _validate_base 被拒，走不到锁逻辑）。
+    monkeypatch.setattr(handlers.config, "MANAGED_PROJECTS_ROOT", str(tmp_path))
+    monkeypatch.setattr(handlers.config, "SELF_PROJECT_DIR", "")
 
     first_entered = threading.Event()
     release_first = threading.Event()
@@ -292,6 +437,9 @@ def test_dispatch_allows_parallel_commands_for_different_directories(monkeypatch
     dir_b = tmp_path / "b"
     dir_a.mkdir()
     dir_b.mkdir()
+    # 让 tmp_path 下的业务目录通过 dir 安全闸。
+    monkeypatch.setattr(handlers.config, "MANAGED_PROJECTS_ROOT", str(tmp_path))
+    monkeypatch.setattr(handlers.config, "SELF_PROJECT_DIR", "")
 
     entered = threading.Barrier(2)
     release = threading.Event()
@@ -332,6 +480,9 @@ def test_dispatch_allows_parallel_commands_for_different_directories(monkeypatch
 def test_dispatch_logs_when_command_waits_for_project_lock(monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture) -> None:
     shared_dir = tmp_path / "shared-log"
     shared_dir.mkdir()
+    # 让 tmp_path 下的业务目录通过 dir 安全闸。
+    monkeypatch.setattr(handlers.config, "MANAGED_PROJECTS_ROOT", str(tmp_path))
+    monkeypatch.setattr(handlers.config, "SELF_PROJECT_DIR", "")
     first_entered = threading.Event()
     release_first = threading.Event()
 
