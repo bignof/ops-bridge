@@ -34,10 +34,21 @@ class CommandDispatchRequest(BaseModel):
     mode: Literal["graceful", "force"] | None = Field(default=None, title="操作模式")
     dir: str = Field(title="目标目录")
     image: str | None = Field(default=None, title="目标镜像")
+    # force stop 护栏入参(本 model 沿用 camelCase 入参风格,与 requestId 一致)。
+    serviceName: str | None = Field(default=None, title="服务名(force stop 最后健康实例校验用)")
+    allowLastInstance: bool = Field(default=False, title="允许停最后健康实例")
 
     @property
     def request_id(self) -> str:
         return self.requestId
+
+    @property
+    def service_name(self) -> str | None:
+        return self.serviceName
+
+    @property
+    def allow_last_instance(self) -> bool:
+        return self.allowLastInstance
 
     @model_validator(mode="after")
     def validate_image(self) -> "CommandDispatchRequest":

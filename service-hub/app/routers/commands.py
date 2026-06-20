@@ -4,6 +4,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, status
 
+from app import force_guard
 from app.api_support import _build_command_list_response, _command_list_query_dependency, _derive_requested_by, _require_admin_token, _serialize_command, get_command_events_response
 from app.models import CommandDispatchRequest, CommandDispatchResponse, CommandEventSnapshot, CommandListResponse, CommandSnapshot
 
@@ -57,6 +58,21 @@ async def dispatch_command(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
     if not agent["online"]:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Agent is offline")
+
+    # force stop 服务端护栏(仅 action=stop && mode=force):被拒命令不入库不下发(拒在记录前)。
+    # ① 全局滑窗速率;② 不可停掉某 service 最后一个健康实例(allowLastInstance 可显式跳过)。
+    if request.action == "stop" and request.mode == "force":
+        force_guard.check_force_rate_limit(main_module.settings)
+        if not request.allow_last_instance:
+            if request.service_name:
+                await force_guard.check_last_healthy_instance(
+                    main_module.hub_state,
+                    agent_id,
+                    request.service_name,
+                    timeout=main_module.settings.rolling_cmd_timeout,
+                )
+            else:
+                main_module.logger.warning("force stop 无 service_name,跳过最后健康实例校验:%s", agent_id)
 
     payload = {
         "type": "command",
