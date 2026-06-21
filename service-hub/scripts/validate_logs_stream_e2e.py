@@ -66,7 +66,11 @@ def docker_exec_python(container: str, source: str) -> str:
 
 
 def hub_request(path: str, *, method: str = "GET", headers: dict[str, str] | None = None, body: dict | None = None) -> dict | list:
-    headers_json = json.dumps(headers or {}, ensure_ascii=False)
+    # P1-deploy 加固后 hub 全部端点(含只读 GET)均需 X-Admin-Token;默认注入,显式 headers 可覆盖。
+    merged_headers = {"X-Admin-Token": ADMIN_TOKEN}
+    if headers:
+        merged_headers.update(headers)
+    headers_json = json.dumps(merged_headers, ensure_ascii=False)
     body_json = json.dumps(body, ensure_ascii=False) if body is not None else None
     source = [
         "import json, urllib.request",
@@ -249,6 +253,8 @@ def stream_logs() -> dict:
         {
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
+            # P1-deploy:logs/stream 端点已加 _require_admin_token,无此头会 403。
+            "X-Admin-Token": ADMIN_TOKEN,
             "X-Requested-By": REQUESTED_BY,
             "X-Requested-Source": REQUEST_SOURCE,
         },

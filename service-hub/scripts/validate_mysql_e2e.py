@@ -57,7 +57,11 @@ def docker_exec_python(container: str, source: str) -> str:
 
 
 def hub_request(path: str, *, method: str = "GET", headers: dict[str, str] | None = None, body: dict | None = None) -> dict | list:
-    headers_json = json.dumps(headers or {}, ensure_ascii=False)
+    # P1-deploy 加固后 hub 全部端点(含只读 GET)均需 X-Admin-Token;默认注入,显式 headers 可覆盖。
+    merged_headers = {"X-Admin-Token": ADMIN_TOKEN}
+    if headers:
+        merged_headers.update(headers)
+    headers_json = json.dumps(merged_headers, ensure_ascii=False)
     body_json = json.dumps(body, ensure_ascii=False) if body is not None else None
     source = [
         "import json, urllib.request",
@@ -226,15 +230,9 @@ def start_environment(mysql_password: str) -> None:
 
 def wait_for_command(request_id: str) -> dict:
     for _ in range(30):
-        status = json.loads(
-            docker_exec_python(
-                HUB_CONTAINER,
-                (
-                    "import urllib.request; "
-                    f"print(urllib.request.urlopen('http://127.0.0.1:8080/api/commands/{request_id}', timeout=10).read().decode())"
-                ),
-            )
-        )
+        # 经 hub_request(默认带 X-Admin-Token);P1-deploy 后只读 GET /api/commands/{id} 需鉴权,
+        # 原裸 urlopen 无 token 会 403。
+        status = hub_request(f"/api/commands/{request_id}")
         if status["status"] not in {"queued", "processing"}:
             return status
         time.sleep(2)
@@ -268,8 +266,10 @@ def main() -> int:
         final_status = wait_for_command(request_id)
         events_before = hub_request(f"/api/commands/{request_id}/events")
 
-        if dispatch["command"]["requestedBy"] != "copilot-e2e":
-            raise RuntimeError("requestedBy was not persisted")
+        # P1-deploy/T6:requested_by 由 hub 据 admin token 服务端派生(不信任客户端 X-Requested-By),
+        # 故落库值为派生身份 "platform-admin"(非客户端自报的 "copilot-e2e")。requestSource 仍透传。
+        if dispatch["command"]["requestedBy"] != "platform-admin":
+            raise RuntimeError(f"requestedBy 应为派生身份 platform-admin,实得 {dispatch['command']['requestedBy']}")
         if dispatch["command"]["requestSource"] != "mysql-validation":
             raise RuntimeError("requestSource was not persisted")
         if final_status["status"] != "success":

@@ -75,7 +75,12 @@ def docker_exec_python(container: str, source: str) -> str:
 
 
 def hub_request(path: str, *, method: str = "GET", headers: dict[str, str] | None = None, body: dict | None = None) -> dict | list:
-    headers_json = json.dumps(headers or {}, ensure_ascii=False)
+    # P1-deploy 加固后 hub 全部端点(含只读 GET /api/agents、/api/commands*)均需 X-Admin-Token;
+    # 默认注入,显式 headers 可覆盖。否则只读 GET 会 403。
+    merged_headers = {"X-Admin-Token": ADMIN_TOKEN}
+    if headers:
+        merged_headers.update(headers)
+    headers_json = json.dumps(merged_headers, ensure_ascii=False)
     body_json = json.dumps(body, ensure_ascii=False) if body is not None else None
     source = [
         "import json, urllib.request",
