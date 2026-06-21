@@ -160,5 +160,5 @@ jobs:
           file: ./service-platform/Dockerfile
           push: true
           tags: |
-            ${{ secrets.REGISTRY_URL }}/${{ secrets.SERVICE_PLATFORM_IMAGE_NAME }}:latest
-            ${{ secrets.REGISTRY_URL }}/${{ secrets.SERVICE_PLATFORM_IMAGE_NAME }}:main-${{ env.TS }}
+            ${{ secrets.REGISTRY_URL }}/orchidea/service-platform:latest
+            ${{ secrets.REGISTRY_URL }}/orchidea/service-platform:main-${{ env.TS }}
