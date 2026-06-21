@@ -30,19 +30,60 @@ class CommandDispatchRequest(BaseModel):
     model_config = ConfigDict(title="下发命令请求")
 
     requestId: str = Field(default_factory=lambda: str(uuid4()), title="请求 ID")
-    action: Literal["update", "restart"] = Field(title="动作")
+    action: Literal["update", "restart", "start", "stop", "force-restart", "pull-redeploy"] = Field(title="动作")
+    mode: Literal["graceful", "force"] | None = Field(default=None, title="操作模式")
     dir: str = Field(title="目标目录")
     image: str | None = Field(default=None, title="目标镜像")
+    # force stop 护栏入参(本 model 沿用 camelCase 入参风格,与 requestId 一致)。
+    serviceName: str | None = Field(default=None, title="服务名(force stop 最后健康实例校验用)")
+    allowLastInstance: bool = Field(default=False, title="允许停最后健康实例")
+    # 优雅 stop / pull-redeploy 的 drain 入参(透传给 agent,由 agent 调本机 worker /api/k8s/shutdown)。
+    healthBaseUrl: str | None = Field(default=None, title="优雅 drain 的 worker 健康基址(内网)")
+    shutdownTimeoutSec: int | None = Field(default=None, title="优雅 drain 超时(秒)")
 
     @property
     def request_id(self) -> str:
         return self.requestId
 
+    @property
+    def service_name(self) -> str | None:
+        return self.serviceName
+
+    @property
+    def allow_last_instance(self) -> bool:
+        return self.allowLastInstance
+
     @model_validator(mode="after")
     def validate_image(self) -> "CommandDispatchRequest":
-        if self.action == "update" and not self.image:
-            raise ValueError("Action 'update' requires the 'image' field")
+        # update 与 pull-redeploy 都需要 image(pull-redeploy 在 agent 侧复用 handle_update)
+        if self.action in ("update", "pull-redeploy") and not self.image:
+            raise ValueError("Action 'update'/'pull-redeploy' requires the 'image' field")
         return self
+
+
+class ListInstancesRequest(BaseModel):
+    # camelCase 入参,与 CommandDispatchRequest 风格一致;serviceName 必填。
+    model_config = ConfigDict(title="查询实例请求")
+
+    serviceName: str = Field(title="服务名")
+    expectedComposeProject: str | None = Field(default=None, title="期望 compose 项目名")
+
+    @property
+    def service_name(self) -> str:
+        return self.serviceName
+
+    @property
+    def expected_compose_project(self) -> str | None:
+        return self.expectedComposeProject
+
+
+class ListInstancesResponse(BaseModel):
+    model_config = titled_model_config("查询实例响应")
+
+    status: str = Field(title="状态")
+    # 直接回传 agent 上报的实例数组(字段含 address/containerId/healthy/matched/composeProject),
+    # 不做严格 schema 约束,避免与 agent 端实例结构耦合。
+    instances: list[dict[str, Any]] = Field(default_factory=list, title="实例列表")
 
 
 class AgentLogsStreamRequest(BaseModel):
@@ -71,6 +112,9 @@ class AgentSnapshot(BaseModel):
     queued_commands: int = Field(default=0, title="排队中的命令数")
     processing_commands: int = Field(default=0, title="执行中的命令数")
     last_command_created_at: datetime | None = Field(default=None, title="最近命令创建时间")
+    # register 帧上报的纯内存在线态(离线为 None,不落 DB);供节点页展示与将来能力门控。
+    capabilities: list[str] | None = Field(default=None, title="Agent 能力集", description="agent 上报的可执行动作集合，离线时为空。")
+    agent_version: str | None = Field(default=None, title="Agent 版本", description="agent 上报的版本号，离线时为空。")
 
 
 class AgentCredentialResponse(BaseModel):
@@ -107,6 +151,7 @@ class CommandSnapshot(BaseModel):
     agent_id: str = Field(title="Agent 标识")
     status: str = Field(title="状态")
     action: str = Field(title="动作")
+    mode: str | None = Field(default=None, title="操作模式")
     dir: str = Field(title="目标目录")
     image: str | None = Field(default=None, title="目标镜像")
     original_request_id: str | None = Field(default=None, title="原始请求 ID")

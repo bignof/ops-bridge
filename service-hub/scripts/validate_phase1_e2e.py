@@ -262,6 +262,7 @@ def dispatch_command(
         method="POST",
         headers={
             "Content-Type": "application/json",
+            "X-Admin-Token": ADMIN_TOKEN,
             "X-Requested-By": REQUESTED_BY,
             "X-Requested-Source": request_source,
         },

@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -31,6 +31,7 @@ class CommandModel(Base):
     request_id: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     agent_id: Mapped[str] = mapped_column(String(255), index=True)
     action: Mapped[str] = mapped_column(String(64))
+    mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
     target_dir: Mapped[str] = mapped_column(String(2048))
     target_image: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     status: Mapped[str] = mapped_column(String(32), index=True)
@@ -56,3 +57,20 @@ class CommandEventModel(Base):
     event_type: Mapped[str] = mapped_column(String(64), index=True)
     payload_json: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class RollingTaskModel(Base):
+    __tablename__ = "rolling_tasks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    agent_id: Mapped[str] = mapped_column(String(255), index=True)
+    service_name: Mapped[str] = mapped_column(String(255), index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True)        # running/done/failed/interrupted
+    degraded: Mapped[bool] = mapped_column(Boolean, default=False)
+    active_key: Mapped[str | None] = mapped_column(String(512), nullable=True, unique=True)
+    nodes_json: Mapped[str] = mapped_column(Text, default="[]")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

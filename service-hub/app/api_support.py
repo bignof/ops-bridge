@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 from datetime import datetime
@@ -170,8 +171,25 @@ def _require_admin_token(admin_token: str | None) -> None:
 
     if not main_module.settings.admin_token:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Admin token is not configured")
-    if admin_token != main_module.settings.admin_token:
+    # 常量时间比较防时序侧信道;not admin_token 短路必要(compare_digest 收 None 会 TypeError)
+    if not admin_token or not hmac.compare_digest(admin_token, main_module.settings.admin_token):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid admin token")
+
+
+# 服务端据 admin token 派生的固定审计身份(单 admin 模型)。
+PLATFORM_ADMIN_IDENTITY = "platform-admin"
+
+
+def _derive_requested_by(admin_token: str | None) -> str:
+    """据 admin token 服务端派生 requested_by(审计权威身份)。
+
+    安全:requested_by 决不能信客户端自报的 X-Requested-By 头——任何持 hub admin token 的
+    调用方都能伪造。本函数据 token 派生真实身份,由调用方强制覆盖客户端值。
+
+    当前为单 admin 模型(settings.admin_token),token 已由 _require_admin_token 在调用前校验
+    通过(非法即 403),故此处直接返回固定常量。函数独立存在是为将来多 token 各自映射身份留位。
+    """
+    return PLATFORM_ADMIN_IDENTITY
 
 
 async def _build_command_list_response(
@@ -236,6 +254,20 @@ async def _handle_agent_message(agent_id: str, payload: dict[str, Any]) -> None:
     if msg_type == "heartbeat":
         return
 
+    if msg_type == "register":
+        # #4/#10:消费 agent 连上首帧上报的能力 / 版本,存进在线态(纯内存,随连接生命周期)。
+        # 供平台节点页展示;能力门控(BFF 据 capabilities 拒不支持的 action)为后续。
+        capabilities = payload.get("capabilities")
+        agent_version = payload.get("agentVersion")
+        await main_module.hub_state.set_agent_runtime(agent_id, capabilities, agent_version)
+        logger.info(
+            "Agent %s registered: capabilities=%s agentVersion=%s",
+            agent_id,
+            capabilities,
+            agent_version,
+        )
+        return
+
     if msg_type == "ack":
         request_id = payload.get("requestId")
         if request_id:
@@ -252,6 +284,12 @@ async def _handle_agent_message(agent_id: str, payload: dict[str, Any]) -> None:
                 message=payload.get("message"),
                 error=payload.get("error"),
             )
+        return
+
+    if msg_type in ("list-instances-result", "graceful-restart-result"):
+        request_id = payload.get("requestId")
+        if request_id:
+            await main_module.hub_state.resolve_pending(request_id, payload)
         return
 
     if msg_type == "logs_started":

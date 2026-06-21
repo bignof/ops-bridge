@@ -46,6 +46,42 @@ def test_connection_state_and_open_close_error(monkeypatch: pytest.MonkeyPatch) 
     assert heartbeat_calls == [ws]
 
 
+def test_on_open_sends_register_frame_with_capabilities(monkeypatch: pytest.MonkeyPatch) -> None:
+    """连上后必须发 register 帧（含 capabilities + agentVersion），且不破坏既有 _on_open 行为。"""
+    module = _import_ws_client(monkeypatch)
+    sent: list[dict] = []
+    heartbeat_calls: list[object] = []
+
+    # 避免起心跳线程；同时断言它仍被调用（不回归）。
+    monkeypatch.setattr(module, "_start_heartbeat", lambda ws: heartbeat_calls.append(ws))
+    monkeypatch.setattr(module, "send_message", lambda ws, payload: sent.append(payload))
+    monkeypatch.setattr(module.time, "time", lambda: 123.0)
+
+    ws = SimpleNamespace(keep_running=True)
+    module._on_open(ws)
+
+    register_frames = [m for m in sent if m.get("type") == "register"]
+    assert len(register_frames) == 1
+    frame = register_frames[0]
+    # capabilities 取命令动作集（HANDLERS keys）
+    assert "start" in frame["capabilities"]
+    assert "stop" in frame["capabilities"]
+    assert "force-restart" in frame["capabilities"]
+    assert "pull-redeploy" in frame["capabilities"]
+    assert "update" in frame["capabilities"]
+    assert "restart" in frame["capabilities"]
+    # 已排序，便于平台稳定比对
+    assert frame["capabilities"] == sorted(frame["capabilities"])
+    assert frame["agentVersion"]  # 非空
+    assert frame["agentId"] == "agent-7"
+
+    # 不回归：_start_heartbeat 仍被调用、_update_state(connected=True) 仍生效
+    assert heartbeat_calls == [ws]
+    state = module.get_connection_state()
+    assert state["connected"] is True
+    assert state["last_connect_ts"] == 123.0
+
+
 def test_on_message_dispatches_commands_and_ping(monkeypatch: pytest.MonkeyPatch) -> None:
     module = _import_ws_client(monkeypatch)
     dispatch_calls: list[tuple[object, dict]] = []
@@ -81,6 +117,33 @@ def test_on_message_dispatches_commands_and_ping(monkeypatch: pytest.MonkeyPatch
     assert logs_stop_calls == [{"type": "logs_stop", "sessionId": "logs-1"}]
     assert sent_messages == [{"type": "pong", "timestamp": 456.0}]
     assert state["last_message_ts"] == 456.0
+
+
+def test_on_message_routes_rolling(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _import_ws_client(monkeypatch)
+    calls: list[tuple[str, dict]] = []
+
+    # ws_client 通过 `from core.rolling import ...` 绑定了本地名,monkeypatch 必须打在
+    # ws_client 模块上(打 core.rolling 改不到已绑定引用)。
+    monkeypatch.setattr(module, "handle_list_instances", lambda ws, data: calls.append(("list", data)))
+    monkeypatch.setattr(module, "handle_graceful_restart", lambda ws, data: calls.append(("gr", data)))
+
+    class ImmediateThread:
+        def __init__(self, target, args, daemon):
+            self.target = target
+            self.args = args
+
+        def start(self) -> None:
+            self.target(*self.args)
+
+    monkeypatch.setattr(module.threading, "Thread", ImmediateThread)
+
+    module._on_message(None, '{"type":"list-instances","requestId":"r1","serviceName":"s"}')
+    module._on_message(None, '{"type":"graceful-restart","requestId":"g1","containerId":"c"}')
+
+    assert [c[0] for c in calls] == ["list", "gr"]
+    assert calls[0][1]["serviceName"] == "s"
+    assert calls[1][1]["containerId"] == "c"
 
 
 def test_start_heartbeat_sends_periodic_messages(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -166,6 +229,8 @@ def test_connect_handles_real_websocket_round_trip(monkeypatch: pytest.MonkeyPat
 
     async def handler(websocket) -> None:
         server_connected.set()
+        # 连上后 agent 第一帧是 register（能力/版本上报），先收下它再走 ping/pong。
+        observed["register"] = json.loads(await websocket.recv())
         await websocket.send(json.dumps({"type": "ping"}))
         observed["pong"] = json.loads(await websocket.recv())
         await websocket.send(json.dumps({"type": "command", "requestId": "req-real"}))
@@ -193,5 +258,9 @@ def test_connect_handles_real_websocket_round_trip(monkeypatch: pytest.MonkeyPat
 
     assert server_connected.is_set() is True
     assert client_thread.is_alive() is False
+    # 真实 socket 上确实先收到了 register 帧（含 capabilities + agentVersion）
+    assert observed["register"]["type"] == "register"
+    assert "restart" in observed["register"]["capabilities"]
+    assert observed["register"]["agentVersion"]
     assert observed["pong"] == {"type": "pong", "timestamp": observed["pong"]["timestamp"]}
     assert observed["command"] == {"type": "command", "requestId": "req-real"}

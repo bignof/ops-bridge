@@ -6,6 +6,7 @@ on:
     paths:
       - "service-agent/**"
       - "service-hub/**"
+      - "service-platform/**"
       - ".github/workflows/docker-publish.yml"
   workflow_dispatch:
 
@@ -19,6 +20,7 @@ jobs:
     outputs:
       service-agent: ${{ steps.filter.outputs.service-agent }}
       service-hub: ${{ steps.filter.outputs.service-hub }}
+      service-platform: ${{ steps.filter.outputs.service-platform }}
 
     steps:
       - name: Checkout repository
@@ -34,6 +36,9 @@ jobs:
               - '.github/workflows/docker-publish.yml'
             service-hub:
               - 'service-hub/**'
+              - '.github/workflows/docker-publish.yml'
+            service-platform:
+              - 'service-platform/**'
               - '.github/workflows/docker-publish.yml'
 
   service-agent:
@@ -115,3 +120,45 @@ jobs:
           tags: |
             ${{ secrets.REGISTRY_URL }}/${{ secrets.SERVICE_HUB_IMAGE_NAME }}:latest
             ${{ secrets.REGISTRY_URL }}/${{ secrets.SERVICE_HUB_IMAGE_NAME }}:main-${{ env.TS }}
+
+  service-platform:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.service-platform == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.REGISTRY_URL }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Set image tags
+        shell: bash
+        run: |
+          echo "TS=$(TZ='Asia/Shanghai' date +'%Y%m%d-%H%M%S')" >> "$GITHUB_ENV"
+
+      # 多阶段镜像(web 阶段构建 SPA → python 阶段托管);context 取 service-platform 根,
+      # Dockerfile 内 COPY web/ 与 app/ 均相对该 context。
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./service-platform
+          file: ./service-platform/Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.REGISTRY_URL }}/orchidea/service-platform:latest
+            ${{ secrets.REGISTRY_URL }}/orchidea/service-platform:main-${{ env.TS }}

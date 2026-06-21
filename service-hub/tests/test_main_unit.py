@@ -29,9 +29,13 @@ class RecordingState:
         self.retried: tuple[dict[str, Any], dict[str, Any]] | None = None
         self.auth_result = True
         self.auth_calls: list[tuple[str, str]] = []
+        self.runtime_calls: list[tuple[str, Any, Any]] = []
 
     async def touch_agent(self, agent_id: str, event_type: str) -> None:
         self.touched.append((agent_id, event_type))
+
+    async def set_agent_runtime(self, agent_id: str, capabilities: Any, agent_version: Any) -> None:
+        self.runtime_calls.append((agent_id, capabilities, agent_version))
 
     async def mark_ack(self, request_id: str) -> None:
         self.acked.append(request_id)
@@ -241,6 +245,9 @@ def test_lifespan_initializes_hub_state(monkeypatch: pytest.MonkeyPatch) -> None
         async def initialize(self) -> None:
             initialized["value"] = True
 
+        async def interrupt_running_rolling(self) -> int:
+            return 0
+
     monkeypatch.setattr(main_module, "hub_state", StubState())
 
     async def run_lifespan() -> None:
@@ -264,6 +271,15 @@ def test_require_admin_token_handles_missing_and_invalid_configuration(monkeypat
     object.__setattr__(main_module.settings, "admin_token", "configured-token")
     with pytest.raises(HTTPException, match="Invalid admin token"):
         _require_admin_token("wrong-token")
+
+    # L7: header 缺失(None)必须走 not admin_token 短路 → 403,
+    # 不能落到 hmac.compare_digest(None, ...)(会 TypeError)
+    with pytest.raises(HTTPException, match="Invalid admin token"):
+        _require_admin_token(None)
+
+    # L7: 等长但不同的 token 仍 403(常量时间比较不改变正确性)
+    with pytest.raises(HTTPException, match="Invalid admin token"):
+        _require_admin_token("configured-tokez")
 
     _require_admin_token("configured-token")
     object.__setattr__(main_module.settings, "admin_token", original)
@@ -302,6 +318,38 @@ def test_handle_agent_message_branches(monkeypatch: pytest.MonkeyPatch) -> None:
     assert recording_state.results == [("req-2", "success", "ok", "done", None)]
 
 
+def test_handle_agent_message_register_consumes_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # #4/#10:register 帧须被消费——capabilities/agentVersion 存进在线态,
+    # 且不再落到末尾 "Unhandled message type" 日志。
+    import app.main as main_module
+
+    recording_state = RecordingState()
+    monkeypatch.setattr(main_module, "hub_state", recording_state)
+
+    with caplog.at_level(logging.INFO, logger="app.api_support"):
+        asyncio.run(
+            _handle_agent_message(
+                "agent-a",
+                {
+                    "type": "register",
+                    "agentId": "agent-a",
+                    "capabilities": ["restart", "stop", "start"],
+                    "agentVersion": "1.2.3",
+                },
+            )
+        )
+
+    # capabilities/agentVersion 被写入在线态。
+    assert recording_state.runtime_calls == [("agent-a", ["restart", "stop", "start"], "1.2.3")]
+    # 不得落 Unhandled。
+    assert not any("Unhandled message type" in record.getMessage() for record in caplog.records)
+    # register 也算一次活跃。
+    assert ("agent-a", "register") in recording_state.touched
+
+
 def test_dispatch_command_error_branches(monkeypatch: pytest.MonkeyPatch) -> None:
     import app.main as main_module
 
@@ -312,21 +360,21 @@ def test_dispatch_command_error_branches(monkeypatch: pytest.MonkeyPatch) -> Non
 
     recording_state.agent = None
     with pytest.raises(HTTPException, match="Agent not found"):
-        asyncio.run(dispatch_command(request=request, agent_id="agent-a"))
+        asyncio.run(dispatch_command(request=request, agent_id="agent-a", admin_token=main_module.settings.admin_token))
 
     recording_state.agent = {"agent_id": "agent-a", "online": False}
     with pytest.raises(HTTPException, match="Agent is offline"):
-        asyncio.run(dispatch_command(request=request, agent_id="agent-a"))
+        asyncio.run(dispatch_command(request=request, agent_id="agent-a", admin_token=main_module.settings.admin_token))
 
     recording_state.agent = {"agent_id": "agent-a", "online": True}
     recording_state.connection = None
     with pytest.raises(HTTPException, match="Agent connection is unavailable"):
-        asyncio.run(dispatch_command(request=request, agent_id="agent-a"))
+        asyncio.run(dispatch_command(request=request, agent_id="agent-a", admin_token=main_module.settings.admin_token))
     assert recording_state.results[-1] == ("req-1", "failed", None, None, "Agent connection is unavailable")
 
     recording_state.connection = FailingSocket()
     with pytest.raises(HTTPException, match="Failed to dispatch command"):
-        asyncio.run(dispatch_command(request=request, agent_id="agent-a"))
+        asyncio.run(dispatch_command(request=request, agent_id="agent-a", admin_token=main_module.settings.admin_token))
     assert recording_state.results[-1][0] == "req-1"
     assert recording_state.results[-1][-1] == "Failed to dispatch command: boom"
 
@@ -344,7 +392,8 @@ def test_dispatch_command_success_includes_image(monkeypatch: pytest.MonkeyPatch
         dispatch_command(
             request=request,
             agent_id="agent-a",
-            requested_by=None,
+            admin_token=main_module.settings.admin_token,
+            requested_by_hint=None,  # 形参随服务端派生改名(X-Requested-By 仅作 hint)
             request_source=None,
         )
     )
@@ -362,6 +411,25 @@ def test_dispatch_command_success_includes_image(monkeypatch: pytest.MonkeyPatch
     ]
 
 
+def test_dispatch_and_retry_require_admin_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.main as main_module
+
+    recording_state = RecordingState()
+    monkeypatch.setattr(main_module, "hub_state", recording_state)
+
+    request = CommandDispatchRequest(requestId="req-1", action="restart", dir="/srv/a")
+
+    with pytest.raises(HTTPException) as dispatch_exc:
+        asyncio.run(dispatch_command(request=request, agent_id="agent-a", admin_token=None))
+    assert dispatch_exc.value.status_code == 403
+    assert dispatch_exc.value.detail == "Invalid admin token"
+
+    with pytest.raises(HTTPException) as retry_exc:
+        asyncio.run(retry_command("req-1", admin_token=None))
+    assert retry_exc.value.status_code == 403
+    assert retry_exc.value.detail == "Invalid admin token"
+
+
 def test_retry_command_error_branches(monkeypatch: pytest.MonkeyPatch) -> None:
     import app.main as main_module
 
@@ -369,25 +437,25 @@ def test_retry_command_error_branches(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(main_module, "hub_state", recording_state)
 
     with pytest.raises(HTTPException, match="Command not found"):
-        asyncio.run(retry_command("missing"))
+        asyncio.run(retry_command("missing", admin_token=main_module.settings.admin_token))
 
     recording_state.commands["req-1"] = {"request_id": "req-1", "agent_id": "agent-a", "status": "success"}
     with pytest.raises(HTTPException, match="Only failed commands can be retried"):
-        asyncio.run(retry_command("req-1"))
+        asyncio.run(retry_command("req-1", admin_token=main_module.settings.admin_token))
 
     recording_state.commands["req-1"] = {"request_id": "req-1", "agent_id": "agent-a", "status": "failed"}
     recording_state.agent = None
     with pytest.raises(HTTPException, match="Agent not found"):
-        asyncio.run(retry_command("req-1"))
+        asyncio.run(retry_command("req-1", admin_token=main_module.settings.admin_token))
 
     recording_state.agent = {"agent_id": "agent-a", "online": False}
     with pytest.raises(HTTPException, match="Agent is offline"):
-        asyncio.run(retry_command("req-1"))
+        asyncio.run(retry_command("req-1", admin_token=main_module.settings.admin_token))
 
     recording_state.agent = {"agent_id": "agent-a", "online": True}
     recording_state.retried = None
     with pytest.raises(HTTPException, match="Command not found"):
-        asyncio.run(retry_command("req-1"))
+        asyncio.run(retry_command("req-1", admin_token=main_module.settings.admin_token))
 
     recording_state.retried = (
         recording_state.commands["req-1"],
@@ -399,12 +467,12 @@ def test_retry_command_error_branches(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     recording_state.connection = None
     with pytest.raises(HTTPException, match="Agent connection is unavailable"):
-        asyncio.run(retry_command("req-1"))
+        asyncio.run(retry_command("req-1", admin_token=main_module.settings.admin_token))
     assert recording_state.results[-1] == ("req-2", "failed", None, None, "Agent connection is unavailable")
 
     recording_state.connection = FailingSocket()
     with pytest.raises(HTTPException, match="Failed to dispatch command"):
-        asyncio.run(retry_command("req-1"))
+        asyncio.run(retry_command("req-1", admin_token=main_module.settings.admin_token))
     assert recording_state.results[-1][0] == "req-2"
 
 

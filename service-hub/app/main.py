@@ -14,6 +14,7 @@ from app.routers.agent_ws import agent_ws, router as agent_ws_router
 from app.routers.agents import get_agent, list_agents, provision_agent, rotate_agent_credentials, router as agents_router
 from app.routers.commands import dispatch_command, get_command, get_command_events, list_commands, retry_command, router as commands_router
 from app.routers.logs import router as logs_router, stream_agent_logs
+from app.routers.rolling import router as rolling_router
 from app.routers.system import health, router as system_router
 from app.store import HubState
 
@@ -92,6 +93,9 @@ def _localize_openapi(schema: dict[str, Any]) -> dict[str, Any]:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await hub_state.initialize()
+    interrupted = await hub_state.interrupt_running_rolling()
+    if interrupted:
+        logger.warning("启动恢复:发现 %s 个中断的滚动任务,已标记 interrupted", interrupted)
     yield
 
 
@@ -122,4 +126,5 @@ app.include_router(system_router)
 app.include_router(agents_router)
 app.include_router(commands_router)
 app.include_router(logs_router)
+app.include_router(rolling_router)
 app.include_router(agent_ws_router)

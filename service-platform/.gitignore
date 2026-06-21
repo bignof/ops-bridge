@@ -1,0 +1,5 @@
+service-platform.db
+*.sqlite3
+data/
+# 前端构建产物(vite outDir → app/static):本地/CI/镜像各自构建,不入库。
+app/static/
