@@ -1,0 +1,20 @@
+# service-console 单镜像部署(hub + platform + nginx 三合一)。
+# 用法:cp .env.example .env && 填好密钥 && docker compose up -d
+name: service-console
+
+services:
+  console:
+    image: ${SERVICE_CONSOLE_IMAGE:-service-console:latest}
+    container_name: ${SERVICE_CONSOLE_CONTAINER_NAME:-service-console}
+    restart: always
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      # 启用 TLS 后取消注释(并在 nginx.conf 配 443 段 + 下方挂证书):
+      # - "443:443"
+    env_file:
+      - .env
+    volumes:
+      # 持久化:两个 sqlite 库 + 插件包目录。生产多节点建议换共享存储/对象存储。
+      - ${DATA_DIR:-./data}:/data
+      # 启用 TLS:挂证书目录到容器内 /etc/nginx/certs
+      # - ./certs:/etc/nginx/certs:ro

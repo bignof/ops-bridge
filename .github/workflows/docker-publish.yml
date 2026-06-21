@@ -7,6 +7,7 @@ on:
       - "service-agent/**"
       - "service-hub/**"
       - "service-platform/**"
+      - "deploy/all-in-one/**"
       - ".github/workflows/docker-publish.yml"
   workflow_dispatch:
 
@@ -21,6 +22,7 @@ jobs:
       service-agent: ${{ steps.filter.outputs.service-agent }}
       service-hub: ${{ steps.filter.outputs.service-hub }}
       service-platform: ${{ steps.filter.outputs.service-platform }}
+      console: ${{ steps.filter.outputs.console }}
 
     steps:
       - name: Checkout repository
@@ -38,6 +40,11 @@ jobs:
               - 'service-hub/**'
               - '.github/workflows/docker-publish.yml'
             service-platform:
+              - 'service-platform/**'
+              - '.github/workflows/docker-publish.yml'
+            console:
+              - 'deploy/all-in-one/**'
+              - 'service-hub/**'
               - 'service-platform/**'
               - '.github/workflows/docker-publish.yml'
 
@@ -162,3 +169,47 @@ jobs:
           tags: |
             ${{ secrets.REGISTRY_URL }}/orchidea/service-platform:latest
             ${{ secrets.REGISTRY_URL }}/orchidea/service-platform:main-${{ env.TS }}
+
+  # all-in-one 单镜像:hub + platform + nginx 三合一(supervisord 托管)。
+  # hub/platform 任一源码或 deploy/all-in-one 变更都会重建。
+  service-console:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.console == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.REGISTRY_URL }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Set image tags
+        shell: bash
+        run: |
+          echo "TS=$(TZ='Asia/Shanghai' date +'%Y%m%d-%H%M%S')" >> "$GITHUB_ENV"
+
+      # context 取 monorepo 根(Dockerfile 同时 COPY service-hub/ 与 service-platform/);
+      # file 指向 deploy/all-in-one/Dockerfile;BuildKit 读同目录 Dockerfile.dockerignore 排除 node_modules 等。
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./deploy/all-in-one/Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.REGISTRY_URL }}/orchidea/service-console:latest
+            ${{ secrets.REGISTRY_URL }}/orchidea/service-console:main-${{ env.TS }}
