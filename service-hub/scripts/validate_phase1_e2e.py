@@ -416,8 +416,10 @@ def main() -> int:
         persisted_update = hub_request(f"/api/commands/{update_request_id}")
         persisted_update_events = hub_request(f"/api/commands/{update_request_id}/events")
 
-        if persisted_restart["requestedBy"] != REQUESTED_BY:
-            raise RuntimeError("restart command requester metadata was not preserved")
+        # P1-deploy/T6:requested_by 由 hub 据 admin token 服务端派生(不信任客户端 X-Requested-By),
+        # 落库并跨 hub 重启持久化的是派生身份 "platform-admin"(非客户端自报的 REQUESTED_BY)。
+        if persisted_restart["requestedBy"] != "platform-admin":
+            raise RuntimeError(f"restart command requester metadata 应为派生 platform-admin,实得 {persisted_restart['requestedBy']}")
         if persisted_update["requestSource"] != UPDATE_REQUEST_SOURCE:
             raise RuntimeError("update command source metadata was not preserved")
         if [event["eventType"] for event in persisted_update_events] != ["created", "ack", "result"]:
