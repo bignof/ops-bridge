@@ -30,7 +30,6 @@ from app.routers.system import router as system_router
 # _handle_agent_message / _remote_address 在此 import 即成为 app.main 模块全局,
 # 供 hub 路由 / WS 经 `import app.main as main_module; main_module.X` 取用。
 from app.hub.api_support import _handle_agent_message, _remote_address  # noqa: F401 (经 main_module 取用)
-from app.hub.db import Database as HubDatabase
 from app.hub.store import HubState
 from app.hub.routers.agent_ws import router as agent_ws_router
 from app.hub.routers.agents import router as agents_router
@@ -46,14 +45,12 @@ logger = logging.getLogger(__name__)
 # 后取 `main_module.database`,禁止模块级 `from app.main import database`),不在 app/db.py 建。
 database = Database(settings.database_url)
 
-# 并入的 hub 单例(S2):hub_state 落点在此(hub 路由 / WS 经 main_module.hub_state 取用)。
-# hub_database 过渡期独立(settings.hub_database_url,避免与 console 库共用 DATABASE_URL 撞 _managed_tables
-# 守卫);S4 合 DB 后并入 database。
-hub_database = HubDatabase(settings.hub_database_url)
+# 并入的 hub 单例:hub_state 落点在此(hub 路由 / WS 经 main_module.hub_state 取用),
+# 与 console 共用同一 `database`(S4 已合为单一 DB / 单一 metadata)。
 hub_state = HubState(
     heartbeat_timeout=settings.heartbeat_timeout,
     command_history_limit=settings.command_history_limit,
-    database=hub_database,
+    database=database,
 )
 
 
@@ -62,10 +59,9 @@ async def lifespan(_: FastAPI):
     # 评审(被否决条目残留 hardening):空 / 过短 jwt_secret 拒绝启动(纵深防御,配合 Task 3 pin PyJWT)。
     if not settings.jwt_secret or len(settings.jwt_secret) < 32:
         raise RuntimeError("PLATFORM_JWT_SECRET 未配置或过短(须 ≥32 字符)")
-    database.init_schema()
-    # 并入的 hub(S2):建 hub 表 + 恢复中断的滚动任务。**务必保留 interrupt_running_rolling**,
+    database.init_schema()  # 单一 DB,建全部 12 表(console 8 + hub 4)
+    # 并入的 hub:恢复中断的滚动任务。**务必保留 interrupt_running_rolling**,
     # 否则重启后中断的滚动永不被标 interrupted(评审 M-9)。
-    hub_database.init_schema()
     await hub_state.initialize()
     interrupted = await hub_state.interrupt_running_rolling()
     if interrupted:

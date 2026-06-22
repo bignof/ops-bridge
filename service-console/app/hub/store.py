@@ -12,7 +12,7 @@ from fastapi import WebSocket
 from sqlalchemy import case, func, select
 from sqlalchemy.exc import IntegrityError
 
-from app.hub.db import Database
+from app.db import Database
 from app.hub.db_models import AgentModel, CommandEventModel, CommandModel, RollingTaskModel
 
 

@@ -6,6 +6,7 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from app import db_models  # noqa: F401
+from app.hub import db_models as _hub_db_models  # noqa: F401 (S4:并入的 hub 表也注册到同一 Base.metadata)
 from app.db import Base
 
 

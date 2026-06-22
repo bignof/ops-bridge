@@ -12,8 +12,9 @@ class Base(DeclarativeBase):
 
 
 class Database:
-    # 本平台 8 张台账表(评审 M10);具体模型由后续 Task 在 app/db_models.py 落地。
+    # 合并后 12 张表(console 8 + 并入的 hub 4);模型见 app/db_models.py 与 app/hub/db_models.py。
     _managed_tables = {
+        # console
         "namespace",
         "service",
         "plugin",
@@ -22,6 +23,11 @@ class Database:
         "service_plugin",
         "service_plugin_version",
         "fetch_record",
+        # 并入的 hub(S4)
+        "agents",
+        "commands",
+        "command_events",
+        "rolling_tasks",
     }
 
     def __init__(self, database_url: str) -> None:
