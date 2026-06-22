@@ -1,6 +1,6 @@
 # 插件分发改造 + console 合并 · 总开发计划
 
-> **唯一主计划**(已并入原 `console-merge-plan`)。依据:`plugin-distribution-redesign.zh-CN.md`(设计冻结基线)+ `review-ultracode-2026-06-21.zh-CN.md` + `review-ultracode-2026-06-22.zh-CN.md`(两轮评审收口)。
+> **唯一主计划**(已并入原 `console-merge-plan`)。依据:`plugin-distribution-redesign.zh-CN.md`(设计冻结基线)+ `archive/review-ultracode-2026-06-21.zh-CN.md` + `review-ultracode-2026-06-22.zh-CN.md`(两轮评审收口)。
 > 把设计 + 「hub/platform 合并为 service-console」翻成**可分配任务**,每条标 仓库 / 模块 / 前置 / 验收。
 > **仓库**:`services-monorepo`(合并后只剩 **service-console** + **service-agent**)与 `cnp`(`docker/nocobase/sync-plugins.js`)。
 > **决策(2026-06-22)**:① 彻底合并 hub+platform → **service-console**(一服务一 DB;DB 压成单一初始迁移);落点重命名 service-console;agent `plugin_cache` 保留。② 失败收敛 **mode = freeze**(失败即停 + 标记 + 人工决定重试/回滚,不自动回滚)。③ 跨机服务发布 = **按 `nacos_service_name` 事务扇出置活**(单一真相)。

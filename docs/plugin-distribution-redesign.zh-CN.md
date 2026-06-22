@@ -266,7 +266,7 @@ agent 下包:  /download/<attachmentId> 未命中缓存 → GET {PLATFORM_URL}/a
 > - **M7**(发现的 dir/image 驱动写寻址扩大越权面):这是 §3.3「推翻 v3 发现权威」的代价;沿用 `validate_managed_dir`(realpath 须在 `MANAGED_PROJECTS_ROOT` 下)兜底即可,不新增强约束。
 > - **M9**(caller header 可伪造):已在 §2.5 改为「caller 只取 agent 可验证的源 IP 反查」——这条属审计正确性,顺带收口。
 >
-> **共同底线**:不为这些给部署加 sha256 校验 / 强绑 127.0.0.1 / allowlist 必填 等摩擦,均不作硬门、不阻塞上线;`validate_managed_dir` 等**既有**兜底保留。若将来该端口需跨网段暴露,再回头逐条提级。评审全文见 `review-ultracode-2026-06-21.zh-CN.md`。
+> **共同底线**:不为这些给部署加 sha256 校验 / 强绑 127.0.0.1 / allowlist 必填 等摩擦,均不作硬门、不阻塞上线;`validate_managed_dir` 等**既有**兜底保留。若将来该端口需跨网段暴露,再回头逐条提级。评审全文见 `archive/review-ultracode-2026-06-21.zh-CN.md`。
 
 ## 6. 健壮性(失败与启动)
 

@@ -337,7 +337,7 @@ GET http://&lt;agent-host&gt;:&lt;port&gt;/download/&lt;attachmentId&gt;
       </tbody>
     </table>
     <div class="note warn"><b>去掉两个老坑：</b>① 不再有「root 管理员 JWT（exp≈3026 年≈永不过期）散落在每个 worker」，凭据只在 agent、可轮换。② 传输层修掉 <code>rejectUnauthorized:false</code>/<code>-k</code>：worker→agent 本机明文 HTTP 即可（不出主机）；<b>agent→platform 走正经 TLS</b>（有效证书或 CA 入信任库），不跳过校验。</div>
-    <div class="note">🔻 <b>安全取舍（2026-06-21 定，优先级低于部署省事）</b>：ultracode 评审两条"网络暴露/投毒"高危（H1 agent 入站默认绑 <code>0.0.0.0</code>；H2 包全链路无 sha256）<b>有意降级、不提到 P0/P1</b>——前提是 <b>agent 内网、不暴露外网</b>，且<b>部署简单是最高优先级</b>（不为安全给部署加 sha256 / 强绑 127.0.0.1 / 镜像 allowlist 必填 等摩擦）。零成本默认仍<b>建议</b>（worker-facing 监听写 127.0.0.1、<code>validate_managed_dir</code> 兜底保留），但不作硬门、不阻塞上线。若该端口将来需跨网段暴露，再回头提级。全文见 <code>review-ultracode-2026-06-21.zh-CN.md</code>。</div>
+    <div class="note">🔻 <b>安全取舍（2026-06-21 定，优先级低于部署省事）</b>：ultracode 评审两条"网络暴露/投毒"高危（H1 agent 入站默认绑 <code>0.0.0.0</code>；H2 包全链路无 sha256）<b>有意降级、不提到 P0/P1</b>——前提是 <b>agent 内网、不暴露外网</b>，且<b>部署简单是最高优先级</b>（不为安全给部署加 sha256 / 强绑 127.0.0.1 / 镜像 allowlist 必填 等摩擦）。零成本默认仍<b>建议</b>（worker-facing 监听写 127.0.0.1、<code>validate_managed_dir</code> 兜底保留），但不作硬门、不阻塞上线。若该端口将来需跨网段暴露，再回头提级。全文见 <code>archive/review-ultracode-2026-06-21.zh-CN.md</code>。</div>
   </div>
 
   <h2><span class="n">6</span>健壮性（失败与启动）</h2>
