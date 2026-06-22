@@ -18,7 +18,15 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from app import store
 from app.auth import require_session
 from app.db_models import Namespace, Service
-from app.models import ServiceIn, ServiceListOut, ServiceOut, ServiceUpdate
+from app.models import (
+    ServiceImageListOut,
+    ServiceImageOut,
+    ServiceImageSetCurrentIn,
+    ServiceIn,
+    ServiceListOut,
+    ServiceOut,
+    ServiceUpdate,
+)
 
 
 router = APIRouter(prefix="/api/services", tags=["服务台账"])
@@ -109,3 +117,43 @@ async def delete_service(
     if not store.delete_row(Service, service_id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "service not found")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# --- 镜像台账(P4-4,纯增量,本期不接 redeploy 寻址) -----------------------
+
+
+@router.get(
+    "/{service_id}/images",
+    response_model=ServiceImageListOut,
+    summary="服务镜像台账列表",
+    description="返回该 service 的镜像历史(createdAt 倒序);信封含 count/rows/page/pageSize/totalPage。",
+)
+async def list_service_images(
+    service_id: int,
+    _: str = Depends(require_session),
+) -> ServiceImageListOut:
+    # 镜像历史数据量小(单 service 通常寥寥数行),不分页:一次取全集装进信封(page=1, pageSize=count)。
+    rows = store.list_service_images(service_id)
+    count = len(rows)
+    return ServiceImageListOut(
+        count=count,
+        rows=[ServiceImageOut.model_validate(row) for row in rows],
+        page=1,
+        page_size=count,
+        total_page=1 if count else 0,
+    )
+
+
+@router.post(
+    "/{service_id}/images/set-current",
+    response_model=ServiceImageOut,
+    summary="设置当前镜像",
+    description="把指定 image 置为该 service 的当前镜像(单活:同 service 其它行 isCurrent 清空);返回置后的当前镜像行。",
+)
+async def set_current_service_image(
+    service_id: int,
+    body: ServiceImageSetCurrentIn,
+    _: str = Depends(require_session),
+) -> ServiceImageOut:
+    record = store.set_current_image(service_id, body.image)
+    return ServiceImageOut.model_validate(record)

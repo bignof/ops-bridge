@@ -17,7 +17,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Callable, Sequence, TypeVar
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app import storage, tokens
@@ -28,6 +28,7 @@ from app.db_models import (
     PluginAttachment,
     PluginVersion,
     Service,
+    ServiceImage,
     ServicePlugin,
     ServicePluginVersion,
 )
@@ -728,3 +729,86 @@ def create_fetch_record(
             "remark": remark,
         },
     )
+
+
+# --- 镜像台账(P4-4,纯增量,本期不接 redeploy 寻址) -----------------------
+#
+# 一行 = 某 service 曾用/在用的一个镜像;同 service 多行(历史),至多一行 is_current=True。
+# 单活由 set_current_image 在**单事务**内维护(同 service 先全清 is_current 再置目标),
+# 不设 DB 生成列/唯一兜底(镜像写入低频且 redeploy 寻址尚未消费此列,保持迁移简单)。
+
+
+def list_service_images(service_id: int) -> list[ServiceImage]:
+    """查某 service 的镜像台账行(created_at 倒序,最新在前)。
+
+    同 created_at 时再按 id 倒序兜底稳定顺序(同事务内插入 created_at 相同的极端情形)。
+    """
+    with _db().session_factory() as session:
+        stmt = (
+            select(ServiceImage)
+            .where(ServiceImage.service_id == service_id)
+            .order_by(ServiceImage.created_at.desc(), ServiceImage.id.desc())
+        )
+        return list(session.execute(stmt).scalars().all())
+
+
+def set_current_image(service_id: int, image: str) -> ServiceImage:
+    """把 (service_id, image) 置为该 service 的当前镜像(单活),返回置后的当前镜像行。
+
+    单事务内:① 该 (service_id, image) 行不存在则插入(新行 created_at = 当前 UTC)→
+    ② 把同 service **其它所有行** is_current=False → ③ 目标行 is_current=True。
+
+    复用既有行时不刷其 created_at(保留首次记录的时间);仅新插入时填 created_at。
+    """
+    now = _now()
+    with _db().session_factory() as session:
+        # 先全清同 service 的 is_current(目标行若已存在也会被清,随后再置 True;避免遗留多 current)。
+        session.execute(
+            update(ServiceImage)
+            .where(ServiceImage.service_id == service_id, ServiceImage.is_current.is_(True))
+            .values(is_current=False)
+        )
+        target = session.execute(
+            select(ServiceImage)
+            .where(ServiceImage.service_id == service_id, ServiceImage.image == image)
+            .limit(1)
+        ).scalar_one_or_none()
+        if target is None:
+            target = ServiceImage(
+                service_id=service_id,
+                image=image,
+                is_current=True,
+                created_at=now,
+            )
+            session.add(target)
+        else:
+            target.is_current = True
+        session.commit()
+        session.refresh(target)
+        return target
+
+
+def add_service_image(service_id: int, image: str) -> ServiceImage:
+    """仅追加一条镜像历史(不改 is_current 单活态);(service_id, image) 已存在则原样返回该行。
+
+    与 set_current_image 区别:本函数只补历史、不置当前。重复 (service_id, image) 不重复插入
+    (台账以 (service, image) 去重),已存在时直接返回既有行。
+    """
+    with _db().session_factory() as session:
+        existing = session.execute(
+            select(ServiceImage)
+            .where(ServiceImage.service_id == service_id, ServiceImage.image == image)
+            .limit(1)
+        ).scalar_one_or_none()
+        if existing is not None:
+            return existing
+        record = ServiceImage(
+            service_id=service_id,
+            image=image,
+            is_current=False,
+            created_at=_now(),
+        )
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+        return record

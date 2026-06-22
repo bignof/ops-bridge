@@ -225,6 +225,33 @@ class ServiceListOut(ListEnvelope[ServiceOut]):
     """service 列表响应(具体子类,避开泛型 response_model 的 Pydantic 警告路径)。"""
 
 
+# --- service_image 镜像台账(P4-4) ----------------------------------------
+
+
+class ServiceImageOut(BaseModel):
+    """镜像台账行响应:id + serviceId + image + isCurrent + createdAt(camelCase)。"""
+
+    model_config = MODEL_CONFIG
+
+    id: int
+    service_id: int
+    image: str
+    is_current: bool
+    created_at: datetime
+
+
+class ServiceImageListOut(ListEnvelope[ServiceImageOut]):
+    """镜像台账列表响应(具体子类,避开泛型 response_model 的 Pydantic 警告路径)。"""
+
+
+class ServiceImageSetCurrentIn(BaseModel):
+    """set-current 请求 body:`{image}`(把该 image 置为本 service 当前镜像)。"""
+
+    model_config = MODEL_CONFIG
+
+    image: str
+
+
 # --- service_plugin 资源(Task 6b) -----------------------------------------
 
 

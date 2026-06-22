@@ -132,3 +132,17 @@ class FetchRecord(Base):
     fetch_date: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     remark: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ServiceImage(Base):
+    # 镜像台账(P4-4):一行 = 某 service 曾用/在用的一个镜像。同 service 多行(历史),
+    # **至多一行 is_current=True**(当前镜像)。本期纯台账,不接 redeploy 寻址(后续 P4-2/P4-5)。
+    # 单活由 app 在 set_current_image 内事务维护(同 service 先全清 is_current 再置目标),不设 DB
+    # 生成列/唯一兜底——镜像历史并发写入低频,且 redeploy 寻址尚未消费此列,保持迁移简单(sqlite+MySQL8 双可建)。
+    __tablename__ = "service_images"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    service_id: Mapped[int] = mapped_column(Integer, index=True)
+    image: Mapped[str] = mapped_column(String(2048))
+    is_current: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
