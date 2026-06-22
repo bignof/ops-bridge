@@ -20,7 +20,7 @@ P4 的 publish→自动滚动 依赖 §4.1 协调器(同批,不可早于它)
 - **A(agent 侧)可与 M 并行**;P2 依赖 P1。
 - **P4 自动触发依赖 §4.1 协调器**(评审 M1/L1),二者同批。
 
-**进度**:P0 设计冻结基线已出 · **P1-1 ✓**(167cc65)· **P1-4 ✓** · **M/S1 ✓**(96c8c71)· 计划已并 console-merge(1dbdfae)· **已过 ultracode 二轮评审(2026-06-22),本版已收口确认项**。
+**进度**:P0 设计冻结基线已出 · **P1-1 ✓**(167cc65)· **P1-4 ✓** · 计划已并 console-merge(1dbdfae)· 已过 ultracode 二轮评审(2026-06-22)收口 · **M 合并 S1–S8 全部完成 ✅**(96c8c71→2d0dd71;hub+platform→单一 service-console,单库 12 表,进程内直调,373 测试绿,顶层只剩 service-agent+service-console)。**下一步:P1-2/P1-3(agent worker-facing + 回源)、P2(worker)、P3+(发现/实例页/投放,均落 service-console)**。
 
 ---
 
@@ -43,13 +43,13 @@ P4 的 publish→自动滚动 依赖 §4.1 协调器(同批,不可早于它)
 | 步 | 内容 | 测试门 |
 | --- | --- | --- |
 | **S1 ✓** | 落点重命名 `git mv service-platform service-console`;修目录名引用(app/ci.yml);镜像/deploy 类留 S7 | console 测试 263 passed(已过) |
-| **S2** | 并入 hub 代码 + WS 端点。子项:① hub `app`(store/routers/ws/models/config/api_support/force_guard)并入 console;② `main.py` include hub 路由 + 挂 `/ws/agent`;③ **合并模块级单例**(`database`/`hub_state`/`logger` 落点唯一,沿用 console「单例唯一落点 + 函数内延迟 import」约定,过渡期允许两 `Database` 实例并存);④ **合并两个 lifespan,务必保留 hub 的 `hub_state.initialize` + `interrupt_running_rolling`**(否则重启后中断的滚动永不被标 interrupted);⑤ 确认 WS 握手能过中间件(BaseHTTPMiddleware 不处理 websocket scope,需 e2e 验)(评审 M-9) | **WS agent 能连入 + 启动恢复中断滚动**;hub 路由可访问;import 修通 |
-| **S3** | 合 config:hub settings 并入 console 一份(`SERVICE_HUB_URL`/`HUB_ADMIN_TOKEN` 等内部项删) | config 测试绿 |
-| **S4** | 合 DB + 迁移(**高风险,评审 H-1**)。子项:(a) **合并两个 `db.py` 的 `_managed_tables` 守卫为 12 张全集**(console 8 + hub 4)并保留「部分初始化→RuntimeError」语义,加**旧库升级路径迁移测试**;(b) 统一 `db.py`(一个 engine/Base,统一 `created_at/updated_at` 时区);(c) **删两套 `migrations/`,单一 `0001_initial` 必须 `alembic autogenerate` against 合并后 `Base.metadata`——禁手工拼接两个旧 0001**(否则静默丢 hub 增量迁移的 5 个 delta 列:`commands.mode/retry_count/original_request_id`、`agents.agent_key_hash/key_issued_at`,`store.py` 运行时实读) | **老库 + 新库双路径建表均绿 + 列集断言**(新库列集 == console 0001 ∪ hub 0001+0002+0003+0005,尤校上述 5 列) |
-| **S5** | 进程内直调,删 hub_client(**高风险,评审 H-2**)。子项:① 列 **7 个 `hub_client` 函数**(provision/list_agents/list_instances/dispatch_command/rolling_restart/list_commands/rotate_agent_key)→ 对应 `hub_state`/store 内部方法**映射表**,标 **sync→async 边界**;② 改 `nodes.py` **5 处调用点**(`:83/143/267/313/337/373`)为进程内直调,**必须保留 per-agent 短超时 `asyncio.wait_for` + `gather(return_exceptions)` 隔离**(否则单 agent WS 卡死吊死整页);③ `dispatch/rolling` 的 `requested_by/request_source` 改进程内取值来源(不再有 admin-token 服务端派生);④ 重写 `test_nodes`(~34 处 monkeypatch 桩)/`test_hub_client`/namespaces 测试桩;⑤ 删 `hub_client.py` + 相关 config | console 全量绿 + **「单 agent 卡死整页仍响应」degraded 回归** + caller 身份正确 |
-| **S6** | 合测试:hub tests 并入 console;修 import;原 platform+hub 用例(+调整)全绿 | 全量绿 |
-| **S7** | 镜像/CI/nginx:all-in-one Dockerfile/supervisord 改单进程;nginx 单上游;`docker-publish.yml` 单 `service-console` 镜像、删 hub 镜像 job;`service-console/deploy/*` 单服务化;**补 `PLATFORM_URL` 进 agent 部署模板并注明须与 `WS_URL` 同指一台 console**(评审 M-10) | 镜像构建通过;57 床冒烟;agent 仅配一处 console 地址即可 WS 连接 + 回源 |
-| **S8** | 清理:删 `service-hub` 旧目录;文档/README 指向 service-console;全量 + e2e(ws/logs/rolling) | 全量 + e2e 绿 |
+| **S2 ✓** | 并入 hub 代码 + WS 端点。子项:① hub `app`(store/routers/ws/models/config/api_support/force_guard)并入 console;② `main.py` include hub 路由 + 挂 `/ws/agent`;③ **合并模块级单例**(`database`/`hub_state`/`logger` 落点唯一,沿用 console「单例唯一落点 + 函数内延迟 import」约定,过渡期允许两 `Database` 实例并存);④ **合并两个 lifespan,务必保留 hub 的 `hub_state.initialize` + `interrupt_running_rolling`**(否则重启后中断的滚动永不被标 interrupted);⑤ 确认 WS 握手能过中间件(BaseHTTPMiddleware 不处理 websocket scope,需 e2e 验)(评审 M-9) | **WS agent 能连入 + 启动恢复中断滚动**;hub 路由可访问;import 修通 |
+| **S3 ✓** | 合 config:hub settings 并入 console 一份(`SERVICE_HUB_URL`/`HUB_ADMIN_TOKEN` 等内部项删) | config 测试绿 |
+| **S4 ✓** | 合 DB + 迁移(**高风险,评审 H-1**)。子项:(a) **合并两个 `db.py` 的 `_managed_tables` 守卫为 12 张全集**(console 8 + hub 4)并保留「部分初始化→RuntimeError」语义,加**旧库升级路径迁移测试**;(b) 统一 `db.py`(一个 engine/Base,统一 `created_at/updated_at` 时区);(c) **删两套 `migrations/`,单一 `0001_initial` 必须 `alembic autogenerate` against 合并后 `Base.metadata`——禁手工拼接两个旧 0001**(否则静默丢 hub 增量迁移的 5 个 delta 列:`commands.mode/retry_count/original_request_id`、`agents.agent_key_hash/key_issued_at`,`store.py` 运行时实读) | **老库 + 新库双路径建表均绿 + 列集断言**(新库列集 == console 0001 ∪ hub 0001+0002+0003+0005,尤校上述 5 列) |
+| **S5 ✓** | 进程内直调,删 hub_client(**高风险,评审 H-2**)。子项:① 列 **7 个 `hub_client` 函数**(provision/list_agents/list_instances/dispatch_command/rolling_restart/list_commands/rotate_agent_key)→ 对应 `hub_state`/store 内部方法**映射表**,标 **sync→async 边界**;② 改 `nodes.py` **5 处调用点**(`:83/143/267/313/337/373`)为进程内直调,**必须保留 per-agent 短超时 `asyncio.wait_for` + `gather(return_exceptions)` 隔离**(否则单 agent WS 卡死吊死整页);③ `dispatch/rolling` 的 `requested_by/request_source` 改进程内取值来源(不再有 admin-token 服务端派生);④ 重写 `test_nodes`(~34 处 monkeypatch 桩)/`test_hub_client`/namespaces 测试桩;⑤ 删 `hub_client.py` + 相关 config | console 全量绿 + **「单 agent 卡死整页仍响应」degraded 回归** + caller 身份正确 |
+| **S6 ✓** | 合测试:hub tests 并入 console;修 import;原 platform+hub 用例(+调整)全绿 | 全量绿 |
+| **S7 ✓** | 镜像/CI/nginx:all-in-one Dockerfile/supervisord 改单进程;nginx 单上游;`docker-publish.yml` 单 `service-console` 镜像、删 hub 镜像 job;`service-console/deploy/*` 单服务化;**补 `PLATFORM_URL` 进 agent 部署模板并注明须与 `WS_URL` 同指一台 console**(评审 M-10) | 镜像构建通过;57 床冒烟;agent 仅配一处 console 地址即可 WS 连接 + 回源 |
+| **S8 ✓** | 清理:删 `service-hub` 旧目录;文档/README 指向 service-console;全量 + e2e(ws/logs/rolling) | 全量 + e2e 绿 |
 
 **M 风险门**:S4/S5 最险,各完成后跑 console 全量;S2 WS 整合后跑 `validate_logs_stream_e2e`/`validate_phase1_e2e`;旧目录到 S8 才删。
 
