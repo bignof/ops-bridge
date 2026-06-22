@@ -130,6 +130,56 @@ export async function dispatchNodeAction(
   return r.data;
 }
 
+// ── 实例(instances,DiscoveredNode = agent 自动发现的容器)──────────────────────
+// 实例页 = agent 周期性从 nacos + docker labels 发现上报的物理容器列表(发现权威)。
+// 与上面「节点(nodes)」不同:nodes 是平台 Service 台账 ×(agent×service) 的逻辑视图;
+// instances 是 agent 真实发现的**每个容器一行**(同 nacos 名的多容器各算一个实例)。
+
+/**
+ * 实例行(对齐后端 DiscoveredNodeOut,全 camelCase)。
+ * `dir`/`image`/`composeProject` 为 agent 发现的**权威值**(非手配)。
+ * `status`:`active`(本轮在报)/ `stale`(失联或本轮缺席,仍保留可定位、可被 start)。
+ * `running`:容器是否在跑(docker 含 stopped 也上报);`healthy`:nacos 匹配的健康态(无匹配为 null)。
+ * `nacosService`:nacos 匹配到的服务名(无匹配为 null)。
+ */
+export interface InstanceRow {
+  agentId: string;
+  containerName: string;
+  /** 容器真实 id(可空)。 */
+  containerId: string | null;
+  /** compose 工程名(发现权威;可空)。 */
+  composeProject: string | null;
+  /** compose 服务名(发现权威;可空)。 */
+  composeService: string | null;
+  /** 目录(发现权威;可空)。 */
+  dir: string | null;
+  /** 镜像(发现权威;可空)。 */
+  image: string | null;
+  /** 容器是否在跑。 */
+  running: boolean;
+  /** nacos 匹配的服务名;无匹配为 null。 */
+  nacosService: string | null;
+  /** nacos 健康态;无匹配为 null(列显「-」)。 */
+  healthy: boolean | null;
+  /** active(本轮在报)/ stale(失联或缺席,仍保留)。 */
+  status: string;
+  /** 最近心跳时间(ISO8601;可空)。 */
+  heartbeatAt: string | null;
+  /** 首次发现时间(ISO8601;可空)。 */
+  firstSeenAt: string | null;
+}
+
+/**
+ * 实例列表(服务端分页,统一信封):GET /api/nodes/instances?page=&pageSize=&namespace=&status=。
+ * - `namespace`:按 agentId 过滤(发现实例的命名空间)。
+ * - `status`:`active` / `stale` 过滤;**省略 = 含 active+stale**(stale 实例也要可见,可被 start)。
+ */
+export async function listInstances<T = InstanceRow>(
+  params: ListParams = {},
+): Promise<ListEnvelope<T>> {
+  return list<T>('nodes/instances', params);
+}
+
 /**
  * 新建:POST /api/<resource>(201)。返回响应体(可能含 show-once 明文)。
  * `suppressGlobalError`:CrudTable 对 409「编码已存在」本地精确提示,故 opt-out 全局兜底防双 toast。

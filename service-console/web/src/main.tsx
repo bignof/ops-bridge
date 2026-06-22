@@ -17,6 +17,7 @@ const ServicePluginsPage = lazy(() => import('./pages/ServicePluginsPage'));
 const PluginUploadPage = lazy(() => import('./pages/PluginUploadPage'));
 const ReleasesPage = lazy(() => import('./pages/ReleasesPage'));
 const FetchRecordsPage = lazy(() => import('./pages/FetchRecordsPage'));
+const InstancesPage = lazy(() => import('./pages/InstancesPage'));
 const NodesPage = lazy(() => import('./pages/NodesPage'));
 const NodeOperationsPage = lazy(() => import('./pages/NodeOperationsPage'));
 
@@ -53,6 +54,7 @@ const router = createHashRouter([
       { path: 'plugin-upload', element: lazyPage(<PluginUploadPage />) },
       { path: 'releases', element: lazyPage(<ReleasesPage />) },
       { path: 'fetch-records', element: lazyPage(<FetchRecordsPage />) },
+      { path: 'instances', element: lazyPage(<InstancesPage />) },
       { path: 'nodes', element: lazyPage(<NodesPage />) },
       { path: 'node-operations', element: lazyPage(<NodeOperationsPage />) },
     ],

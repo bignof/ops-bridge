@@ -8,6 +8,7 @@ import {
   ClusterOutlined,
   CloudUploadOutlined,
   DeploymentUnitOutlined,
+  DesktopOutlined,
   HistoryOutlined,
   LogoutOutlined,
   PartitionOutlined,
@@ -50,6 +51,7 @@ const MENU_ITEMS: MenuProps['items'] = [
     label: '运维',
     type: 'group',
     children: [
+      { key: '/instances', icon: <DesktopOutlined />, label: '实例' },
       { key: '/nodes', icon: <ClusterOutlined />, label: '节点' },
       { key: '/node-operations', icon: <AuditOutlined />, label: '操作审计' },
     ],
