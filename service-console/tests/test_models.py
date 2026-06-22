@@ -2,7 +2,7 @@
 
 本文件是 service-platform 首个真正建表读写的测试:不经 `client` fixture,
 直接 `Database("sqlite:///<tmp_path>/t.db")` + `init_schema()`(=alembic
-upgrade head,会跑本任务新写的 20260619_0001 迁移)建库,再用真 session 验
+upgrade head,会跑初始 squash 迁移 682a89c2f7d1)建库,再用真 session 验
 DB 层约束。验证点:
 
 - 唯一约束(namespace.code / uq_service_ns_code / uq_pv_plugin_version /

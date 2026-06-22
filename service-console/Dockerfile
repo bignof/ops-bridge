@@ -1,4 +1,6 @@
-# service-platform 运行镜像(P1-SPA:多阶段,前端 SPA + Python 后端同一镜像)。
+# service-console 单服务运行镜像(无 nginx/supervisor):仅 CI 冒烟构建与本地直跑;
+# 生产交付走 deploy/all-in-one/Dockerfile(nginx + console + supervisord)。
+# 本镜像仍是多阶段(P1-SPA:前端 SPA + Python 后端同一镜像)。
 #
 # 阶段 1(web):node 构建 SPA。`npm run build` = `tsc -b && vite build`,vite.config.ts
 #   的 `build.outDir` 是相对 web/ 的 `../app/static`,故在 WORKDIR=/build/web 下构建,

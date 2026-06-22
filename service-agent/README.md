@@ -48,7 +48,7 @@ service-agent（容器）
 
 | 变量                  | 说明                          | 示例                                                 |
 | --------------------- | ----------------------------- | ---------------------------------------------------- |
-| `WS_URL`              | 控制台 WebSocket 地址         | `ws://192.168.1.10:13000/ws/agent`                   |
+| `WS_URL`              | 控制台 WebSocket 地址         | `ws://192.168.1.100:8080/ws/agent`                   |
 | `AGENT_ID`            | Agent 唯一标识                | `prod-server-01`                                     |
 | `AGENT_KEY`           | Hub 为该 agent 签发的独立 key | `hub-issued-agent-key`                               |
 | `RECONNECT_DELAY`     | 断线重连间隔（秒），默认 `5`  | `5`                                                  |

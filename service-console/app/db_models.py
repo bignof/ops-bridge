@@ -12,7 +12,7 @@
 - 复合唯一约束:`uq_service_ns_code` / `uq_pv_plugin_version` /
   `uq_sp_service_plugin`。
 
-DDL 真实落地见 `migrations/versions/20260619_0001_initial_schema.py`;`init_schema()`
+DDL 真实落地见单一初始 squash 迁移 `migrations/versions/682a89c2f7d1_initial_schema_console_12_tables.py`;`init_schema()`
 经 alembic upgrade 建表,本模块的 `Base.metadata` 供 env.py 的 autogenerate 收集。
 """
 

@@ -1,5 +1,5 @@
 /* eslint-env node */
-// service-platform 控制台前端 ESLint 配置(eslint 8 经典 .eslintrc 格式)。
+// service-console 控制台前端 ESLint 配置(eslint 8 经典 .eslintrc 格式)。
 module.exports = {
   root: true,
   env: { browser: true, es2020: true, node: true },

@@ -2,7 +2,7 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
-// service-platform 控制台前端构建配置。
+// service-console 控制台前端构建配置。
 // - base '/' :SPA 与 FastAPI 同源托管(单容器),所有静态资源走根路径。
 // - 使用 hash 路由(createHashRouter),刷新/深链不依赖后端 history fallback。
 export default defineConfig({

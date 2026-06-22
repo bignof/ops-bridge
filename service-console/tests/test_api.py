@@ -784,6 +784,12 @@ def test_stream_agent_logs_returns_sse_events(client: TestClient) -> None:
         session_id = response.headers["X-Log-Session-Id"]
 
     assert response.status_code == 200
+    # 合并交叉:钉死「SSE 内容类型 + 缓存禁用 + SecurityHeaders 也注入到流式响应」。
+    # (logs.py 出 text/event-stream + no-cache;SecurityHeaders 中间件对所有响应——含 SSE——注入安全头。)
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["X-Frame-Options"] == "DENY"
+    assert "default-src 'self'" in response.headers["Content-Security-Policy"]
     # criticC:requestedBy 由 hub 据 admin token 服务端派生(platform-admin),
     # 不再原样落客户端 X-Requested-By(与 dispatch/retry 审计模型一致)。
     assert socket.messages == [

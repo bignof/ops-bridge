@@ -1,9 +1,9 @@
 {
-  "name": "service-platform-web",
+  "name": "service-console-web",
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "service-platform 控制台前端(SPA),走 P1a FastAPI 后端 API。",
+  "description": "service-console 控制台前端(SPA),走 P1a FastAPI 后端 API。",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",

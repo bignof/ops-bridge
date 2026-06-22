@@ -77,7 +77,9 @@ docker build -t orchidea/service-agent:local ./service-agent
 
 - [插件分发改造 · 总开发计划](docs/plugin-distribution-dev-plan.zh-CN.md) —— 当前主计划(P0 + 合并 M + P1–P5)
 - [插件分发改造 · 设计](docs/plugin-distribution-redesign.zh-CN.md) / [.html](docs/plugin-distribution-redesign.zh-CN.html)
+- [平台原型(UI 参考)](docs/plugin-platform-prototype.zh-CN.html)
 - [ultracode 评审(2026-06-22)](docs/review-ultracode-2026-06-22.zh-CN.md)
 - [Service Console 操作说明](service-console/README.md)
 - [Service Agent 操作说明](service-agent/README.md)
 - 历史文档(node-control / 一期 / 早期评审等)见 [`docs/archive/`](docs/archive/README.md)
+- docs 根的 `collections/fields/uiSchemas.sql` 是 NocoBase 旧 schema dump(SPA 字段基线源数据),非导航文档

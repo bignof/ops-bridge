@@ -100,6 +100,9 @@ async def stream_agent_logs(
 
     headers = {
         "Cache-Control": "no-cache",
+        # 逐响应关 nginx 缓冲(兜底:即便边缘 nginx.conf 漏配 SSE 专用 location,
+        # 也能靠应用侧这个头让 nginx 不缓冲该流式响应)。
+        "X-Accel-Buffering": "no",
         "X-Log-Session-Id": session_id,
     }
     return StreamingResponse(event_stream(), media_type="text/event-stream", headers=headers)

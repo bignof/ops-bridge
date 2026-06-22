@@ -1,6 +1,6 @@
 import client from './client';
 
-// 泛型 CRUD 资源层:统一封装 service-platform 控制台对 P1a FastAPI 后端的资源访问。
+// 泛型 CRUD 资源层:统一封装 service-console 控制台对 P1a FastAPI 后端的资源访问。
 // - 列表统一信封(全量 camelCase,与 P1a `*Out` 模型 to_camel 输出对齐):
 //     { count, rows, page, pageSize, totalPage }
 // - 资源路径约定:/api/<resource>(如 'namespaces' → /api/namespaces)。

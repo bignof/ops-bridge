@@ -38,7 +38,7 @@ P4 的 publish→自动滚动 依赖 §4.1 协调器(同批,不可早于它)
 
 ## M — hub + platform 合并为 service-console(S1–S8)
 
-> 终态:单 FastAPI = platform 路由 + SPA + hub `/ws/agent` + hub 路由(logs/rolling/nodes)+ hub store;一个 DB + 一套 Alembic;删 `hub_client.py`(进程内直调);all-in-one 单进程;agent 不动。
+> 终态:单 FastAPI = platform 路由 + SPA + hub `/ws/agent` + hub 路由(logs/rolling/nodes)+ hub store;一个 DB + 一套 Alembic;`hub_client.py` 改造为进程内 async 适配器(保留 7 函数名 + 契约,函数体 await 调 app/hub handler,删 `SERVICE_HUB_URL`/`HUB_ADMIN_TOKEN` + httpx 依赖);all-in-one 单进程;agent 不动。
 
 | 步 | 内容 | 测试门 |
 | --- | --- | --- |
@@ -46,9 +46,9 @@ P4 的 publish→自动滚动 依赖 §4.1 协调器(同批,不可早于它)
 | **S2 ✓** | 并入 hub 代码 + WS 端点。子项:① hub `app`(store/routers/ws/models/config/api_support/force_guard)并入 console;② `main.py` include hub 路由 + 挂 `/ws/agent`;③ **合并模块级单例**(`database`/`hub_state`/`logger` 落点唯一,沿用 console「单例唯一落点 + 函数内延迟 import」约定,过渡期允许两 `Database` 实例并存);④ **合并两个 lifespan,务必保留 hub 的 `hub_state.initialize` + `interrupt_running_rolling`**(否则重启后中断的滚动永不被标 interrupted);⑤ 确认 WS 握手能过中间件(BaseHTTPMiddleware 不处理 websocket scope,需 e2e 验)(评审 M-9) | **WS agent 能连入 + 启动恢复中断滚动**;hub 路由可访问;import 修通 |
 | **S3 ✓** | 合 config:hub settings 并入 console 一份(`SERVICE_HUB_URL`/`HUB_ADMIN_TOKEN` 等内部项删) | config 测试绿 |
 | **S4 ✓** | 合 DB + 迁移(**高风险,评审 H-1**)。子项:(a) **合并两个 `db.py` 的 `_managed_tables` 守卫为 12 张全集**(console 8 + hub 4)并保留「部分初始化→RuntimeError」语义,加**旧库升级路径迁移测试**;(b) 统一 `db.py`(一个 engine/Base,统一 `created_at/updated_at` 时区);(c) **删两套 `migrations/`,单一 `0001_initial` 必须 `alembic autogenerate` against 合并后 `Base.metadata`——禁手工拼接两个旧 0001**(否则静默丢 hub 增量迁移的 5 个 delta 列:`commands.mode/retry_count/original_request_id`、`agents.agent_key_hash/key_issued_at`,`store.py` 运行时实读) | **老库 + 新库双路径建表均绿 + 列集断言**(新库列集 == console 0001 ∪ hub 0001+0002+0003+0005,尤校上述 5 列) |
-| **S5 ✓** | 进程内直调,删 hub_client(**高风险,评审 H-2**)。子项:① 列 **7 个 `hub_client` 函数**(provision/list_agents/list_instances/dispatch_command/rolling_restart/list_commands/rotate_agent_key)→ 对应 `hub_state`/store 内部方法**映射表**,标 **sync→async 边界**;② 改 `nodes.py` **5 处调用点**(`:83/143/267/313/337/373`)为进程内直调,**必须保留 per-agent 短超时 `asyncio.wait_for` + `gather(return_exceptions)` 隔离**(否则单 agent WS 卡死吊死整页);③ `dispatch/rolling` 的 `requested_by/request_source` 改进程内取值来源(不再有 admin-token 服务端派生);④ 重写 `test_nodes`(~34 处 monkeypatch 桩)/`test_hub_client`/namespaces 测试桩;⑤ 删 `hub_client.py` + 相关 config | console 全量绿 + **「单 agent 卡死整页仍响应」degraded 回归** + caller 身份正确 |
+| **S5 ✓** | 进程内直调,删 hub_client(**高风险,评审 H-2**)。子项:① 列 **7 个 `hub_client` 函数**(provision/list_agents/list_instances/dispatch_command/rolling_restart/list_commands/rotate_agent_key)→ 对应 `hub_state`/store 内部方法**映射表**,标 **sync→async 边界**;② 改 `nodes.py` **5 处调用点**(`:83/143/267/313/337/373`)为进程内直调,**必须保留 per-agent 短超时 `asyncio.wait_for` + `gather(return_exceptions)` 隔离**(否则单 agent WS 卡死吊死整页);③ `dispatch/rolling` 的 `requested_by/request_source` 改进程内取值来源(不再有 admin-token 服务端派生);④ 重写 `test_nodes`(~34 处 monkeypatch 桩)/`test_hub_client`/namespaces 测试桩;⑤ `hub_client.py` 改造为进程内 async 适配器(保留 7 函数名 + 契约,函数体 await 调 app/hub handler,删 `SERVICE_HUB_URL`/`HUB_ADMIN_TOKEN` + httpx 依赖)+ 相关 config | console 全量绿 + **「单 agent 卡死整页仍响应」degraded 回归** + caller 身份正确 |
 | **S6 ✓** | 合测试:hub tests 并入 console;修 import;原 platform+hub 用例(+调整)全绿 | 全量绿 |
-| **S7 ✓** | 镜像/CI/nginx:all-in-one Dockerfile/supervisord 改单进程;nginx 单上游;`docker-publish.yml` 单 `service-console` 镜像、删 hub 镜像 job;`service-console/deploy/*` 单服务化;**补 `PLATFORM_URL` 进 agent 部署模板并注明须与 `WS_URL` 同指一台 console**(评审 M-10) | 镜像构建通过;57 床冒烟;agent 仅配一处 console 地址即可 WS 连接 + 回源 |
+| **S7 ✓** | 镜像/CI/nginx:all-in-one Dockerfile/supervisord 改单进程;nginx 单上游;`docker-publish.yml` 单 `service-console` 镜像、删 hub 镜像 job;删除旧三容器部署栈 `service-console/deploy/`,统一由 `deploy/all-in-one` 承担;**补 `PLATFORM_URL` 进 agent 部署模板并注明须与 `WS_URL` 同指一台 console**(评审 M-10) | 镜像构建通过;57 床冒烟;agent 仅配一处 console 地址即可 WS 连接 + 回源 |
 | **S8 ✓** | 清理:删 `service-hub` 旧目录;文档/README 指向 service-console;全量 + e2e(ws/logs/rolling) | 全量 + e2e 绿 |
 
 **M 风险门**:S4/S5 最险,各完成后跑 console 全量;S2 WS 整合后跑 `validate_logs_stream_e2e`/`validate_phase1_e2e`;旧目录到 S8 才删。
@@ -129,7 +129,7 @@ P4 的 publish→自动滚动 依赖 §4.1 协调器(同批,不可早于它)
 
 ## 文档/原型一致性收口(评审 C 组,与施工并行)
 
-- **设计文档补合并决策注 + 收口 platform/hub 措辞 → service-console**(评审 M-5):§1 组件表、§4.1「均在 hub」、§5 安全表、§8「hub:」分节、§12 现状表;并把 §4「单一真相」与 §4.1「跨多 ns」消解为 P0-4 的扇出模型。
+- ✅ **设计文档补合并决策注 + 收口 platform/hub 措辞 → service-console**(评审 M-5):顶部已加「覆盖性声明」;§1 组件表(platform+hub 并为 service-console)、§5 安全表(删除已不存在的 platform→hub admin-token 链)已收口;§8/§12 的「hub」作为 console 进程内模块名(`app/hub/`)保留,由覆盖性声明统一口径;§4「单一真相」/§4.1「跨多 ns」由 P0-4 扇出模型消解。
 - **原型演示态自洽**(评审 M-1~M-4/M-6/M-7/L-1/L-2/L-3/H-7):managed 表数据驱动 + 一键纳管真落库 + 发布收敛 `_convergeInst` + NODES active 从 SERVICES 派生 + doUpub 文案对齐 + 两列(去恒等)+ 跨 ns 样例 + 获取记录回源粒度。〔已派 proto-fixer 执行〕
 
 ## 跨仓与契约纪律(贯穿)
@@ -142,5 +142,5 @@ P4 的 publish→自动滚动 依赖 §4.1 协调器(同批,不可早于它)
 ## 现状速查(哪些是新建 / 改 / 已有)
 
 - **零实现 / 全新**:agent 插件缓存(✓)、worker-facing 端点、docker 含 stopped 采集、**agent 周期发现上报线程**、console 接收/DiscoveredNode 表/实例页、**ServiceImage 台账**、跨 agent 协调器、跨机聚合查询、desired-state 发布 UI。
-- **改既有**(合并后均在 **service-console**):`rolling.py:_run_rolling`(unmatched 守卫)、`releases.py`(publish 触发 + 跨机扇出)、`distribution.py`(审计口径)、**`nodes.py`(寻址迁 DiscoveredNode + 进程内直调 + 保 degraded 不变式)**、`instance_match.py`(补 composeProject 上报);cnp `sync-plugins`(配置 + mode2 gate)。**Phase M 删 `hub_client.py`**。
+- **改既有**(合并后均在 **service-console**):`rolling.py:_run_rolling`(unmatched 守卫)、`releases.py`(publish 触发 + 跨机扇出)、`distribution.py`(审计口径)、**`nodes.py`(寻址迁 DiscoveredNode + 进程内直调 + 保 degraded 不变式)**、`instance_match.py`(补 composeProject 上报);cnp `sync-plugins`(配置 + mode2 gate)。**Phase M 把 `hub_client.py` 改造为进程内 async 适配器**(保留 7 函数名 + 契约,函数体 await 调 app/hub handler,删 `SERVICE_HUB_URL`/`HUB_ADMIN_TOKEN` + httpx 依赖)。
 - **复用不动 / 已有**:`distribution.py` 的 `query_plugins`/`download`(分发端点 + pull-token + IDOR)、安装链(curl→tar→copy→pm enable)、`validate_managed_dir` 安全闸;**实时日志全链路**(agent `core/log_sessions.py` + `app/routers/logs.py` SSE+fan-out + e2e)——node-control 已实现,合并后同进程,仅缺 console 实例页 UI(P3-9)。

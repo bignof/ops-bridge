@@ -49,8 +49,7 @@
 | --- | --- | --- |
 | worker | 启动时向本机 agent 要插件清单 + 下载包 + 安装 | **无** |
 | agent(一台一个) | ① 本机插件缓存 + 回源平台 ② worker-facing HTTP ③ 拓扑发现上报 ④ 执行 docker 命令 | 本 namespace 的 **pull-token**(分发)+ **agentKey**(连 hub) |
-| platform | 维护「服务→插件→版本」、提供 `/api/distribution/*`、节点台账 UI、发布 | — |
-| hub | agent broker:命令下发 + 接收发现上报 + 节点心跳台账 | platform 给的 admin token |
+| service-console(原 platform + hub 进程内合并) | 维护「服务→插件→版本」、提供 `/api/distribution/*`、节点台账 UI、发布;内置 hub 模块(`app/hub/`)做 agent broker:命令下发 + 接收发现上报 + 节点心跳台账 | —(进程内,无 platform→hub token) |
 
 ## 2. 分发链详设(worker ↔ agent ↔ platform)
 
@@ -247,8 +246,8 @@ agent 下包:  /download/<attachmentId> 未命中缓存 → GET {PLATFORM_URL}/a
 | --- | --- | --- |
 | worker → agent | **无** | 同主机信任 + agent namespace 隔离(P2 可加容器来源校验) |
 | agent → platform 分发 | 本 namespace **pull-token**(可轮换,show-once) | token 属 namespace 校验 + download IDOR 归属链(平台已实现) |
-| agent ↔ hub 控制 | **agentKey**(WS) | hub 校验 |
-| platform → hub | admin token | hub `_require_admin_token` |
+| agent ↔ console 控制 | **agentKey**(WS) | console 内置 hub 模块校验 |
+| platform↔hub(合并后进程内直调) | 无(原 admin token 链已删) | `app/hub_client.py` 进程内 await,无跨进程边界 |
 | 优雅停机 | `K8S_SHUTDOWN_TOKEN`(X-Shutdown-Token) | cnp opt-in 闸(已合 1.7.x_v2) |
 
 - **去掉老坑**:不再有「root 管理员 JWT(exp≈3026 年,等于永不过期)散落在每个 worker」。凭据只在 agent(一台一个,可轮换)。

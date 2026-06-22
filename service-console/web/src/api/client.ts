@@ -1,7 +1,7 @@
 import axios, { type AxiosError, type InternalAxiosRequestConfig } from 'axios';
 import { message } from 'antd';
 
-// service-platform 控制台统一 API 客户端。
+// service-console 控制台统一 API 客户端。
 // - baseURL '/' :与 FastAPI 同源(单容器托管),业务侧用完整路径(如 '/api/namespaces'、'/auth/login')。
 // - 请求拦截:注入 sessionStorage 里的 Bearer token(刷新保活)。
 // - 响应拦截:
