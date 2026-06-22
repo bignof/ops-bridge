@@ -1,4 +1,4 @@
-# service-console 单镜像部署(hub + platform + nginx 三合一)。
+# service-console 单镜像部署(单一 console + nginx)。
 # 用法:cp .env.example .env && 填好密钥 && docker compose up -d
 name: service-console
 
@@ -14,7 +14,7 @@ services:
     env_file:
       - .env
     volumes:
-      # 持久化:两个 sqlite 库 + 插件包目录。生产多节点建议换共享存储/对象存储。
+      # 持久化:sqlite 库 + 插件包目录。生产多节点建议换共享存储/对象存储。
       - ${DATA_DIR:-./data}:/data
       # 启用 TLS:挂证书目录到容器内 /etc/nginx/certs
       # - ./certs:/etc/nginx/certs:ro

@@ -1,4 +1,4 @@
-# 构建上下文 = monorepo 根。仅需 service-hub/ 与 service-platform/ 源码。
+# 构建上下文 = monorepo 根。仅需 service-console/ 源码。
 # 关键:排除 web/node_modules(宿主机为 Windows,带入会覆盖容器内 npm ci 产物且 ABI 不兼容)。
 .git
 **/.git
@@ -11,11 +11,8 @@
 **/.coverage
 
 # 本地运行时产物 / 数据(勿带入镜像)
-service-platform/app/static
-service-platform/service-platform.db
+service-console/app/static
 **/*.db
-service-hub/data
-service-platform/data
 **/.env
 **/.env.*
 
