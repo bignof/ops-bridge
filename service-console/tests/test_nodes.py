@@ -1262,3 +1262,63 @@ def test_node_operations_hub_failure_502(client: TestClient, monkeypatch) -> Non
 def test_node_operations_requires_auth(client: TestClient) -> None:
     # 无 Bearer → 401。
     assert client.get("/api/node-operations").status_code == 401
+
+
+# =====================================================================================
+# P3-5:实例(发现节点)列表 GET /api/nodes/instances
+# =====================================================================================
+
+
+def test_list_instances_returns_discovered_camel_and_counts(client: TestClient) -> None:
+    h = _h(client)
+    _mk_discovered("ns-a", "svc-a", container_name="ns-a-admin-1", dir_="/srv/a", image="img:1",
+                   container_id="c-aaa", compose_project="proj-a", status="active")
+    _mk_discovered("ns-a", "svc-a", container_name="ns-a-admin-2", dir_="/srv/b", status="stale")
+    _mk_discovered("ns-b", "svc-b", container_name="ns-b-x-1", status="active")
+
+    body = client.get("/api/nodes/instances", headers=h).json()
+    assert body["count"] == 3
+    assert {r["agentId"] for r in body["rows"]} == {"ns-a", "ns-b"}
+    r = next(x for x in body["rows"] if x["containerName"] == "ns-a-admin-1")
+    # camelCase + 发现权威字段齐
+    assert r["composeProject"] == "proj-a"
+    assert r["dir"] == "/srv/a"
+    assert r["image"] == "img:1"
+    assert r["containerId"] == "c-aaa"
+    assert r["status"] == "active"
+    assert "heartbeatAt" in r and "nacosService" in r and "running" in r
+
+
+def test_list_instances_filters_by_namespace(client: TestClient) -> None:
+    h = _h(client)
+    _mk_discovered("ns-a", "svc-a", container_name="ns-a-1")
+    _mk_discovered("ns-b", "svc-b", container_name="ns-b-1")
+    body = client.get("/api/nodes/instances?namespace=ns-a", headers=h).json()
+    assert body["count"] == 1
+    assert body["rows"][0]["agentId"] == "ns-a"
+
+
+def test_list_instances_shows_stale_by_default_and_status_filter(client: TestClient) -> None:
+    h = _h(client)
+    _mk_discovered("ns-a", "svc-a", container_name="active-1", status="active")
+    _mk_discovered("ns-a", "svc-a", container_name="stale-1", status="stale")
+    # 默认含 stale(已停可见,可被 start,M8)
+    default_names = {r["containerName"] for r in client.get("/api/nodes/instances", headers=h).json()["rows"]}
+    assert default_names == {"active-1", "stale-1"}
+    # status=active 过滤
+    active = client.get("/api/nodes/instances?status=active", headers=h).json()
+    assert {r["containerName"] for r in active["rows"]} == {"active-1"}
+
+
+def test_list_instances_paginates(client: TestClient) -> None:
+    h = _h(client)
+    for i in range(3):
+        _mk_discovered("ns-a", "svc-a", container_name=f"c-{i}")
+    body = client.get("/api/nodes/instances?page=1&pageSize=2", headers=h).json()
+    assert body["count"] == 3
+    assert len(body["rows"]) == 2
+    assert body["totalPage"] == 2
+
+
+def test_list_instances_requires_auth(client: TestClient) -> None:
+    assert client.get("/api/nodes/instances").status_code == 401

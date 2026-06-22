@@ -44,7 +44,10 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from app import hub_client, store
 from app.auth import require_session
 from app.db_models import Namespace, Service
+from app.hub.db_models import DiscoveredNodeModel
 from app.models import (
+    DiscoveredNodeListOut,
+    DiscoveredNodeOut,
     NodeActionIn,
     NodeActionOut,
     NodeListOut,
@@ -222,6 +225,35 @@ async def list_nodes(
     return NodeListOut(
         count=count,
         rows=out_rows,
+        page=page,
+        page_size=page_size,
+        total_page=math.ceil(count / page_size) if page_size else 0,
+    )
+
+
+@router.get(
+    "/instances",
+    response_model=DiscoveredNodeListOut,
+    summary="实例(发现节点)列表",
+    description="分页返回 agent 自动发现上报的容器实例(DiscoveredNode);可按 namespace(=agentId)与 status(active/stale)过滤。dir/image/composeProject 为发现权威值;stale 行保留(失联可定位)。",
+)
+async def list_discovered_instances(
+    _: str = Depends(require_session),
+    page: int = Query(default=1, ge=1, title="页码"),
+    page_size: int = Query(default=20, ge=1, le=200, alias="pageSize", title="每页条数"),
+    namespace: str | None = Query(default=None, title="按 namespace(=agentId)过滤"),
+    status_filter: str | None = Query(default=None, alias="status", title="按状态过滤(active/stale)"),
+) -> DiscoveredNodeListOut:
+    # 实例页数据源 = DiscoveredNode(发现权威)。默认不按 status 过滤:stale 实例也要可见(已停但可 start,M8)。
+    filters: list[Any] = []
+    if namespace:
+        filters.append(DiscoveredNodeModel.agent_id == namespace)
+    if status_filter:
+        filters.append(DiscoveredNodeModel.status == status_filter)
+    rows, count = store.list_rows(DiscoveredNodeModel, page=page, page_size=page_size, filters=filters)
+    return DiscoveredNodeListOut(
+        count=count,
+        rows=[DiscoveredNodeOut.model_validate(r) for r in rows],
         page=page,
         page_size=page_size,
         total_page=math.ceil(count / page_size) if page_size else 0,

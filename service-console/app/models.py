@@ -398,6 +398,35 @@ class NodeListOut(ListEnvelope[NodeOut]):
     """节点列表响应(具体子类,避开泛型 response_model 的 Pydantic 警告路径)。"""
 
 
+class DiscoveredNodeOut(BaseModel):
+    """实例(DiscoveredNode)行响应:agent 自动发现上报、console 落库的物理容器节点(P3-5)。
+
+    一行 = 某 agent 名下一个 compose 容器(实例);`dir`/`image`/`composeProject` 为 agent 发现的
+    **权威值**(发现权威,非手配)。`status`:`active`(本轮在报)/ `stale`(失联或本轮缺席,保留
+    可定位,评审 M8);`healthy`/`nacosService` 来自 nacos 匹配(无匹配为 None)。
+    """
+
+    model_config = MODEL_CONFIG
+
+    agent_id: str
+    container_name: str
+    container_id: str | None = None
+    compose_project: str | None = None
+    compose_service: str | None = None
+    dir: str | None = None
+    image: str | None = None
+    running: bool
+    nacos_service: str | None = None
+    healthy: bool | None = None
+    status: str
+    heartbeat_at: datetime | None = None
+    first_seen_at: datetime | None = None
+
+
+class DiscoveredNodeListOut(ListEnvelope[DiscoveredNodeOut]):
+    """实例列表响应(具体子类,避开泛型 response_model 的 Pydantic 警告路径)。"""
+
+
 # --- 节点操作下发 + 操作审计(Task 10b) -----------------------------------
 
 
