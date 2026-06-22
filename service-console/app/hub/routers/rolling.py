@@ -111,6 +111,142 @@ async def rolling_restart(
     return {"taskId": task_id}
 
 
+# 跨 agent(跨机)滚动用的哨兵 agent_id:跨机锁键以 service_name 为单位,
+# RollingTaskModel.agent_id 无单一归属,占位为 "*"(仅审计展示用,不参与锁/寻址)。
+_CROSS_AGENT_SENTINEL = "*"
+
+
+async def _run_service_rolling(task_id, service_name, force, hub_state, settings):
+    """跨 agent(跨机)顺序滚动协调器(P4-1,设计 §4.1)。
+
+    跨机零中断 = 把承载同一 nacos 服务的**各 agent 的 matched-local healthy 实例**汇成一条
+    全局有序列表,**全局一次只滚一个**(每个 graceful drain→restart→wait-ready 完才下一个),
+    从而任一时刻至多一个实例 down。与单 agent `_run_rolling` 的关键差异:① 实例来源跨多个
+    agent(靠自动发现的 DiscoveredNode 按 nacos 名聚合定位 agent);② unmatched 实例不再整体
+    abort,而是**过滤丢弃**(unmatched = 别机实例,本协调器逐 agent 各取本机 matched);③ 集群
+    健康门 ≥2 从「单机内」升级为「集群级」(跨 agent 实例合计)。失败收敛 = freeze(失败即停,
+    不回滚)。
+
+    TODO(后续加固,本期不做):continuous cross-probe —— 滚 A 期间持续重探 B/C 健康。MVP 靠
+    「全局一次只滚一个 + 每步 wait-ready」已保证至多一个 down;对「独立第三方实例在滚动期间自行
+    故障」的连续探测是后续加固项,不在本期范围。
+    """
+    import app.store as store
+
+    try:
+        # 1. 定位 agents:按 nacos 名聚合 active 发现实例 → 取承载该服务的不重复 agent(稳定序)。
+        agg = await asyncio.to_thread(store.aggregate_discovered_by_nacos, "active")
+        group = agg.get(service_name, [])
+        agent_ids: list[str] = []
+        for dn in group:
+            if dn.agent_id not in agent_ids:
+                agent_ids.append(dn.agent_id)
+        if not agent_ids:
+            await hub_state.finish_rolling(
+                task_id, "failed", error="无发现实例(nacos 未发现该服务的活跃实例)")
+            return
+
+        # 2. 逐 agent 收集 matched-local healthy 实例 → 跨 agent 有序列表(先按 agent 序、agent 内按返回序)。
+        targets: list[dict] = []
+        for agent_id in agent_ids:
+            req = str(uuid.uuid4())
+            listed = await hub_state.call_agent(
+                agent_id,
+                {"type": "list-instances", "requestId": req, "serviceName": service_name},
+                timeout=settings.rolling_cmd_timeout)
+            if listed.get("status") != "success":
+                await hub_state.finish_rolling(
+                    task_id, "failed",
+                    error=f"list-instances 失败(agent {agent_id}): {listed.get('error')}")
+                return
+            for inst in listed.get("instances") or []:
+                # unmatched = 别机实例,过滤丢弃(不再 abort);只滚本机 matched 且 healthy 的实例。
+                if inst.get("matched") and inst.get("healthy"):
+                    targets.append({
+                        "agentId": agent_id,
+                        "address": inst["address"],
+                        "containerId": inst["containerId"],
+                    })
+
+        # 3. 集群健康门(跨 agent 实例合计):0 → 无可滚;<2 且非 force → 拒(零中断不可达)。
+        total = len(targets)
+        if total == 0:
+            await hub_state.finish_rolling(
+                task_id, "failed", error="无可滚实例(各 agent 均无 matched 且 healthy 的本机实例)")
+            return
+        if total < 2 and not force:
+            await hub_state.finish_rolling(
+                task_id, "failed",
+                error=f"集群健康实例数={total}<2,无法零中断滚动;扩容或 force")
+            return
+
+        # 4. 全局逐一滚:先把全部 targets 落 nodes(pending,带 agentId+address+containerId),再按序滚。
+        nodes = [{"agentId": t["agentId"], "address": t["address"],
+                  "containerId": t["containerId"], "status": "pending"} for t in targets]
+        await hub_state.update_rolling_nodes(task_id, nodes)
+        for idx, node in enumerate(nodes):
+            nodes[idx]["status"] = "in-progress"
+            await hub_state.update_rolling_nodes(task_id, nodes)
+            req = str(uuid.uuid4())
+            res = await hub_state.call_agent(node["agentId"], {
+                "type": "graceful-restart", "requestId": req,
+                "containerId": node["containerId"],
+                "healthBaseUrl": f"http://{node['address']}",
+                "settleSec": settings.rolling_settle_sec,
+                "shutdownTimeoutSec": settings.rolling_shutdown_timeout,
+                "readyTimeoutSec": settings.rolling_ready_timeout,
+            }, timeout=settings.rolling_cmd_timeout)
+            if res.get("status") != "success":
+                # 失败即停(freeze,不回滚):该节点 failed,余下全部标 skipped。
+                nodes[idx]["status"] = "failed"
+                nodes[idx]["error"] = res.get("error")
+                for n in nodes[idx + 1:]:
+                    n["status"] = "skipped"
+                await hub_state.finish_rolling(
+                    task_id, "failed", nodes=nodes,
+                    error=f"节点 {node['agentId']}/{node['address']} 失败,停止滚动")
+                return
+            nodes[idx]["status"] = "done"
+            await hub_state.update_rolling_nodes(task_id, nodes)
+
+        # 5. 全部成功:集群实例 <2(force 放行)标 degraded,否则 done。
+        await hub_state.finish_rolling(
+            task_id, "degraded" if total < 2 else "done", nodes=nodes, degraded=(total < 2))
+    except asyncio.TimeoutError:
+        await hub_state.finish_rolling(task_id, "failed", error="等待 agent 命令结果超时")
+    except Exception as exc:  # noqa: BLE001
+        await hub_state.finish_rolling(task_id, "failed", error=str(exc))
+
+
+class ServiceRollingRequest(BaseModel):
+    serviceName: str
+    force: bool = False
+
+
+@router.post("/api/service-rolling")
+async def service_rolling(
+    request: ServiceRollingRequest,
+    admin_token: str | None = Header(default=None, alias="X-Admin-Token", title="管理令牌"),
+):
+    # 跨 agent(跨机)顺序滚动入口:锁键以 service_name 为单位(agent_id 用哨兵 "*"),
+    # 防同一 nacos 服务被并发跨机滚。建 task 后台执行,与单 agent 端点同构。
+    _require_admin_token(admin_token)
+    import app.main as main_module
+    task_id = str(uuid.uuid4())
+    try:
+        await main_module.hub_state.create_rolling_task(
+            task_id, _CROSS_AGENT_SENTINEL, request.serviceName, request.force,
+            active_key=request.serviceName)
+    except RollingConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    task = asyncio.create_task(
+        _run_service_rolling(task_id, request.serviceName, request.force,
+                             main_module.hub_state, _hub_settings))
+    _background.add(task)
+    task.add_done_callback(_on_task_done)
+    return {"taskId": task_id}
+
+
 @router.get("/api/rolling-restart/{task_id}")
 async def get_rolling(
     task_id: str = Path(...),

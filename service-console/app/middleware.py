@@ -44,6 +44,7 @@ WHITELIST_PREFIXES: tuple[str, ...] = (
     "/api/agents",
     "/api/commands",
     "/api/rolling-restart",
+    "/api/service-rolling",
 )
 
 

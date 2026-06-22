@@ -1008,23 +1008,30 @@ class HubState:
             record = session.scalar(select(AgentModel).where(AgentModel.agent_id == agent_id))
             return _agent_to_dict(record) if record is not None else None
 
-    async def create_rolling_task(self, task_id, agent_id, service_name, force):
-        return await asyncio.to_thread(self._create_rolling_task_sync, task_id, agent_id, service_name, force)
+    async def create_rolling_task(self, task_id, agent_id, service_name, force, *, active_key=None):
+        return await asyncio.to_thread(
+            self._create_rolling_task_sync, task_id, agent_id, service_name, force, active_key)
 
-    def _create_rolling_task_sync(self, task_id, agent_id, service_name, force):
+    def _create_rolling_task_sync(self, task_id, agent_id, service_name, force, active_key=None):
+        # active_key 是并发锁键(nullable unique):
+        # - 单 agent 滚动(默认):f"{agent_id}:{service_name}",防同一 (agent,service) 并发滚。
+        # - 跨 agent(跨机)滚动(P4-1):调用方显式传 service_name,锁键以服务为单位
+        #   (agent_id 传哨兵 "*"),防同一 nacos 服务被并发跨机滚。
+        # 复用同一字段与唯一约束,不另立锁机制。
         now = utc_now()
+        key = active_key if active_key is not None else f"{agent_id}:{service_name}"
         with self.database.session_factory() as session:
             record = RollingTaskModel(
                 task_id=task_id, agent_id=agent_id, service_name=service_name,
                 status="running", degraded=False,  # degraded 终态由 finish_rolling 据实际结果置;创建恒 False
-                active_key=f"{agent_id}:{service_name}",
+                active_key=key,
                 nodes_json="[]", created_at=now, updated_at=now)
             session.add(record)
             try:
                 session.commit()
             except IntegrityError as exc:
                 session.rollback()
-                raise RollingConflict(f"{agent_id}:{service_name} 已有滚动在进行") from exc
+                raise RollingConflict(f"{key} 已有滚动在进行") from exc
             session.refresh(record)
             return _rolling_to_dict(record)
 

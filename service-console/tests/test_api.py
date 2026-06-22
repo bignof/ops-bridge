@@ -875,6 +875,40 @@ def test_rolling_status_404_unknown(hub_client: TestClient) -> None:
     assert resp.status_code == 404
 
 
+def test_service_rolling_router_mounted_requires_admin_token(hub_client: TestClient) -> None:
+    # 跨 agent 滚动端点:未带 token → 403(证明白名单放行后由端点首行 _require_admin_token 把关),
+    # 而非 401(被 SessionGuard JWT default-deny 拦)或 404(未注册)。
+    resp = hub_client.post("/api/service-rolling", json={"serviceName": "s"})
+    assert resp.status_code == 403
+    assert resp.json() == {"detail": "Invalid admin token"}
+
+
+def test_service_rolling_returns_task_id(hub_client: TestClient) -> None:
+    # happy path 端点契约:返 taskId。后台跨机协调器因无发现实例会很快 finish(failed),此处只验契约。
+    resp = hub_client.post(
+        "/api/service-rolling",
+        json={"serviceName": "s"},
+        headers={"X-Admin-Token": "test-admin-token"},
+    )
+    assert resp.status_code == 200
+    assert "taskId" in resp.json()
+
+
+def test_service_rolling_conflict_returns_409(hub_client: TestClient) -> None:
+    # 同 serviceName 已有跨机滚动占锁(active_key=service_name)→ 再发 → 409。
+    import app.main as main_module
+
+    state = main_module.hub_state
+    asyncio.run(state.create_rolling_task("task-cross-occupied", "*", "svc-x", False, active_key="svc-x"))
+
+    resp = hub_client.post(
+        "/api/service-rolling",
+        json={"serviceName": "svc-x"},
+        headers={"X-Admin-Token": "test-admin-token"},
+    )
+    assert resp.status_code == 409
+
+
 def test_rolling_restart_conflict_returns_409(hub_client: TestClient) -> None:
     # L3: 先占锁(running),再对同 (agent,service) 发滚动 → 409
     # (冲突在 create_rolling_task 抛出,早于后台任务,天然规避 flaky)
