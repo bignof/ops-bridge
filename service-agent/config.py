@@ -50,6 +50,17 @@ NACOS_CONTEXT_PATH = os.getenv('NACOS_CONTEXT_PATH', '/nacos')
 NACOS_USERNAME     = os.getenv('NACOS_USERNAME', '')
 NACOS_PASSWORD     = os.getenv('NACOS_PASSWORD', '')
 
+# --- 插件分发(P1):agent 本机插件缓存 + worker-facing 端点 + 回源平台 ---
+# 均为可选能力(未配则该 agent 不提供插件分发,不 sys.exit)。
+PLATFORM_URL           = os.getenv('PLATFORM_URL', '')                 # 回源平台基址,如 https://console.example.com(末尾不带 /)
+PULL_TOKEN             = os.getenv('PULL_TOKEN', '')                   # 本 namespace 的 pull-token(回源 Bearer)
+PLUGIN_NAMESPACE       = os.getenv('PLUGIN_NAMESPACE', '')            # agent 自身的本 namespace(回源用);worker 传入的 namespace 一律忽略
+PLUGIN_CACHE_DIR       = os.getenv('PLUGIN_CACHE_DIR', '/data/agent-plugin-cache')   # 缓存 .tgz 落盘目录(可挂卷保留)
+PLUGIN_CACHE_MAX_BYTES = int(os.getenv('PLUGIN_CACHE_MAX_BYTES', str(2 * 1024 * 1024 * 1024)))  # 容量上限,LRU 淘汰;<=0=不限制
+# worker-facing HTTP:默认仅本机 127.0.0.1(不复用 HEALTH_HOST 的 0.0.0.0;worker 同主机访问,不出主机)。
+PLUGIN_SERVE_HOST      = os.getenv('PLUGIN_SERVE_HOST', '127.0.0.1')
+PLUGIN_SERVE_PORT      = int(os.getenv('PLUGIN_SERVE_PORT', '18082'))
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
