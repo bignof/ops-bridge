@@ -614,7 +614,7 @@
     return {imgChanged:imgChanged,imgFrom:s.deployedImage,imgTo:s.image,pc:pc,none:(!imgChanged&&pc.length===0)};
   }
   function hasPending(svc){ return !svcDiff(svc).none; }
-  // canDeploy:统一投放守卫(agent 在线 + 有在跑实例),列表/详情/概览/实例抽屉共用,杜绝各判一次
+  // canDeploy:统一投放守卫(agent 在线 + 有在跑实例),列表/详情/实例抽屉共用,杜绝各判一次
   function canDeploy(svc){
     var s=SERVICES[svc]; if(!s)return {ok:false,reason:'未知服务'};
     var a=AGENTS[s.ns]; if(!a||!a.online)return {ok:false,reason:'agent 离线（'+s.ns+'）,无法投放'};

@@ -125,7 +125,7 @@ agent 下包:  /download/<attachmentId> 未命中缓存 → GET {PLATFORM_URL}/a
 
 - **节点(物理)与服务(逻辑)分表**(推荐):
   - `Service`(逻辑服务)= 插件分发的单位,key = (namespace, **service_code**)。**人工只配这层 + 它装哪些插件/版本。** `service_code`(分发标识)与 `nacos_service_name`(发现/滚动 link 用)是**两个独立列**:创建时默认填同一值、但**可分别编辑**,不是恒等(见 §3.4)。
-  - `DiscoveredNode`(物理节点)= (agentId, composeProject/containerName, dir, image, host, heartbeatAt),**全自动 upsert**;**dir / 镜像 / 容器以此为权威**,供节点运维页 + 控制链寻址。
+  - `DiscoveredNode`(物理节点)= (agentId, composeProject/containerName, dir, image, host, heartbeatAt),**全自动 upsert**;**dir / 镜像 / 容器以此为权威**,供实例运维页 + 控制链寻址。
 - **admin/2admin 自动落位**:两个 compose 工程 → 两行 DiscoveredNode(dir 各异);插件按 nacosService(同)→ 同插件集。两套粒度自动各就各位,不再像现在手配 node1/2/3 那样别扭。
   > ⚠️ **落位的坑(评审 M3)**:`instance_match` 以宿主发布端口为主键、bridge IP 兜底,**无 compose project 校验**(滚动路径才有 composeProject 漂移守卫)。同机两工程若 nacos 注册的是**容器内端口**(常见两工程都 13000)→ 端口主键命中失败落 IP 兜底,共用默认 bridge 网段时 IP 也可能撞 → DiscoveredNode 的 dir/composeProject 绑错工程,后续「更新/重部署」按错 dir 作用到另一组容器。**要点**:钉清 nacos 注册端口语义(宿主 vs 容器内);匹配成功后带 composeProject 一起上报、hub 校验唯一性;对「一容器被多实例匹配 / 一实例匹配到多容器」**做冲突检测告警,不静默取第一个**。
 - namespace 仍由 platform `create namespace` 时 provision(1:1 绑 agent),show-once 返回 pull-token。
@@ -203,38 +203,37 @@ agent 下包:  /download/<attachmentId> 未命中缓存 → GET {PLATFORM_URL}/a
 **信息架构(侧栏)**:
 - **配置**:命名空间、服务、插件(全目录仓库)
 - **发布**:插件上传(列表带「发布」= 选 ns + 服务)、获取记录(按 命名空间 + 服务 + 实例 聚合,插件@版本进详情)。〔原「插件发布」独立页已删——发布统一走服务的「发布」〕
-- **运维**:节点、操作审计
+- **运维**:实例、操作审计
 - **服务的「配置」「镜像」是服务的二级页**(从服务行进入,服务**只读锁定**,带返回;不在侧栏)。
 - 服务列表分 **已纳管 / 未纳管** 两标签页(纳管模型见 §3.4);**「实例」页**(原称「节点」,即 DiscoveredNode 的 UI 名)全自动发现(§3)。术语统一:命名空间 / 服务名(UI 去掉 (agent) / (nacos) 标注;底层 `service_code` 与 `nacos_service_name` 仍是两列、默认同值,见 §3.4)。
 - **实例运维动作简化为「启动 / 停止 / 更新」**:`更新` = 把该实例拉到**服务期望态**(按 diff 自动选:仅插件变 → restart;含镜像变 → pull-redeploy),**取代分立的「重启 / 重部署」**——与 §4.2「一个发布按 diff 选机制」同一思路,只是作用域为单实例。
 
-### 4.3 实例实时日志(agent 流式支持 —— 新)
+### 4.3 实例实时日志(agent + hub **已实现**,仅缺 platform UI)
 
-实例页要能看**实时日志**(`docker logs -f`)。这是**控制链上一个新的"流式"能力**,与现有「一次性命令→结果」模型不同,需要 agent 专门支持。
+> ⚠️ **更正(2026-06-22 核码)**:本节早先写「agent 是一次性命令模型、流式是全新能力、全链路要建」——**错**。核 `service-agent`/`service-hub` 实际代码后确认:**实时日志在 node-control 阶段已端到端实现**(agent 流式 + hub SSE + e2e),**只剩 platform 实例页 UI 待接**。协议以**既有代码为准**,不要另造。
 
-**链路**:
+**链路(现状)**:
 
 ```
-浏览器 ⇄ platform(SSE)⇄ hub(WS)⇄ agent → docker logs --tail 500 -f <containerName>
+浏览器/platform UI  ──→  hub SSE: POST /api/agents/{agentId}/logs/stream
+                                      ⇅ (WS)
+                          agent: docker compose logs -f --tail N  (按 compose 工程目录 dir)
 ```
 
-**为什么"要 agent 支持"(关键)**:现 agent↔hub 是**一次性命令→结果**(发命令、回一个结果就结束);实时日志是**长连流式**(持续吐行、直到主动停)。需新增:
+**已有(node-control 阶段实现,勿重造)**:
 
-- **agent · `docker_cli`**:`stream_logs(container, tail=500, follow=True)` —— `subprocess` 跑 `docker logs --tail N -f`,逐行 yield。
-- **agent · ws/handlers 新增"流式命令"通道**(区别于一次性命令),三类消息带 `streamId`:`log-stream-start {streamId, container, tail}` / `log-chunk {streamId, lines[]}` / `log-stream-stop {streamId}`。agent 维护 `streamId → 子进程`;收到 stop、或 WS 断连、或无活动超时 → **kill `docker logs` 进程**,**绝不留孤儿进程**。
-- **hub**:把 `log-chunk` 转发给对应 platform 订阅者;platform 断开/超时 → 通知 agent stop。
-- **platform**:BFF 开一个 **SSE** 端点(如 `GET /api/instances/{id}/logs/stream`,admin 鉴权)→ 经 hub 向该实例所属 agent 发起 stream,把 `log-chunk` 以 SSE 推给浏览器。
+- **agent · `core/log_sessions.py`**:`start_log_session` / `stop_log_session`;daemon 线程跑 `open_compose_process(dir, ["logs","-f","--tail",N, ("--timestamps")])`;WS 回 `logs_started` / `logs_chunk` / `logs_finished` / `logs_error`;入参 `sessionId` + `dir`(**compose 工程目录,非 containerName**) + `tail`(默认 200) + `timestamps`;停止/结束 `terminate → wait(5s) → kill`,**不留孤儿**;**已带 `validate_managed_dir` 安全闸**(realpath 须在受管根、拒 agent 自身,防越权读任意目录日志)。
+- **hub · `app/routers/logs.py`**:`POST /api/agents/{agentId}/logs/stream` 返回 **SSE**(`text/event-stream`);**admin-token 鉴权 + `requested_by` 服务端据 token 派生**(客户端 `X-Requested-By` 仅 hint、不入审计,无旁路);agent 在线/连接校验;**多订阅 fan-out**(`subscribe_log_stream` → subscriberId + queue,多人看同实例共享一条 agent 流,**最后一个退订才向 agent 发 `logs_stop`**);响应头回 `X-Log-Session-Id`。有 e2e:`service-hub/scripts/validate_logs_stream_e2e.py`。
 
-**生命周期 / 防爆**:
+**仅待建(platform 侧)**:
 
-- 默认 `--tail 500 --follow`;**仅实时 tail,不落库**(历史日志/检索另说,走既有日志基础设施,不在本方案范围)。
-- **关闭即停**:前端关面板 / 浏览器断开 / 无活动超时(如 10min)→ 链路逐级 stop → agent kill 进程。
-- **背压/截流**:agent 端按行批量 + 速率上限(>N 行/s 合并或丢弃并标「日志过快,已截流」);单行长度截断;前端只保留最近 ~500 行(超出从顶部丢)。
-- **多订阅者**:同实例多人看 —— 简单起见各自独立流 + 并发上限(或后续做 fan-out 共享一个 agent 流)。
+- **platform 实例页日志查看器 UI**:打开 hub 的 SSE(平台 BFF 透传,或 SPA 直连 hub `/api/agents/{agentId}/logs/stream`),消费 `started/chunk/finished/error` 事件渲染;`dir` 取自该实例对应 `DiscoveredNode` 的 compose 工程目录、`agentId` 取自其所属 agent。
+- 前端体验:tail 默认 200(代码默认,可配)、自动滚动、关闭/切走即断开 SSE(hub 的 finally 会向 agent 发 `logs_stop` 收口)。
+- **不要**另造 `streamId / container / log-stream-*` 协议(早先设计的错误命名);一律用既有 `sessionId / dir / logs_*` + hub SSE 端点。
 
-**权限(按 §5 取舍,内网从简)**:走 platform **admin-token → hub → agent** 既有受信链;agent 只对**本机受管容器**开 logs(复用 DiscoveredNode / 受管工程校验)。日志可能含敏感信息 → 仅平台侧有权角色可看,**不**暴露给 worker/public。内网,不额外加固。
+**权限**:复用既有 admin-token 受信链 + `validate_managed_dir`,内网从简(§5),不额外加固。
 
-**数据模型**:无新增持久表(纯流式);可选 agent 本地审计「谁何时看了哪个实例的日志」。**现状对照 = ❌ 待建**(agent 流式 + hub 转发 + platform SSE + UI 查看器全要建),归 **P3**(实例页运维能力)同批或紧随。
+**现状对照 = ⚠️ 大部分已有**:agent 流式 + hub SSE + fan-out + 安全闸 + e2e 均已落地;**唯一待建 = platform 实例页 UI 接 hub SSE**(P3,小工作量)。
 
 ## 5. 安全模型(完整)
 
@@ -292,9 +291,9 @@ agent 下包:  /download/<attachmentId> 未命中缓存 → GET {PLATFORM_URL}/a
   - 「已纳管」= Service 表里有行(无需额外 flag);「已发现未纳管」收件箱 = 发现的 nacosService ∉ Service 表;对账 = `Service ⋈ DiscoveredNode`(by nacosServiceName)的 join 视图(不落表,实时算)。
   - **插件维度**:`service_plugins`(service↔plugin 绑定)+ 每绑定的 active 版本(`service_plugin_version`)→ 支撑「绑定/解绑/改版本」。
   - **镜像维度(新)**:`ServiceImage`(service_id, image, isCurrent, createdAt)历史表(或 Service.currentImage + 历史行)→ 支撑镜像「当前 / 历史 / 回滚」;回滚 = 置某历史 tag 为 current + pull-redeploy。镜像本身仍是节点级(发现上报真实运行 tag),这里存的是「该服务**应用**哪个镜像」的意图 + 历史。
-- **hub**:加「发现上报」接收 + 落库 + 心跳清理;加**流式日志转发**(`log-chunk` 从 agent 转发给订阅的 platform,§4.3)。
-- **agent**:新增 `plugin_cache` 模块 + worker-facing HTTP 路由 + 周期发现上报 + **流式命令通道(`docker logs -f` 实时日志,§4.3)** + 配置项 `PLATFORM_URL` / `PULL_TOKEN` / `PLUGIN_CACHE_DIR` / `PLUGIN_SERVE_PORT`。
-- **platform**:加实例日志 **SSE 端点**(`/api/instances/{id}/logs/stream`,admin 鉴权,经 hub 拉 agent 流,§4.3)。
+- **hub**:加「发现上报」接收 + 落库 + 心跳清理。(实时日志 SSE `app/routers/logs.py` **已有**,§4.3,无需新增。)
+- **agent**:新增 `plugin_cache` 模块 + worker-facing HTTP 路由 + 周期发现上报 + 配置项 `PLATFORM_URL` / `PULL_TOKEN` / `PLUGIN_CACHE_DIR` / `PLUGIN_SERVE_PORT`。(实时日志流式 `core/log_sessions.py` **已有**,§4.3,无需新增。)
+- **platform**:实例页**日志查看器 UI** 接 hub 既有 SSE(§4.3);其余实例/服务/纳管/镜像页。
 
 ## 9. worker 侧(`docker/nocobase/sync-plugins.js`)—— 基本是改配置,不重写
 
@@ -333,7 +332,7 @@ agent 下包:  /download/<attachmentId> 未命中缓存 → GET {PLATFORM_URL}/a
 | **P0** | 契约定稿(worker↔agent **零 ns**、发现上报、数据模型、**失败即停回滚语义** G5)+ **worker↔agent contract test**(G1)+ 本设计冻结 | 评审通过;contract test 绿 |
 | **P1** | agent:`plugin_cache` + worker-facing `/plugins`、`/download`(回源平台,持 token);配置项落地 | worker 经 agent 拉到插件(缓存命中/回源各一次) |
 | **P2** | worker:改 `sync-plugins.config.json`(adminUrl→本机 agent、apiPath→`/plugins`、去 token、**保留 namespace 字段**);若要彻底去 ns 则改 mode2 gate(L3,必改非可选) | 真 worker 从本机 agent 装插件成功;agent 挂走 last-good 不白屏;**agent 返回空清单 → 不清空既有插件 + 记 warning**(M4) |
-| **P3** | 自动发现:agent 周期 nacos+**docker(含 stopped,新采集器)**上报 → hub 落库 + 心跳(标 stale 不删)→ platform 节点表 + UI;Service auto-upsert;**实例实时日志(§4.3,agent 流式)** | UI 自动出现 admin/2admin 两节点(含已停),dir 自动填,无需手配;实例页能看 `docker logs -f` 实时流 |
+| **P3** | 自动发现:agent 周期 nacos+**docker(含 stopped,新采集器)**上报 → hub 落库 + 心跳(标 stale 不删)→ platform 节点表 + UI;Service auto-upsert;**实例实时日志 UI**(§4.3,agent+hub SSE **已有**,仅接 platform 实例页查看器) | UI 自动出现 admin/2admin 两节点(含已停),dir 自动填,无需手配;实例页接 hub SSE 看实时日志 |
 | **P4** | 投放联动(**依赖 §4.1 协调器、同批**):platform 发布 → hub **跨 agent 顺序投放**(restart / pull-redeploy 共用协调器 + 集群健康门 + 失败即停回滚)→ worker 重拉;agent 预热 | 改 active → 跨机顺序滚 → 都跑新版零中断;**注入失败 → 失败即停 + 收敛**(G5) |
 | **P5** | 加固:fetch_record caller 维度、灰度发布、缓存 sha256 校验、可观测面板、**迁移老节点**(root-JWT→pull-token、adminUrl→agent) | 老节点平滑迁入;审计/监控齐全 |
 
@@ -363,4 +362,4 @@ agent 下包:  /download/<attachmentId> 未命中缓存 → GET {PLATFORM_URL}/a
 | **发布→滚动投放联动**(publish/rollback 现只改 DB active,不触发控制链 M1)**+ 预热** | ❌ 待建(P4,依赖跨 agent 协调器) |
 | 服务「插件配置」管理面(绑定/解绑/改版本) | ⚠️ 后端模型多在(service_plugins/releases),缺二级页 UI |
 | 服务「镜像配置」管理面(当前/历史/回滚 → pull-redeploy) | ❌ 待建(原型已设计;pull-redeploy 能力 agent 侧已有,缺平台镜像台账 + 回滚 UI) |
-| **实例实时日志**(§4.3:agent `docker logs -f` 流式 → hub 转发 → platform SSE → UI) | ❌ 待建(P3;agent 现是"一次性命令"模型,**流式通道是新能力**,全链路要建) |
+| **实例实时日志**(§4.3:agent `compose logs -f` 流式 → hub SSE → UI) | ⚠️ **大部分已有**:agent `core/log_sessions.py` + hub `app/routers/logs.py`(SSE+fan-out+鉴权)+ e2e 均已落地(node-control);**仅 platform 实例页查看器 UI 待建**(P3,小) |

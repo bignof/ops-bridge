@@ -71,7 +71,7 @@ P0 契约+设计冻结  ──→ 阻塞所有后续
 | P3-3 | **hub 接收发现上报 + 落库 + 心跳**:**标 `stale`/`unknown` 不删行**(评审 M8),显式确认下线才删 | service-hub(store + 新消息类型) | P3-1 | agent 失联节点保留可定位 |
 | P3-4 | **platform DiscoveredNode 表 + 实例页 UI**:全自动 upsert;dir/镜像权威在此(P0-4) | service-platform(`db_models.py` + SPA 实例页) | P3-3 | UI 自动出现节点,dir 自动填,无需手配 |
 | P3-5 | **纳管模型**:发现 `nacosService` ∉ Service → 「已发现未纳管」收件箱;一键纳管(预填 ns+nacosName)+ 人工配插件;对账三态(running-but-unmanaged / managed-but-down / version-drift) | service-platform | P3-4 | 收件箱 + 对账视图可用 |
-| P3-6 | **实例实时日志(评审/需求 §4.3)**:agent **流式命令通道**(`stream_logs` 跑 `docker logs --tail 500 -f` 逐行 yield;`log-stream-start/log-chunk/log-stream-stop` 带 streamId;停/断连/超时 kill 进程不留孤儿)+ hub 转发 + platform **SSE** 端点(`/api/instances/{id}/logs/stream`,admin)+ UI 查看器 | service-agent + service-hub + service-platform | P3-4 | 实例页看 `docker logs -f` 实时流;关闭即停无孤儿;离线实例不可用 |
+| P3-6 | **实例实时日志(§4.3)—— agent+hub 已有,仅接 platform UI**:agent `core/log_sessions.py`(`compose logs -f --tail N`,sessionId+dir,logs_started/chunk/finished/error,kill 不留孤儿,validate_managed_dir 闸)+ hub `app/routers/logs.py`(SSE `POST /api/agents/{agentId}/logs/stream`,admin+派生 requested_by,**fan-out**,e2e)**均已落地**;**本任务只做 platform 实例页日志查看器 UI**:接 hub SSE(BFF 透传或 SPA 直连),dir 取自 DiscoveredNode、agentId 取自所属 agent;**复用既有 sessionId/dir/logs_\* 协议,勿另造** | service-platform(UI;agent/hub 不动) | P3-4 | 实例页接 hub SSE 看实时日志;关闭即断(hub 收口向 agent 发 logs_stop);离线实例不可用 |
 
 **P3 验收**:UI 自动出现 admin/2admin 等节点(含已停);实例页能看实时日志。
 
@@ -111,6 +111,6 @@ P0 契约+设计冻结  ──→ 阻塞所有后续
 
 ## 现状速查(哪些是新建、哪些是改)
 
-- **零实现 / 全新**:agent 插件缓存、worker-facing 端点、docker 含 stopped 采集、发现上报、跨 agent 协调器、实例实时日志流式通道、platform 节点表/实例页/SSE。
+- **零实现 / 全新**:agent 插件缓存、worker-facing 端点、docker 含 stopped 采集、发现上报、跨 agent 协调器、platform 节点表/实例页。
 - **改既有**:`rolling.py:_run_rolling`(unmatched 守卫)、`releases.py`(publish 触发控制链)、cnp `sync-plugins`(配置 + mode2 gate)、`distribution.py`(审计口径/可选 sha256)。
-- **复用不动**:`distribution.py` 的 `query_plugins`/`download`(分发端点 + pull-token + IDOR)、安装链(curl→tar→copy→pm enable)、`validate_managed_dir` 安全闸。
+- **复用不动 / 已有**:`distribution.py` 的 `query_plugins`/`download`(分发端点 + pull-token + IDOR)、安装链(curl→tar→copy→pm enable)、`validate_managed_dir` 安全闸;**实时日志全链路**(agent `core/log_sessions.py` + hub `app/routers/logs.py` SSE+fan-out + e2e)——node-control 已实现,仅缺 platform UI(P3-6)。

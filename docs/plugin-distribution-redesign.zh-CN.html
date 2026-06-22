@@ -296,19 +296,21 @@ GET http://&lt;agent-host&gt;:&lt;port&gt;/download/&lt;attachmentId&gt;
       <li><b>创建服务</b>只填 <code>命名空间 + 服务编码（= nacos 服务名）</code>；<b>目录 / 镜像不在创建表单</b>——目录纯节点级（自动发现），镜像走「镜像配置」管理面。</li>
       <li><b>镜像有历史 + 回滚</b>：每次发布镜像入历史，可一键回滚到旧 tag（pull-redeploy）。</li>
     </ul>
-    <p><b>信息架构（侧栏）</b>：配置（命名空间 / 服务 / 插件）· 发布（插件上传〔列表带「发布」=选 ns+服务〕/ 获取记录〔按 命名空间+服务+实例 聚合,插件@版本进详情〕；原「插件发布」独立页已删，发布统一走服务的「发布」）· 运维（节点 / 操作审计）。<b>服务的「配置」「镜像」是服务二级页</b>（从服务行进入，服务<b>只读锁定</b>，不在侧栏）；服务列表分 <b>已纳管 / 未纳管</b> 标签页（§3.4）；<b>「实例」页</b>（原「节点」，即 DiscoveredNode 的 UI 名）全自动发现（§3）。术语统一：命名空间 / 服务名（UI 去 (agent)/(nacos) 标注；底层 service_code 与 nacos_service_name 仍是两列、默认同值，见 §3.4）。<b>实例运维动作简化为「启动 / 停止 / 更新」</b>：<code>更新</code> = 把该实例拉到<b>服务期望态</b>（按 diff 自动选 restart / pull-redeploy），取代分立的「重启 / 重部署」。</p>
+    <p><b>信息架构（侧栏）</b>：配置（命名空间 / 服务 / 插件）· 发布（插件上传〔列表带「发布」=选 ns+服务〕/ 获取记录〔按 命名空间+服务+实例 聚合,插件@版本进详情〕；原「插件发布」独立页已删，发布统一走服务的「发布」）· 运维（实例 / 操作审计）。<b>服务的「配置」「镜像」是服务二级页</b>（从服务行进入，服务<b>只读锁定</b>，不在侧栏）；服务列表分 <b>已纳管 / 未纳管</b> 标签页（§3.4）；<b>「实例」页</b>（原「节点」，即 DiscoveredNode 的 UI 名）全自动发现（§3）。术语统一：命名空间 / 服务名（UI 去 (agent)/(nacos) 标注；底层 service_code 与 nacos_service_name 仍是两列、默认同值，见 §3.4）。<b>实例运维动作简化为「启动 / 停止 / 更新」</b>：<code>更新</code> = 把该实例拉到<b>服务期望态</b>（按 diff 自动选 restart / pull-redeploy），取代分立的「重启 / 重部署」。</p>
   </div>
 
   <div class="card">
-    <h3>4.3 实例实时日志（agent 流式支持 —— 新）</h3>
-    <p class="lead">实例页要能看<b>实时日志</b>（<code>docker logs -f</code>）。这是控制链上一个<b>新的"流式"能力</b>，与现有「一次性命令→结果」不同，<b>要 agent 专门支持</b>。</p>
-    <pre><code>浏览器 ⇄ platform(SSE) ⇄ hub(WS) ⇄ agent → docker logs --tail 500 -f &lt;container&gt;</code></pre>
+    <h3>4.3 实例实时日志（agent + hub <b>已实现</b>，仅缺 platform UI）</h3>
+    <div class="note warn">⚠️ <b>更正(2026-06-22 核码)</b>：本节早先写「agent 一次性命令模型、流式是全新能力、全链路待建」<b>是错的</b>。核 service-agent/service-hub 实际代码:实时日志在 <b>node-control 阶段已端到端实现</b>(agent 流式 + hub SSE + e2e),<b>只剩 platform 实例页 UI 待接</b>;协议以既有代码为准,勿另造。</div>
+    <pre><code>浏览器/platform UI → hub SSE: POST /api/agents/{agentId}/logs/stream
+                          ⇅ (WS)
+              agent: docker compose logs -f --tail N  (按 compose 工程目录 dir)</code></pre>
     <ul>
-      <li><b>为什么"要 agent 支持"</b>：现 agent↔hub 是<b>一次性命令→结果</b>；实时日志是<b>长连流式</b>（持续吐行直到停）。新增 <code>docker_cli.stream_logs(container, tail, follow)</code>（<code>subprocess</code> 跑 <code>docker logs -f</code> 逐行 yield）+ <b>流式命令通道</b>三类消息带 <code>streamId</code>：<code>log-stream-start / log-chunk / log-stream-stop</code>。</li>
-      <li><b>hub</b> 转发 <code>log-chunk</code> 给订阅的 platform；<b>platform</b> 开 <b>SSE</b> 端点 <code>/api/instances/{id}/logs/stream</code>（admin 鉴权）经 hub 拉 agent 流推给浏览器。</li>
-      <li><b>生命周期/防爆</b>：默认 <code>--tail 500 -f</code>；<b>仅实时不落库</b>；关面板/断连/无活动超时 → 逐级 stop → <b>agent kill <code>docker logs</code> 进程，不留孤儿</b>；行速率截流 + 前端只留最近 ~500 行。</li>
-      <li><b>权限</b>（按 §5 取舍，内网从简）：走 admin-token→hub→agent 既有受信链；agent 只对<b>本机受管容器</b>开 logs；仅平台有权角色可看，不暴露 worker/public。</li>
-      <li><b>数据模型</b>：无新增持久表（纯流式）；归 <b>P3</b>，现状 <b>❌ 待建</b>（流式通道是新能力，全链路要建）。</li>
+      <li><b>已有 · agent</b> <code>core/log_sessions.py</code>：<code>start/stop_log_session</code>;daemon 线程跑 <code>compose logs -f --tail N</code>;WS 回 <code>logs_started/logs_chunk/logs_finished/logs_error</code>;入参 <code>sessionId</code>+<code>dir</code>(compose 工程目录,非 container)+<code>tail</code>(默认 200)+<code>timestamps</code>;停止 <code>terminate→wait→kill</code> 不留孤儿;<b>已带 <code>validate_managed_dir</code> 安全闸</b>。</li>
+      <li><b>已有 · hub</b> <code>app/routers/logs.py</code>：<code>POST /api/agents/{agentId}/logs/stream</code> 返回 <b>SSE</b>;admin-token + <code>requested_by</code> 服务端派生(无客户端旁路);<b>多订阅 fan-out</b>(共享一条 agent 流,最后退订才向 agent 发 <code>logs_stop</code>);有 e2e <code>validate_logs_stream_e2e.py</code>。</li>
+      <li><b>仅待建 · platform</b>：实例页<b>日志查看器 UI</b> 接 hub 既有 SSE(BFF 透传或 SPA 直连);<code>dir</code> 取自 DiscoveredNode 的 compose 工程目录、<code>agentId</code> 取自所属 agent。<b>复用既有 <code>sessionId/dir/logs_*</code> 协议,勿另造 streamId/container/log-stream-*。</b></li>
+      <li><b>权限</b>:复用既有 admin-token 受信链 + <code>validate_managed_dir</code>,内网从简(§5)。</li>
+      <li><b>现状 = ⚠️ 大部分已有</b>(agent+hub+e2e),仅 platform UI 待建(P3,小)。</li>
     </ul>
   </div>
 
@@ -365,9 +367,9 @@ GET http://&lt;agent-host&gt;:&lt;port&gt;/download/&lt;attachmentId&gt;
       <div>
         <h3>hub / agent</h3>
         <ul>
-          <li><b>hub</b>：加「发现上报」接收 + 落库 + 心跳清理；加<b>流式日志转发</b>（<code>log-chunk</code> agent→platform，§4.3）。</li>
-          <li><b>agent</b>：新增 <code>plugin_cache</code> 模块 + worker-facing HTTP 路由 + 周期发现上报 + <b>流式命令通道（<code>docker logs -f</code> 实时日志，§4.3）</b> + 配置项 <code>PLATFORM_URL</code> / <code>PULL_TOKEN</code> / <code>PLUGIN_CACHE_DIR</code> / <code>PLUGIN_SERVE_PORT</code>。</li>
-          <li><b>platform</b>：加实例日志 <b>SSE 端点</b>（<code>/api/instances/{id}/logs/stream</code>，admin 鉴权，§4.3）。</li>
+          <li><b>hub</b>：加「发现上报」接收 + 落库 + 心跳清理。(实时日志 SSE <code>app/routers/logs.py</code> <b>已有</b>,§4.3,无需新增。)</li>
+          <li><b>agent</b>：新增 <code>plugin_cache</code> 模块 + worker-facing HTTP 路由 + 周期发现上报 + 配置项 <code>PLATFORM_URL</code> / <code>PULL_TOKEN</code> / <code>PLUGIN_CACHE_DIR</code> / <code>PLUGIN_SERVE_PORT</code>。(实时日志流式 <code>core/log_sessions.py</code> <b>已有</b>,§4.3,无需新增。)</li>
+          <li><b>platform</b>：实例页<b>日志查看器 UI</b> 接 hub 既有 SSE(§4.3);其余实例/服务/纳管/镜像页。</li>
         </ul>
       </div>
     </div>
@@ -430,7 +432,7 @@ GET http://&lt;agent-host&gt;:&lt;port&gt;/download/&lt;attachmentId&gt;
         <tr><td>发布→滚动投放联动 + 预热</td><td><span class="badge b-no">❌ 待建</span> P4(依赖跨 agent 协调器;现 publish/rollback 只改 DB active、不触发控制链 M1)</td></tr>
         <tr><td>服务「插件配置」管理面（绑定/解绑/改版本）</td><td><span class="badge b-warn">⚠️ 后端模型多在，缺二级页 UI</span></td></tr>
         <tr><td>服务「镜像配置」管理面（当前/历史/回滚 → pull-redeploy）</td><td><span class="badge b-no">❌ 待建</span> 原型已设计；pull-redeploy 在 agent 侧，缺平台镜像台账 + 回滚 UI</td></tr>
-        <tr><td><b>实例实时日志</b>（§4.3：agent <code>docker logs -f</code> 流式 → hub 转发 → platform SSE → UI）</td><td><span class="badge b-no">❌ 待建</span> P3;agent 现是"一次性命令"模型,<b>流式通道是新能力</b>,全链路要建</td></tr>
+        <tr><td><b>实例实时日志</b>（§4.3：agent <code>compose logs -f</code> 流式 → hub SSE → UI）</td><td><span class="badge b-warn">⚠️ 大部分已有</span> agent <code>core/log_sessions.py</code> + hub <code>app/routers/logs.py</code>(SSE+fan-out+鉴权)+ e2e 均已落地(node-control);<b>仅 platform 实例页 UI 待建</b>(P3,小)</td></tr>
       </tbody>
     </table>
   </div>
