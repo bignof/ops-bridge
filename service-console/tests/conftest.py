@@ -39,6 +39,7 @@ os.environ.setdefault("PLATFORM_ADMIN_PASSWORD", "admin-pw")
 os.environ.setdefault("PLATFORM_JWT_SECRET", "test-secret-which-is-long-enough-0123456789")
 
 from app.db import Database  # noqa: E402
+from app.hub.store import HubState  # noqa: E402
 from app.main import app  # noqa: E402
 
 
@@ -77,4 +78,37 @@ def client(tmp_path: Path) -> Iterator[TestClient]:
     database.engine.dispose()
     main_module.database = old_database  # 还原,防跨用例泄漏
     main_module.hub_state.database = old_hub_db
+    object.__setattr__(main_module.settings, "admin_token", old_admin_token)
+
+
+@pytest.fixture()
+def hub_client(tmp_path: Path) -> Iterator[TestClient]:
+    """每用例**全新 HubState** 的隔离客户端(原 test_api.py / test_node_ops.py 各自重复
+    定义同一份,评审 test-quality #1 下沉至此去重,消灭三份同名 client 分叉)。
+
+    与 `client` 的区别:`client` 复用模块级 `hub_state` 单例、仅 swap 其 `.database`;
+    本 fixture 整体替换 `main_module.hub_state` 为全新实例。直接操作 hub 进程内态
+    (`attach_agent` 灌 `_connections`/`_agent_runtime`,用例间不清理且断言精确条数)的测试
+    必须用它——复用单例会让上一个用例的残留连接泄漏进下一个用例,打破计数断言。
+    """
+    database = Database("sqlite:///" + str(tmp_path / "test.db"))
+    test_state = HubState(heartbeat_timeout=90, command_history_limit=200, database=database)
+    database.init_schema()
+
+    import app.main as main_module
+
+    old_database = main_module.database
+    old_hub_state = main_module.hub_state
+    old_admin_token = main_module.settings.admin_token
+    main_module.database = database
+    main_module.hub_state = test_state
+    object.__setattr__(main_module.settings, "admin_token", "test-admin-token")
+    app.dependency_overrides = {}
+
+    with TestClient(app) as test_client:
+        yield test_client
+
+    database.engine.dispose()
+    main_module.database = old_database
+    main_module.hub_state = old_hub_state
     object.__setattr__(main_module.settings, "admin_token", old_admin_token)
