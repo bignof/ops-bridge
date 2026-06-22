@@ -1,7 +1,10 @@
+import { useState } from 'react';
 import { ProTable, type ProColumns } from '@ant-design/pro-components';
-import { Tag, Typography } from 'antd';
+import { Button, Tag, Tooltip, Typography } from 'antd';
+import { FileTextOutlined } from '@ant-design/icons';
 import * as resources from '../api/resources';
 import type { InstanceRow } from '../api/resources';
+import InstanceLogDrawer from '../components/InstanceLogDrawer';
 
 const { Text } = Typography;
 
@@ -142,16 +145,51 @@ const columns: ProColumns<InstanceRow>[] = [
  * 筛选:namespace(=agentId,文本)、status(active/stale,**默认全部含 stale**);空值不透传(避免发
  *       `namespace=""` / `status=""` 给后端)。
  *
- * 本期**纯只读**:无行级运维操作(启动/停止/更新/日志)与纳管/对账——那些是后续任务。
- * 原型实例行虽有操作按钮,此页先不接后端(避免乱接),留待后续批次。
- * 鉴权失败(401)由 client 拦截器统一跳登录。
+ * 行操作(本期仅「日志」,P3-9):点「日志」打开 {@link InstanceLogDrawer} 接 console 既有 SSE 看实时
+ * tail(`agentId` + 发现权威 `dir`)。**仅当该行有 `dir` 时可点**(无 dir 禁用 + tooltip 说明);
+ * 启动/停止/更新等运维操作仍留后续批次,本页不接。
+ * 鉴权失败(401)由 client 拦截器统一跳登录;日志 SSE 的 401/403 由抽屉内显式报错(见组件注释)。
  */
 export default function InstancesPage() {
+  // 当前打开日志抽屉的目标实例(null = 关闭)。取该行 agentId + dir 发起 SSE。
+  const [logTarget, setLogTarget] = useState<InstanceRow | null>(null);
+
+  // 行操作列(仅「日志」):无 dir 的实例禁用(发现未取到工程目录,无法定位 compose 日志)。
+  const optionColumn: ProColumns<InstanceRow> = {
+    title: '操作',
+    valueType: 'option',
+    key: 'option',
+    fixed: 'right',
+    render: (_dom, record) => {
+      const canViewLog = !!record.dir;
+      const btn = (
+        <Button
+          size="small"
+          icon={<FileTextOutlined />}
+          disabled={!canViewLog}
+          onClick={() => setLogTarget(record)}
+        >
+          日志
+        </Button>
+      );
+      // 无 dir:禁用并用 tooltip 说明原因(disabled 按钮自身不触发 hover,故包一层 span 承载 tooltip)。
+      return canViewLog ? (
+        btn
+      ) : (
+        <Tooltip title="该实例未发现工程目录(dir),无法拉取实时日志">
+          <span>{btn}</span>
+        </Tooltip>
+      );
+    },
+  };
+
   return (
+    <>
     <ProTable<InstanceRow>
       // 行唯一键:agentId + containerName(后端 uq_dn_agent_container 唯一约束据此)。
       rowKey={(r) => `${r.agentId}:${r.containerName}`}
-      columns={columns}
+      // 展示列(模块级常量)+ 行操作列(需组件 state 开日志抽屉,故在组件内拼上)。
+      columns={[...columns, optionColumn]}
       // 服务端分页:current/pageSize → 后端 page/pageSize;查询表单产生的 namespace/status 过滤平铺透传;
       // 空字符串过滤值剔除(不发空参,后端仅按 truthy 过滤);读信封后返回 ProTable 约定结构。
       request={async (params) => {
@@ -174,12 +212,22 @@ export default function InstancesPage() {
         }
       }}
       pagination={{ showSizeChanger: true }}
-      // 开查询表单(namespace / status 筛选)。只读页无添加/编辑/行操作。
+      // 开查询表单(namespace / status 筛选)。本期行操作仅「日志」(见 optionColumn)。
       search={{ labelWidth: 'auto', defaultCollapsed: false }}
       options={{ reload: true, density: false, setting: false }}
       toolBarRender={false}
       dateFormatter="string"
       scroll={{ x: 'max-content' }}
     />
+
+    {/* 实时日志抽屉:目标实例的 agentId + 发现权威 dir 发起 SSE;关闭即 abort 停流。 */}
+    <InstanceLogDrawer
+      open={logTarget !== null}
+      onClose={() => setLogTarget(null)}
+      agentId={logTarget?.agentId ?? null}
+      dir={logTarget?.dir ?? null}
+      title={logTarget?.containerName}
+    />
+    </>
   );
 }

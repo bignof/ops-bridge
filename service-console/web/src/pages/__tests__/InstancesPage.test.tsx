@@ -23,6 +23,18 @@ if (!globalThis.ResizeObserver) {
   } as unknown as typeof ResizeObserver;
 }
 
+// 日志抽屉打开即 fetch console SSE;本页用例 stub 一个返回单个 started 帧的流,验证「点日志→开抽屉→发起请求」。
+// (SSE 解析/事件/abort 的细粒度断言在 InstanceLogDrawer.test.tsx,这里只验页面联动。)
+const sseStartedStream = (): ReadableStream<Uint8Array> => {
+  const enc = new TextEncoder();
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(enc.encode('event: started\ndata: {"sessionId":"s1"}\n\n'));
+      controller.close();
+    },
+  });
+};
+
 // antd 在两个汉字按钮间插空格,带图标按钮的 accessible name 还含图标名;抹空白后用 includes 匹配。
 const byNormalizedName = (text: string) => (name: string) => name.replace(/\s/g, '').includes(text);
 
@@ -142,15 +154,15 @@ describe('InstancesPage', () => {
     expect(params.pageSize).toBeDefined();
   });
 
-  it('纯只读:无「添加」按钮、无行内编辑/删除/运维操作', async () => {
+  it('行操作仅「日志」:无「添加/编辑/删除」,无启动/停止/更新(本期未接)', async () => {
     render(<InstancesPage />);
     await screen.findByText('ns-online');
 
-    // 本期只读列表:不渲染添加 / 编辑 / 删除,也无行级运维动作(启动/停止/更新)。
+    // 不渲染添加 / 编辑 / 删除。
     expect(screen.queryByText('添加')).not.toBeInTheDocument();
     expect(screen.queryByText('编辑')).not.toBeInTheDocument();
     expect(screen.queryByText('删除')).not.toBeInTheDocument();
-    // 行内不出现运维动作按钮(本期不接)。
+    // 行内运维动作(启动/停止/更新)本期仍不接。
     const onlineRow = screen.getByText('ns-online').closest('tr')!;
     expect(within(onlineRow).queryByText('启动')).not.toBeInTheDocument();
     expect(within(onlineRow).queryByText('停止')).not.toBeInTheDocument();
@@ -230,5 +242,49 @@ describe('InstancesPage', () => {
     await waitFor(() => expect(listInstances).toHaveBeenCalled());
     // 失败时不渲染数据行;页面不抛(ProTable request 失败走 success:false)。
     expect(screen.queryByText('ns-online')).not.toBeInTheDocument();
+  });
+
+  // ── 行操作「日志」(P3-9):有 dir 可点 → 开抽屉发起 SSE;无 dir 禁用 ─────────────────
+  it('有 dir 的行「日志」按钮可点;点击打开日志抽屉并发起 SSE(POST 到该行 agentId)', async () => {
+    // 抽屉打开即 fetch console SSE;stub 返回单 started 帧的流,捕获入参验证按行 agentId 寻址。
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 200, body: sseStartedStream() }) as unknown as Response);
+    vi.stubGlobal('fetch', fetchMock);
+    sessionStorage.setItem('platform_token', 'tok-x');
+    try {
+      const user = userEvent.setup();
+      render(<InstancesPage />);
+      await screen.findByText('ns-online');
+
+      // 行 1(ns-online)有 dir → 「日志」按钮可点。
+      const onlineRow = screen.getByText('ns-online').closest('tr')!;
+      const logBtn = within(onlineRow).getByRole('button', { name: byNormalizedName('日志') });
+      expect(logBtn).toBeEnabled();
+
+      await user.click(logBtn);
+
+      // 抽屉打开:标题副标识 = 容器名;且对该行 agentId 发起 SSE。
+      expect(await screen.findByText('· container-admin')).toBeInTheDocument();
+      await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+      const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(url).toBe('/api/agents/ns-online/logs/stream');
+      const body = JSON.parse(init.body as string);
+      expect(body.dir).toBe('/data/orchidea/admin');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('无 dir 的行「日志」按钮禁用(发现未取到工程目录)', async () => {
+    // 行 2(ns-prod)的 dir 在 fixture 里有值;此处单独给一份 dir=null 的信封验证禁用态。
+    listInstances.mockResolvedValue({
+      ...instancesEnvelope,
+      rows: [{ ...instancesEnvelope.rows[1], dir: null }],
+      count: 1,
+    });
+    render(<InstancesPage />);
+    const row = (await screen.findByText('ns-prod')).closest('tr')!;
+    const logBtn = within(row).getByRole('button', { name: byNormalizedName('日志') });
+    // 无 dir → 禁用(tooltip 说明原因)。
+    expect(logBtn).toBeDisabled();
   });
 });
