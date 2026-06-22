@@ -1,9 +1,15 @@
 """节点聚合路由(Task 9b)。
 
-`GET /api/nodes`:节点页**权威源 = 平台 Service 表**(每行 = (agent×service)),组合三处:
-① Service 表静态(`dir`/`defaultImage`/`nacosServiceName` + LEFT JOIN namespace.code →
-`agentId`/`namespaceCode`);② hub 实时在线态(`hub_client.list_agents` 一次性拉全);
-③ 健康实例数(`hub_client.list_instances` per-(agent,service) 并发 fan-out)。
+`GET /api/nodes`:节点页**行集仍以平台 Service 表为准**(每行 = (agent×service)),组合四处:
+① Service 表静态(`serviceCode`/`nacosServiceName` + LEFT JOIN namespace.code → `agentId`/
+`namespaceCode`);② hub 实时在线态(`hub_client.list_agents` 一次性拉全);③ 健康实例数
+(`hub_client.list_instances` per-(agent,service) 并发 fan-out);④ **展示层 dir/defaultImage 的发现
+权威覆盖(P3-6)**:若该 (agent, nacosService) 有**唯一** active DiscoveredNode,则 dir/defaultImage
+优先显示其发现值(真值由 agent 发现而非手配),0 个回退 Service 值、多实例(>1)仍显示 Service 值
+(列表 per-service 无法择一,per-instance 列表归后续实例页 SPA 批次)。批量取齐当页 agent 的发现行、
+内存分组,避免逐行 N+1。
+注:**节点操作下发的寻址权威**(dir/image/containerId)已整体迁到 DiscoveredNode,见下方
+`_resolve_addressing`(本列表仅做展示层覆盖,完整 per-instance 列表后续 SPA 批次再做)。
 
 约束 / 不变式:
 - **响应全 camelCase**(评审 H2):`response_model=NodeListOut`,经 `*Out` 序列化,不手搓 dict。
@@ -30,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
@@ -174,16 +181,36 @@ async def list_nodes(
         # 异常(超时/HTTP错/任意 Exception)或 status!=success(_healthy_count 回 None)→ 该行 degraded。
         degraded_by_idx[idx] = count_or_none is None
 
+    # ④ 展示层「发现权威」(P3-6,尽量):dir / defaultImage 若该 (agent, nacosService) 有**唯一**
+    #    active DiscoveredNode,则优先显示其发现值(体现 dir/image 真值由 agent 发现而非手配);0 个 →
+    #    显示 Service 值(回退);**多实例(>1)→ 仍显示 Service 值**(列表是 per-service,无法择一,
+    #    per-instance 列表归后续实例页 SPA 批次)。一次性批量取齐当页所有 agent 的发现行,内存分组,
+    #    避免逐行 N+1(列表已对每行做 list_instances fan-out,不再叠加 N 次 DB 往返)。
+    page_agent_ids = {row.get("namespace_code") for row in rows if row.get("namespace_code")}
+    discovered_rows = store.list_discovered_nodes_for_agents(page_agent_ids, status="active")
+    # (agentId, nacosService) → 该组的发现行列表;仅 size==1 的组用于覆盖展示(唯一不歧义)。
+    discovered_groups: dict[tuple[str, str], list[Any]] = {}
+    for dn in discovered_rows:
+        if dn.nacos_service:  # 无 nacosService 的发现行无法对回 Service 行,跳过
+            discovered_groups.setdefault((dn.agent_id, dn.nacos_service), []).append(dn)
+
     out_rows: list[NodeOut] = []
     for i, row in enumerate(rows):
         agent = agents_map.get(row.get("namespace_code"))
+        # 默认展示 Service 台账值;有唯一 active DiscoveredNode 时用发现值覆盖 dir/image。
+        display_dir = row.get("dir")
+        display_image = row.get("default_image")
+        group = discovered_groups.get((row.get("namespace_code"), row.get("nacos_service_name")))
+        if group and len(group) == 1:
+            display_dir = group[0].dir
+            display_image = group[0].image
         out_rows.append(
             NodeOut(
                 agent_id=row.get("namespace_code") or "",
                 service_code=row["service_code"],
                 namespace_code=row.get("namespace_code"),
-                dir=row.get("dir"),
-                default_image=row.get("default_image"),
+                dir=display_dir,
+                default_image=display_image,
                 nacos_service_name=row.get("nacos_service_name"),
                 online=online_flags[i],
                 last_seen=agent.get("lastSeenAt") if agent else None,
@@ -202,14 +229,20 @@ async def list_nodes(
 
 
 # =====================================================================================
-# Task 10b:节点操作下发 + 操作审计
+# Task 10b:节点操作下发 + 操作审计  /  P3-6:寻址权威迁到 DiscoveredNode(发现权威)
 # =====================================================================================
 #
-# 寻址权威源 = 平台 Service 表:agentId(=namespace.code)+ serviceCode 反查得
-# dir / nacosServiceName / defaultImage。**BFF 绝不接受客户端传路径或任意 image**——
-# 这些一律由台账派生(防越权操作非授权目录 / 拉非白名单镜像)。requested_by 由 hub 据
-# admin token 服务端派生:BFF **绝不自报 requested_by**(S5 进程内化后,hub_client.dispatch_command
-# 固定传 requested_by_hint=None,handler 内 _derive_requested_by 据 token 得 platform-admin)。
+# 寻址的**权威源 = agent 自动发现上报的 DiscoveredNode**(`discovered_nodes`,承载 dir / image /
+# containerId / composeProject 的真值),**不是**手配的 `Service.dir/default_image`。Service 表只
+# 承载「逻辑服务 + nacosServiceName 入口」,其 dir/default_image **退化为迁移期回退**——仅当某
+# (agent, nacosService) 暂无 DiscoveredNode 时才用。解析两步:① _resolve_service 拿 Service 行
+# (404 早返 + nacosServiceName 入口 + 回退值);② 按 (agentId, nacosServiceName) 查 DiscoveredNode
+# (active),按 0 / 1 / 多 分支定位(见 _resolve_addressing)。
+#
+# **BFF 仍绝不接受客户端传路径或任意 image**——dir/image 一律由 DiscoveredNode(或回退 Service)派生
+# (防越权操作非授权目录 / 拉非白名单镜像)。requested_by 由 hub 据 admin token 服务端派生:BFF
+# **绝不自报 requested_by**(S5 进程内化后,hub_client.dispatch_command 固定传 requested_by_hint=None,
+# handler 内 _derive_requested_by 据 token 得 platform-admin)。
 
 
 def _resolve_service(agent_id: str, service_code: str) -> Service:
@@ -231,6 +264,98 @@ def _resolve_service(agent_id: str, service_code: str) -> Service:
     if not svc_rows:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "节点服务不在台账")
     return svc_rows[0]
+
+
+@dataclass(frozen=True)
+class _NodeAddressing:
+    """寻址解析结果(P3-6「发现权威」):节点操作据此派生 hub payload 的 dir / image / 工程对齐。
+
+    - `dir` / `image`:**优先取自 DiscoveredNode(权威)**,仅 (agent, nacosService) 暂无
+      DiscoveredNode 时回退 `Service.dir` / `Service.default_image`。
+    - `container_id`:DiscoveredNode 的真实容器 id(回退路径下为 None;当前 dispatch payload 暂不
+      消费它,留作将来逐实例精确操作)。
+    - `nacos_service_name`:= Service.nacos_service_name(逻辑服务入口,优雅路径校验/透传用)。
+    - `expected_compose_project`:优先 DiscoveredNode 的真实 `compose_project`(agent 发现的真值,
+      比从 dir basename 猜更准);DiscoveredNode 无此值 / 无 DiscoveredNode 时回退
+      `_compose_default_project(dir)` 启发式。供优雅 drain 做工程对齐守卫(matched)。
+    """
+
+    dir: str | None
+    image: str | None
+    container_id: str | None
+    nacos_service_name: str | None
+    expected_compose_project: str | None
+
+
+def _resolve_addressing(
+    agent_id: str, service_code: str, compose_project: str | None = None
+) -> _NodeAddressing:
+    """寻址解析(P3-6 核心):入口取 Service 行,权威值取自 agent 发现的 DiscoveredNode。
+
+    步骤:
+    ① `_resolve_service(agent_id, service_code)` 拿 Service 行(404 早返;提供 nacosServiceName 入口
+       与迁移期回退 dir/default_image)。
+    ② 按 `(agent_id, Service.nacos_service_name)` 查 DiscoveredNode(active):
+       - **0 个**(或 Service 无 nacosServiceName,无法按 nacos 收敛实例)→ 回退:dir/image 取
+         Service.dir/default_image,containerId 无,expectedComposeProject 走 dir 启发式。
+       - **1 个** → **权威**:dir/image/containerId 取自该 DiscoveredNode;expectedComposeProject 取
+         其真实 compose_project(为空再回退 dir 启发式)。
+       - **>1 个(多实例:同一 nacosService 多 compose 工程,如 admin / 2admin)** → 必须用
+         `compose_project` 指定其一:命中则按该实例定位;未带 compose_project → **409**;带了但无任何
+         实例匹配 → **404**(指定实例不存在)。
+
+    dir/image 一律**优先 DiscoveredNode,Service 仅回退**(发现权威,不可搞反)。
+    """
+    svc = _resolve_service(agent_id, service_code)
+    nacos = svc.nacos_service_name
+
+    # Service 无 nacosServiceName:无法按 nacos 把发现实例收敛到本逻辑服务 → 直接回退 Service 台账值
+    # (force 等只依赖 dir 的操作仍可用;优雅路径会因缺 nacos 在调用方早返 400)。
+    if not nacos:
+        return _NodeAddressing(
+            dir=svc.dir,
+            image=svc.default_image,
+            container_id=None,
+            nacos_service_name=nacos,
+            expected_compose_project=_compose_default_project(svc.dir),
+        )
+
+    discovered = store.list_discovered_nodes(agent_id, nacos, status="active")
+
+    if not discovered:
+        # 迁移期回退:该 (agent, nacosService) 尚无发现上报(agent 未升级 / 未上报)→ 用手配 Service 值。
+        return _NodeAddressing(
+            dir=svc.dir,
+            image=svc.default_image,
+            container_id=None,
+            nacos_service_name=nacos,
+            expected_compose_project=_compose_default_project(svc.dir),
+        )
+
+    if len(discovered) == 1:
+        dn = discovered[0]
+    else:
+        # 多实例:必须由 composeProject 指定操作哪一个 compose 工程的实例。
+        if not compose_project:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "该服务有多个实例(compose 工程),请指定 composeProject",
+            )
+        matched = [d for d in discovered if d.compose_project == compose_project]
+        if not matched:
+            # 指定了 composeProject 却无对应实例:目标实例不存在(404,语义同台账缺失,不暴露实例集)。
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "指定的 composeProject 无对应实例")
+        dn = matched[0]
+
+    # 命中单个 DiscoveredNode(1 个或多实例选中):dir/image/containerId 取发现权威值;
+    # expectedComposeProject 优先用发现的真实 compose_project,为空再回退 dir 启发式。
+    return _NodeAddressing(
+        dir=dn.dir,
+        image=dn.image,
+        container_id=dn.container_id,
+        nacos_service_name=nacos,
+        expected_compose_project=dn.compose_project or _compose_default_project(dn.dir),
+    )
 
 
 def _compose_default_project(dir_: str | None) -> str | None:
@@ -259,12 +384,15 @@ def _compose_default_project(dir_: str | None) -> str | None:
     return kept[start:] or None
 
 
-async def _derive_health_base_url(agent_id: str, nacos_service_name: str | None, dir_: str | None) -> str:
+async def _derive_health_base_url(
+    agent_id: str, nacos_service_name: str | None, expected_compose_project: str | None
+) -> str:
     """优雅 stop / redeploy 的 healthBaseUrl 派生(只选**本机** matched 健康实例)。
 
     `nacos_service_name` 缺失 → 400(优雅操作需配置 nacosServiceName);经 hub
-    `list_instances`(带从 `dir_` 推得的 `expectedComposeProject`)取实例,**过滤 healthy 且
-    matched** 后无实例 → 409(请用 force);否则取过滤后**第一个**实例的 address 拼 `http://<addr>`。
+    `list_instances`(带寻址解析出的 `expected_compose_project` —— P3-6 后优先来自 DiscoveredNode 的
+    真实 compose_project,无则回退 dir basename 启发式)取实例,**过滤 healthy 且 matched** 后无实例
+    → 409(请用 force);否则取过滤后**第一个**实例的 address 拼 `http://<addr>`。
 
     ⚠️ 为什么必须 matched(评审 #3/multi-node):nacos 是**集群级**注册中心,`healthy` 实例可能在
     **别的节点**;agent 恒置 `healthy=True`,只有 `matched` 反映「该容器在**本机**找到(端口/IP 匹配,
@@ -279,9 +407,11 @@ async def _derive_health_base_url(agent_id: str, nacos_service_name: str | None,
     """
     if not nacos_service_name:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "优雅操作需配置 nacosServiceName")
-    # 把 dir 推得的 compose 默认工程名作为 expected 传下去:matched 由此同时校验「本机 + 同 compose 工程」。
-    expected_project = _compose_default_project(dir_)
-    r = await hub_client.list_instances(agent_id, nacos_service_name, expected_compose_project=expected_project)
+    # expected_compose_project 由寻址解析给出(P3-6:优先 DiscoveredNode 真实工程名,无则 dir 启发式),
+    # 作为 expected 传下去:matched 由此同时校验「本机 + 同 compose 工程」。
+    r = await hub_client.list_instances(
+        agent_id, nacos_service_name, expected_compose_project=expected_compose_project
+    )
     # 评审 #3:只选 healthy **且** matched(本机)的实例;别节点(matched=False)的 healthy 实例一律排除。
     local_healthy = [
         i
@@ -299,7 +429,7 @@ async def _derive_health_base_url(agent_id: str, nacos_service_name: str | None,
     "/{agent_id}/{service_code}/{action}",
     response_model=NodeActionOut,
     summary="节点操作下发",
-    description="对某 (agent×service) 下发 启动/停止/重启/重部署;dir/nacosServiceName/image 由 Service 表权威派生;优雅 restart 走 hub 滚动重启,其余走 hub dispatch;requested_by 由 hub 派生。",
+    description="对某 (agent×service) 下发 启动/停止/重启/重部署;dir/image 优先取 agent 发现的 DiscoveredNode(权威),仅无发现时回退 Service 台账;多实例须传 composeProject;优雅 restart 走 hub 滚动重启,其余走 hub dispatch;requested_by 由 hub 派生。",
 )
 async def dispatch_node_action(
     body: NodeActionIn,
@@ -308,11 +438,13 @@ async def dispatch_node_action(
     action: Literal["start", "stop", "restart", "redeploy"] = Path(title="操作(start/stop/restart/redeploy)"),
     _: str = Depends(require_session),
 ) -> NodeActionOut:
-    # ① 台账寻址(404 早返,先于任何 hub 调用)。
-    svc = _resolve_service(agent_id, service_code)
-    dir_ = svc.dir
-    nacos = svc.nacos_service_name
-    default_image = svc.default_image
+    # ① 寻址解析(404 早返 + 多实例 409,先于任何 hub 调用)。P3-6「发现权威」:dir/image 优先取
+    #    agent 发现的 DiscoveredNode,仅该 (agent, nacosService) 无发现时回退手配 Service.dir/default_image;
+    #    同一 nacosService 多实例(多 compose 工程)须由 body.composeProject 指定其一(否则 409)。
+    addr = _resolve_addressing(agent_id, service_code, body.compose_project)
+    dir_ = addr.dir
+    nacos = addr.nacos_service_name
+    default_image = addr.image
     mode = body.mode
 
     # ② mode 必填校验:stop / redeploy 须显式 mode;restart 缺省按 graceful;start 忽略 mode。
@@ -339,7 +471,7 @@ async def dispatch_node_action(
         elif action == "stop" and effective_mode == "force":
             payload.update(action="stop", mode="force", serviceName=nacos, allowLastInstance=body.allow_last_instance)
         elif action == "stop":  # graceful stop
-            health_base_url = await _derive_health_base_url(agent_id, nacos, dir_)
+            health_base_url = await _derive_health_base_url(agent_id, nacos, addr.expected_compose_project)
             payload.update(action="stop", mode="graceful", healthBaseUrl=health_base_url, shutdownTimeoutSec=_GRACEFUL_SHUTDOWN_TIMEOUT_SEC, serviceName=nacos)
         elif action == "redeploy" and effective_mode == "force":
             if not default_image:
@@ -348,7 +480,7 @@ async def dispatch_node_action(
         else:  # redeploy graceful
             if not default_image:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, "重部署需配置 defaultImage")
-            health_base_url = await _derive_health_base_url(agent_id, nacos, dir_)
+            health_base_url = await _derive_health_base_url(agent_id, nacos, addr.expected_compose_project)
             payload.update(action="pull-redeploy", mode="graceful", image=default_image, healthBaseUrl=health_base_url, shutdownTimeoutSec=_GRACEFUL_SHUTDOWN_TIMEOUT_SEC)
 
         resp = await hub_client.dispatch_command(agent_id, payload)

@@ -22,11 +22,13 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 
 import app.hub_client as hc
 import app.routers.nodes as nodes
 from app import store
 from app.db_models import Namespace, Service
+from app.hub.db_models import DiscoveredNodeModel
 from fastapi.testclient import TestClient
 
 
@@ -94,6 +96,44 @@ def _mk_svc(namespace_id: int, service_code: str, *, nacos: str | None = None) -
             "dir": f"/opt/{service_code}",
             "default_image": f"registry/{service_code}:1.0",
             "nacos_service_name": nacos,
+        },
+    ).id
+
+
+def _mk_discovered(
+    agent_id: str,
+    nacos_service: str,
+    *,
+    container_name: str,
+    dir_: str | None = None,
+    image: str | None = None,
+    container_id: str | None = None,
+    compose_project: str | None = None,
+    status: str = "active",
+) -> int:
+    """直接经 store 落一条 DiscoveredNode(模拟 agent 发现上报已落库),返回 id。
+
+    P3-6「发现权威」:节点操作寻址优先取这里的 dir/image/containerId(权威),仅无发现行时回退
+    Service 台账值。heartbeat_at / first_seen_at 是 NOT NULL 无默认列,须显式给(create_row 仅自动
+    补 created_at/updated_at)。
+    """
+    now = datetime.now(timezone.utc)
+    return store.create_row(
+        DiscoveredNodeModel,
+        {
+            "agent_id": agent_id,
+            "container_name": container_name,
+            "container_id": container_id,
+            "compose_project": compose_project,
+            "compose_service": "app",
+            "dir": dir_,
+            "image": image,
+            "running": True,
+            "nacos_service": nacos_service,
+            "healthy": True,
+            "status": status,
+            "heartbeat_at": now,
+            "first_seen_at": now,
         },
     ).id
 
@@ -340,6 +380,52 @@ def test_nodes_pagination(client: TestClient, monkeypatch) -> None:
 def test_nodes_requires_auth(client: TestClient) -> None:
     # 无 Bearer → default-deny 中间件 / require_session 401。
     assert client.get("/api/nodes").status_code == 401
+
+
+def test_nodes_list_shows_discovered_dir_image_when_single(client: TestClient, monkeypatch) -> None:
+    # 列表展示「发现权威」(P3-6):该 (agent, nacosService) 有**唯一** active DiscoveredNode →
+    # dir/defaultImage 显示发现值(覆盖 Service 台账值)。
+    h = _h(client)
+    ns = _mk_ns("agent-ld")
+    _mk_svc(ns, "svc-ld", nacos="ld-nacos")  # Service.dir=/opt/svc-ld image=registry/svc-ld:1.0
+    _mk_discovered("agent-ld", "ld-nacos", container_name="c1", dir_="/srv/disc-ld", image="reg/disc:5")
+
+    monkeypatch.setattr(nodes.hub_client, "list_agents", _aval([_agent("agent-ld")]))
+    monkeypatch.setattr(nodes.hub_client, "list_instances", _aval(_instances(True)))
+
+    row = client.get("/api/nodes", headers=h).json()["rows"][0]
+    assert row["dir"] == "/srv/disc-ld"  # 发现权威覆盖展示
+    assert row["defaultImage"] == "reg/disc:5"
+
+
+def test_nodes_list_multi_instance_keeps_service_value(client: TestClient, monkeypatch) -> None:
+    # 列表展示:多实例(同 nacosService 多 compose 工程)无法择一 → 展示仍回退 Service 值
+    # (per-instance 列表归后续实例页 SPA 批次)。
+    h = _h(client)
+    ns = _mk_ns("agent-lm")
+    _mk_svc(ns, "svc-lm", nacos="lm-nacos")  # Service.dir=/opt/svc-lm
+    _mk_discovered("agent-lm", "lm-nacos", container_name="admin", compose_project="admin", dir_="/srv/admin")
+    _mk_discovered("agent-lm", "lm-nacos", container_name="2admin", compose_project="2admin", dir_="/srv/2admin")
+
+    monkeypatch.setattr(nodes.hub_client, "list_agents", _aval([_agent("agent-lm")]))
+    monkeypatch.setattr(nodes.hub_client, "list_instances", _aval(_instances(True)))
+
+    row = client.get("/api/nodes", headers=h).json()["rows"][0]
+    assert row["dir"] == "/opt/svc-lm"  # 多实例不择一,展示 Service 值
+
+
+def test_nodes_list_no_discovered_keeps_service_value(client: TestClient, monkeypatch) -> None:
+    # 列表展示:无 DiscoveredNode → 回退展示 Service 台账值(与迁移前一致)。
+    h = _h(client)
+    ns = _mk_ns("agent-ln")
+    _mk_svc(ns, "svc-ln", nacos="ln-nacos")  # dir=/opt/svc-ln image=registry/svc-ln:1.0
+
+    monkeypatch.setattr(nodes.hub_client, "list_agents", _aval([_agent("agent-ln")]))
+    monkeypatch.setattr(nodes.hub_client, "list_instances", _aval(_instances(True)))
+
+    row = client.get("/api/nodes", headers=h).json()["rows"][0]
+    assert row["dir"] == "/opt/svc-ln"
+    assert row["defaultImage"] == "registry/svc-ln:1.0"
 
 
 # =====================================================================================
@@ -783,6 +869,263 @@ def test_op_rolling_failure_maps_502(client: TestClient, monkeypatch) -> None:
 def test_op_requires_auth(client: TestClient) -> None:
     # 无 Bearer → 401(纵深防御 + require_session)。
     assert client.post("/api/nodes/a/b/start", json={}).status_code == 401
+
+
+# =====================================================================================
+# P3-6:寻址权威迁到 DiscoveredNode(发现权威)
+# =====================================================================================
+#
+# dir / image / containerId 的权威源 = agent 自动发现上报的 DiscoveredNode,Service.dir/default_image
+# 退化为「该 (agent, nacosService) 暂无 DiscoveredNode 时」的迁移期回退。下面用例 seed DiscoveredNode
+# 行(经 _mk_discovered)验证:有发现行 → 取发现值(即便 Service 值不同/为空);多实例(同 nacosService
+# 多 compose 工程)须 composeProject 消歧;无发现行 → 回退 Service;Service 也空 → 现有「需配置」仍成立。
+
+
+def test_op_dispatch_uses_discovered_dir_over_service(client: TestClient, monkeypatch) -> None:
+    # 发现权威(核心):Service.dir=/opt/svc-dn,但 DiscoveredNode.dir=/srv/real/path →
+    # dispatch payload 的 dir 必须取**发现值** /srv/real/path(不是 Service 值)。
+    h = _h(client)
+    ns = _mk_ns("agent-dn")
+    _mk_svc(ns, "svc-dn", nacos="dn-nacos")  # _mk_svc 默认 dir=/opt/svc-dn
+    _mk_discovered("agent-dn", "dn-nacos", container_name="c1", dir_="/srv/real/path", image="reg/real:9")
+
+    box = {}
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch(box))
+    resp = client.post("/api/nodes/agent-dn/svc-dn/restart", json={"mode": "force"}, headers=h)
+    assert resp.status_code == 200
+    # dir 取自 DiscoveredNode(权威),而非 Service.dir
+    assert box["payload"]["dir"] == "/srv/real/path"
+
+
+def test_op_dispatch_uses_discovered_dir_when_service_dir_empty(client: TestClient, monkeypatch) -> None:
+    # 发现权威边界:Service.dir 为空(None)但 DiscoveredNode.dir 有值 → 仍用发现值,不因 Service 空而失败。
+    h = _h(client)
+    ns = _mk_ns("agent-dne")
+    # Service.dir=None(覆盖 _mk_svc 默认),仅配 nacos
+    store.create_row(
+        Service,
+        {"namespace_id": ns, "service_code": "svc-dne", "dir": None, "default_image": None, "nacos_service_name": "dne-nacos"},
+    )
+    _mk_discovered("agent-dne", "dne-nacos", container_name="c1", dir_="/srv/discovered")
+
+    box = {}
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch(box))
+    resp = client.post("/api/nodes/agent-dne/svc-dne/start", json={}, headers=h)
+    assert resp.status_code == 200
+    assert box["payload"]["dir"] == "/srv/discovered"
+
+
+def test_op_redeploy_force_uses_discovered_image_over_service(client: TestClient, monkeypatch) -> None:
+    # 发现权威(image):redeploy force 的 image 取 DiscoveredNode.image,而非 Service.default_image。
+    h = _h(client)
+    ns = _mk_ns("agent-dni")
+    _mk_svc(ns, "svc-dni", nacos="dni-nacos")  # Service.default_image=registry/svc-dni:1.0
+    _mk_discovered("agent-dni", "dni-nacos", container_name="c1", dir_="/srv/x", image="registry/discovered:7")
+
+    box = {}
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch(box))
+    resp = client.post("/api/nodes/agent-dni/svc-dni/redeploy", json={"mode": "force"}, headers=h)
+    assert resp.status_code == 200
+    p = box["payload"]
+    assert p["image"] == "registry/discovered:7"  # 发现权威
+    assert p["dir"] == "/srv/x"
+
+
+def test_op_dispatch_falls_back_to_service_when_no_discovered(client: TestClient, monkeypatch) -> None:
+    # 回退(迁移期):该 (agent, nacosService) 无任何 DiscoveredNode → dir/image 取 Service 台账值。
+    h = _h(client)
+    ns = _mk_ns("agent-fb")
+    _mk_svc(ns, "svc-fb", nacos="fb-nacos")  # dir=/opt/svc-fb image=registry/svc-fb:1.0
+    # 不 seed 任何 DiscoveredNode
+
+    box = {}
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch(box))
+    resp = client.post("/api/nodes/agent-fb/svc-fb/redeploy", json={"mode": "force"}, headers=h)
+    assert resp.status_code == 200
+    p = box["payload"]
+    assert p["dir"] == "/opt/svc-fb"  # 回退 Service.dir
+    assert p["image"] == "registry/svc-fb:1.0"  # 回退 Service.default_image
+
+
+def test_op_dispatch_no_discovered_and_service_empty_still_400(client: TestClient, monkeypatch) -> None:
+    # 回退且 Service 也空:redeploy force 无 DiscoveredNode 且 Service.default_image=None → 现有「需配置 defaultImage」400 仍成立。
+    h = _h(client)
+    ns = _mk_ns("agent-fb0")
+    store.create_row(
+        Service,
+        {"namespace_id": ns, "service_code": "svc-fb0", "dir": "/opt/svc-fb0", "default_image": None, "nacos_service_name": "fb0-nacos"},
+    )
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _amust_not_call("无 image 不应 dispatch"))
+    resp = client.post("/api/nodes/agent-fb0/svc-fb0/redeploy", json={"mode": "force"}, headers=h)
+    assert resp.status_code == 400
+
+
+def test_op_multi_instance_without_compose_project_409(client: TestClient, monkeypatch) -> None:
+    # 多实例(同一 nacosService 两个 compose 工程)+ 不带 composeProject → 409(请指定 composeProject)。
+    h = _h(client)
+    ns = _mk_ns("agent-mi")
+    _mk_svc(ns, "svc-mi", nacos="mi-nacos")
+    _mk_discovered("agent-mi", "mi-nacos", container_name="admin", compose_project="admin", dir_="/srv/admin")
+    _mk_discovered("agent-mi", "mi-nacos", container_name="2admin", compose_project="2admin", dir_="/srv/2admin")
+
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _amust_not_call("多实例未消歧不应 dispatch"))
+    resp = client.post("/api/nodes/agent-mi/svc-mi/start", json={}, headers=h)
+    assert resp.status_code == 409
+
+
+def test_op_multi_instance_with_compose_project_hits_that_instance(client: TestClient, monkeypatch) -> None:
+    # 多实例 + 带 composeProject → 命中该实例的 dir(按 composeProject 定位到指定 compose 工程那一行)。
+    h = _h(client)
+    ns = _mk_ns("agent-mi2")
+    _mk_svc(ns, "svc-mi2", nacos="mi2-nacos")
+    _mk_discovered("agent-mi2", "mi2-nacos", container_name="admin", compose_project="admin", dir_="/srv/admin")
+    _mk_discovered("agent-mi2", "mi2-nacos", container_name="2admin", compose_project="2admin", dir_="/srv/2admin")
+
+    box = {}
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch(box))
+    resp = client.post(
+        "/api/nodes/agent-mi2/svc-mi2/start", json={"composeProject": "2admin"}, headers=h
+    )
+    assert resp.status_code == 200
+    assert box["payload"]["dir"] == "/srv/2admin"  # 命中指定 compose 工程那一实例
+
+
+def test_op_multi_instance_unknown_compose_project_404(client: TestClient, monkeypatch) -> None:
+    # 多实例 + 指定了不存在的 composeProject → 404(目标实例不存在,语义同台账缺失)。
+    h = _h(client)
+    ns = _mk_ns("agent-mi3")
+    _mk_svc(ns, "svc-mi3", nacos="mi3-nacos")
+    _mk_discovered("agent-mi3", "mi3-nacos", container_name="admin", compose_project="admin", dir_="/srv/admin")
+    _mk_discovered("agent-mi3", "mi3-nacos", container_name="2admin", compose_project="2admin", dir_="/srv/2admin")
+
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _amust_not_call("无匹配实例不应 dispatch"))
+    resp = client.post(
+        "/api/nodes/agent-mi3/svc-mi3/start", json={"composeProject": "nope"}, headers=h
+    )
+    assert resp.status_code == 404
+
+
+def test_op_stale_discovered_ignored_falls_back(client: TestClient, monkeypatch) -> None:
+    # 仅有 stale 的 DiscoveredNode(已缺席)→ 不计入寻址(只取 active)→ 回退 Service.dir。
+    h = _h(client)
+    ns = _mk_ns("agent-st")
+    _mk_svc(ns, "svc-st", nacos="st-nacos")  # dir=/opt/svc-st
+    _mk_discovered("agent-st", "st-nacos", container_name="c1", dir_="/srv/stale", status="stale")
+
+    box = {}
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch(box))
+    resp = client.post("/api/nodes/agent-st/svc-st/start", json={}, headers=h)
+    assert resp.status_code == 200
+    assert box["payload"]["dir"] == "/opt/svc-st"  # stale 不算,回退 Service
+
+
+def test_op_stop_graceful_expected_project_from_discovered(client: TestClient, monkeypatch) -> None:
+    # 发现权威(expectedComposeProject):有唯一 DiscoveredNode 时,优雅 drain 传给 list_instances 的
+    # expectedComposeProject 取 DiscoveredNode 的真实 compose_project(而非从 Service.dir basename 猜)。
+    # Service.dir=/opt/svc-ep(dir 启发式会得 svc-ep),但 DiscoveredNode.compose_project=real-proj →
+    # 应传 real-proj,证明权威来自发现值而非 dir 启发式。
+    h = _h(client)
+    ns = _mk_ns("agent-ep")
+    _mk_svc(ns, "svc-ep", nacos="ep-nacos")  # dir=/opt/svc-ep
+    _mk_discovered(
+        "agent-ep", "ep-nacos", container_name="c1", dir_="/whatever", compose_project="real-proj"
+    )
+
+    captured = {}
+
+    def sync_list_instances(agent_id, service_name, expected_compose_project=None, **kw):
+        captured["expected"] = expected_compose_project
+        return {"status": "success", "instances": [{"address": "10.0.0.3", "healthy": True, "matched": True}]}
+
+    monkeypatch.setattr(nodes.hub_client, "list_instances", _afn(sync_list_instances))
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch({}))
+
+    resp = client.post("/api/nodes/agent-ep/svc-ep/stop", json={"mode": "graceful"}, headers=h)
+    assert resp.status_code == 200
+    assert captured["expected"] == "real-proj"  # 取自 DiscoveredNode.compose_project(发现权威)
+
+
+def test_op_stop_graceful_expected_project_falls_back_to_dir_heuristic(client: TestClient, monkeypatch) -> None:
+    # 回退:DiscoveredNode.compose_project 为空时,expectedComposeProject 回退 dir basename 启发式
+    # (此处用发现 dir;无发现行的回退已由 test_op_stop_graceful_passes_expected_compose_project 覆盖)。
+    h = _h(client)
+    ns = _mk_ns("agent-epf")
+    _mk_svc(ns, "svc-epf", nacos="epf-nacos")
+    # 发现行存在但 compose_project=None,dir=/opt/My_Svc-01 → 回退启发式得 my_svc-01
+    _mk_discovered("agent-epf", "epf-nacos", container_name="c1", dir_="/opt/My_Svc-01", compose_project=None)
+
+    captured = {}
+
+    def sync_list_instances(agent_id, service_name, expected_compose_project=None, **kw):
+        captured["expected"] = expected_compose_project
+        return {"status": "success", "instances": [{"address": "10.0.0.4", "healthy": True, "matched": True}]}
+
+    monkeypatch.setattr(nodes.hub_client, "list_instances", _afn(sync_list_instances))
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch({}))
+
+    resp = client.post("/api/nodes/agent-epf/svc-epf/stop", json={"mode": "graceful"}, headers=h)
+    assert resp.status_code == 200
+    assert captured["expected"] == "my_svc-01"  # compose_project 为空 → 回退发现 dir 的 basename 启发式
+
+
+def test_resolve_addressing_single_discovered_authority(client: TestClient) -> None:
+    # 直接单测寻址解析:唯一 active DiscoveredNode → dir/image/containerId/expectedComposeProject 全取发现值。
+    ns = _mk_ns("agent-ra")
+    _mk_svc(ns, "svc-ra", nacos="ra-nacos")  # Service.dir=/opt/svc-ra image=registry/svc-ra:1.0
+    _mk_discovered(
+        "agent-ra", "ra-nacos", container_name="c1", dir_="/srv/auth", image="reg/auth:1",
+        container_id="cid-abc", compose_project="proj-x",
+    )
+    addr = nodes._resolve_addressing("agent-ra", "svc-ra")
+    assert addr.dir == "/srv/auth"
+    assert addr.image == "reg/auth:1"
+    assert addr.container_id == "cid-abc"
+    assert addr.nacos_service_name == "ra-nacos"
+    assert addr.expected_compose_project == "proj-x"
+
+
+def test_resolve_addressing_no_nacos_falls_back_to_service(client: TestClient) -> None:
+    # Service 无 nacosServiceName → 无法按 nacos 收敛实例 → 直接回退 Service 台账值(dir/image),containerId 无。
+    ns = _mk_ns("agent-rann")
+    store.create_row(
+        Service,
+        {"namespace_id": ns, "service_code": "svc-rann", "dir": "/opt/no-nacos", "default_image": "reg/nn:1", "nacos_service_name": None},
+    )
+    # 即便库里有同 agent 的发现行,Service 无 nacos 也走回退(无法对回)
+    _mk_discovered("agent-rann", "some-nacos", container_name="c1", dir_="/srv/ignored")
+    addr = nodes._resolve_addressing("agent-rann", "svc-rann")
+    assert addr.dir == "/opt/no-nacos"  # 回退 Service
+    assert addr.image == "reg/nn:1"
+    assert addr.container_id is None
+    assert addr.nacos_service_name is None
+
+
+def test_store_list_discovered_nodes_for_agents_queries(client: TestClient) -> None:
+    # 直接覆盖批量查询封装:空入参短路回 [](不发空 IN);有入参按 agent_id IN + status 过滤。
+    assert store.list_discovered_nodes_for_agents([]) == []  # 空 agent_ids 短路
+    _mk_ns("agent-bq")
+    _mk_discovered("agent-bq", "bq-nacos", container_name="c1", dir_="/srv/a")
+    _mk_discovered("agent-bq", "bq-nacos", container_name="c2", dir_="/srv/b", status="stale")
+    _mk_discovered("agent-other", "x-nacos", container_name="c3", dir_="/srv/c")
+
+    # 默认只取 active,且按 agent_id IN 过滤掉 agent-other。
+    active = store.list_discovered_nodes_for_agents(["agent-bq"])
+    assert {r.container_name for r in active} == {"c1"}
+    # status=None → 取全集(含 stale)。
+    all_rows = store.list_discovered_nodes_for_agents(["agent-bq"], status=None)
+    assert {r.container_name for r in all_rows} == {"c1", "c2"}
+
+
+def test_store_list_discovered_nodes_status_none_includes_stale(client: TestClient) -> None:
+    # list_discovered_nodes 的 status=None 分支:取全集(含 stale);默认 active 只取活跃行。
+    _mk_ns("agent-sn")
+    _mk_discovered("agent-sn", "sn-nacos", container_name="a", dir_="/srv/a")
+    _mk_discovered("agent-sn", "sn-nacos", container_name="b", dir_="/srv/b", status="stale")
+
+    active = store.list_discovered_nodes("agent-sn", "sn-nacos")
+    assert {r.container_name for r in active} == {"a"}
+    all_rows = store.list_discovered_nodes("agent-sn", "sn-nacos", status=None)
+    assert {r.container_name for r in all_rows} == {"a", "b"}
 
 
 # --- 操作审计 GET /api/node-operations(代理 hub /api/commands,limit/offset↔page/pageSize) --------

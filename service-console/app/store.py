@@ -31,6 +31,9 @@ from app.db_models import (
     ServicePlugin,
     ServicePluginVersion,
 )
+# 发现上报落地表(P3-4)模型在 hub 命名空间;合并后与 console 共用同一 DB / session_factory,
+# 故节点寻址(P3-6「发现权威」)直接经本 store 的 _db() 查询,无需另立 hub 侧查询入口。
+from app.hub.db_models import DiscoveredNodeModel
 
 
 ModelT = TypeVar("ModelT")
@@ -132,6 +135,56 @@ def find_rows(model: type[ModelT], *, filters: Sequence[Any], limit: int | None 
             stmt = stmt.where(cond)
         if limit is not None:
             stmt = stmt.limit(limit)
+        return list(session.execute(stmt).scalars().all())
+
+
+def list_discovered_nodes(
+    agent_id: str,
+    nacos_service: str | None = None,
+    status: str | None = "active",
+) -> list[DiscoveredNodeModel]:
+    """查某 agent(可再按 nacosService)名下 agent 自动发现上报的 DiscoveredNode 行(P3-6「发现权威」)。
+
+    节点操作的寻址权威源是 agent 周期发现上报、已落库的 `discovered_nodes`(承载 dir / image /
+    containerId / composeProject 的**真值**),而非手配的 `Service.dir/default_image`(后者退化为
+    迁移期回退)。本查询供寻址解析(及将来实例页)按 (agentId[, nacosService]) 取候选实例。
+
+    - `agent_id`:必填,= namespace.code(= agent 注册标识)。
+    - `nacos_service`:可选,按 `nacos_service` 列再过滤(寻址按 Service.nacos_service_name 收敛实例)。
+    - `status`:默认 `"active"`(只取本轮上报命中的活跃行,排除缺席被标 stale 的旧行);传 `None`
+      则不按 status 过滤(取全集,含 stale)。
+
+    返回 ORM 行列表(按 id 升序,稳定顺序)。一个 nacosService 名下有多行(不同 composeProject /
+    dir,如 admin / 2admin 两 compose 工程)是**正常的多实例**,由调用方按 composeProject 定位,
+    不在此处去歧义。
+    """
+    filters: list[Any] = [DiscoveredNodeModel.agent_id == agent_id]
+    if nacos_service is not None:
+        filters.append(DiscoveredNodeModel.nacos_service == nacos_service)
+    if status is not None:
+        filters.append(DiscoveredNodeModel.status == status)
+    with _db().session_factory() as session:
+        stmt = select(DiscoveredNodeModel).where(*filters).order_by(DiscoveredNodeModel.id.asc())
+        return list(session.execute(stmt).scalars().all())
+
+
+def list_discovered_nodes_for_agents(
+    agent_ids: Sequence[str], status: str | None = "active"
+) -> list[DiscoveredNodeModel]:
+    """**批量**取一组 agent 名下的 DiscoveredNode 行(节点列表页展示「发现权威」用,避免逐行 N+1)。
+
+    节点列表每行已按行做 list_instances fan-out;若再逐行查 DiscoveredNode 会叠加 N 次 DB 往返。
+    本函数一次性按 `agent_id IN (...)` 取齐当页所有 agent 的发现行,路由层在内存按
+    (agentId, nacosService) 分组后用于覆盖 dir/image 展示值。`agent_ids` 为空 → 直接返回 `[]`
+    (不发空 IN 查询)。`status` 默认 `"active"`,传 `None` 不按 status 过滤。
+    """
+    if not agent_ids:
+        return []
+    filters: list[Any] = [DiscoveredNodeModel.agent_id.in_(list(agent_ids))]
+    if status is not None:
+        filters.append(DiscoveredNodeModel.status == status)
+    with _db().session_factory() as session:
+        stmt = select(DiscoveredNodeModel).where(*filters).order_by(DiscoveredNodeModel.id.asc())
         return list(session.execute(stmt).scalars().all())
 
 

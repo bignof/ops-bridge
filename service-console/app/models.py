@@ -402,18 +402,24 @@ class NodeListOut(ListEnvelope[NodeOut]):
 
 
 class NodeActionIn(BaseModel):
-    """节点操作请求 body:`{mode?, allowLastInstance?}`。
+    """节点操作请求 body:`{mode?, allowLastInstance?, composeProject?}`。
 
-    寻址(agentId / serviceCode / action)走 URL 路径段,**dir / nacosServiceName /
-    defaultImage 一律由平台 Service 表权威派生**,故 body 不含路径与 image(防客户端传任意路径
-    或镜像)。`mode`:restart 缺省按 graceful;stop / redeploy 必填(路由层校验,缺省 → 400)。
+    寻址(agentId / serviceCode / action)走 URL 路径段;**dir / image / containerId 的权威源是
+    agent 自动发现上报的 DiscoveredNode**(P3-6「发现权威」),客户端仍不传路径或 image(防越权操作
+    非授权目录 / 拉非白名单镜像)——平台据 (agentId, Service.nacosServiceName) 反查 DiscoveredNode
+    取权威值,仅在该 (agent, nacosService) 暂无 DiscoveredNode 时回退手配的 `Service.dir/defaultImage`。
+    `mode`:restart 缺省按 graceful;stop / redeploy 必填(路由层校验,缺省 → 400)。
     `allowLastInstance` 仅 force stop 透传给 hub 护栏(允许停最后一个健康实例)。
+    `composeProject`:**多实例消歧用**——同一 nacosService 名下存在多个 DiscoveredNode(不同
+    compose 工程,如 admin / 2admin)时,必须用它指定要操作的那一个实例;单实例 / 回退场景可不传
+    (寻址解析:多实例缺 composeProject → 409)。
     """
 
     model_config = MODEL_CONFIG
 
     mode: Literal["graceful", "force"] | None = None
     allow_last_instance: bool = False
+    compose_project: str | None = None
 
 
 class NodeActionOut(BaseModel):
