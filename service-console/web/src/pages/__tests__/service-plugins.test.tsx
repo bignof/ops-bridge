@@ -3,27 +3,31 @@ import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import ServicePluginsPage from '../ServicePluginsPage';
 
-// mock 资源层:服务插件页所有数据访问都走 ../../api/resources。
-// list 按 resource 路由:
-//  - 'service-plugins' → ProTable 列表行(列用后端 JOIN 回的可读名)
-//  - 'namespaces'      → 命名空间关联选择 options
-//  - 'services'        → 服务级联 options(**必须带 ?namespaceId= 服务端过滤参数**)
-//  - 'plugins'         → 插件级联 options
+// mock 资源层:服务配置(二级页)所有数据访问都走 ../../api/resources。
+//  - list('services')                         → 顶部「选服务」下拉
+//  - list('service-plugins', {serviceId})     → 选定服务的绑定行(源真相,后端不回版本)
+//  - listReleases({...})                      → releases 主表(join 出每绑定「当前版本」)
+//  - list('plugins')                          → 「绑定插件」弹窗候选(剔除已绑)
+//  - create('service-plugins', {...})         → 绑定
+//  - remove('service-plugins', id)            → 解绑
+//  - listReleaseHistory({serviceId,pluginId}) → 「改版本」抽屉的版本历史
+//  - reactivate({spvId})                      → 改版本(重新激活历史版本)
 const list = vi.fn();
+const listReleases = vi.fn();
+const listReleaseHistory = vi.fn();
 const create = vi.fn();
-const update = vi.fn();
 const remove = vi.fn();
+const reactivate = vi.fn();
 vi.mock('../../api/resources', () => ({
   list: (...a: unknown[]) => list(...a),
+  listReleases: (...a: unknown[]) => listReleases(...a),
+  listReleaseHistory: (...a: unknown[]) => listReleaseHistory(...a),
   create: (...a: unknown[]) => create(...a),
-  update: (...a: unknown[]) => update(...a),
   remove: (...a: unknown[]) => remove(...a),
+  reactivate: (...a: unknown[]) => reactivate(...a),
 }));
 
-// antd 在两个汉字按钮间插空格,带图标按钮的 accessible name 还含图标名;抹空白后用 includes 匹配。
-const byNormalizedName = (text: string) => (name: string) => name.replace(/\s/g, '').includes(text);
-
-// jsdom 不实现以下 API,antd Select 的虚拟列表/滚动会调用,补最小 stub 保证下拉可交互、用例稳定。
+// jsdom 不实现以下 API,antd Select/Drawer/Modal(虚拟列表/portal/滚动锁)会调用,补最小 stub 保证可交互。
 if (!HTMLElement.prototype.scrollIntoView) {
   HTMLElement.prototype.scrollIntoView = () => {};
 }
@@ -35,105 +39,103 @@ if (!globalThis.ResizeObserver) {
   } as unknown as typeof ResizeObserver;
 }
 
-// 列表信封:列直接用后端 JOIN 回的 namespaceCode / serviceCode / pluginCode(不客户端拼 id→名)。
-// P1a service-plugins list 关联回 serviceCode(非 serviceName),服务列据此渲染。
-const servicePluginsEnvelope = {
-  count: 1,
-  rows: [
-    {
-      id: 11,
-      namespaceCode: 'ns-demo',
-      serviceCode: 'svc-demo',
-      pluginCode: 'plugin-demo',
-    },
-  ],
+// antd 在两个汉字按钮间插空格,带图标按钮的 accessible name 还含图标名;抹空白后用 includes 匹配。
+const byNormalizedName = (text: string) => (name: string) => name.replace(/\s/g, '').includes(text);
+
+// 信封工厂:统一 {count, rows, page, pageSize, totalPage}。
+const envelope = <T,>(rows: T[]) => ({
+  count: rows.length,
+  rows,
   page: 1,
-  pageSize: 20,
+  pageSize: 200,
   totalPage: 1,
-};
+});
 
-// 两个命名空间:A1 级联清空用例需切换父级,验证下级被清(单命名空间无法观测切换)。
-const namespacesEnvelope = {
-  count: 2,
-  rows: [
-    { id: 1, code: 'ns-demo', name: '演示命名空间' },
-    { id: 10, code: 'ns-other', name: '另一命名空间' },
-  ],
-  page: 1,
-  pageSize: 100,
-  totalPage: 1,
-};
+// 服务列表(顶部选服务):svc-demo(id=2) / svc-other(id=20)。
+const servicesEnvelope = envelope([
+  { id: 2, serviceCode: 'svc-demo', name: '演示服务' },
+  { id: 20, serviceCode: 'svc-other', name: '另一服务' },
+]);
 
-// 服务按命名空间隔离:ns-demo(id=1)→ svc-demo(id=2);ns-other(id=10)→ svc-other(id=20)。
-// 据 params.namespaceId 返回对应服务,使「换命名空间后服务列表变化 + 旧选值必须被清」可断言。
-const servicesByNamespace: Record<number, typeof servicePluginsEnvelope> = {
-  1: {
-    count: 1,
-    rows: [{ id: 2, serviceCode: 'svc-demo', name: '演示服务' }],
-    page: 1,
-    pageSize: 100,
-    totalPage: 1,
-  } as never,
-  10: {
-    count: 1,
-    rows: [{ id: 20, serviceCode: 'svc-other', name: '另一服务' }],
-    page: 1,
-    pageSize: 100,
-    totalPage: 1,
-  } as never,
-};
+// svc-demo(id=2)的绑定:plugin-a(pluginId=3,已发布)、plugin-b(pluginId=4,未发布)。
+const bindingsEnvelope = envelope([
+  { id: 11, serviceId: 2, pluginId: 3, pluginCode: 'plugin-a' },
+  { id: 12, serviceId: 2, pluginId: 4, pluginCode: 'plugin-b' },
+]);
 
-const pluginsEnvelope = {
-  count: 1,
-  rows: [{ id: 3, code: 'plugin-demo', name: '演示插件' }],
-  page: 1,
-  pageSize: 100,
-  totalPage: 1,
-};
+// releases 主表:仅 plugin-a(serviceId=2,pluginId=3)有 active 版本 1.2.0;plugin-b 无 → 「未发布」。
+const releasesEnvelope = envelope([
+  {
+    id: 101,
+    serviceId: 2,
+    pluginId: 3,
+    version: '1.2.0',
+    versionOrder: 2,
+    isActive: true,
+    isRolledBack: false,
+    publishTime: '2026-06-01T10:00:00Z',
+  },
+]);
 
-// 服务全量(B2 筛选区 serviceId 下拉不带 namespaceId 拉全量;含 svc-demo id=2 供筛选断言)。
-const allServicesEnvelope = {
-  count: 2,
-  rows: [
-    { id: 2, serviceCode: 'svc-demo', name: '演示服务' },
-    { id: 20, serviceCode: 'svc-other', name: '另一服务' },
-  ],
-  page: 1,
-  pageSize: 100,
-  totalPage: 1,
-} as never;
+// 全量插件(「绑定插件」弹窗候选):plugin-a(3,已绑)、plugin-b(4,已绑)、plugin-c(5,可绑)。
+const pluginsEnvelope = envelope([
+  { id: 3, code: 'plugin-a' },
+  { id: 4, code: 'plugin-b' },
+  { id: 5, code: 'plugin-c' },
+]);
 
-// 按 resource 路由 list 返回;services 再按 namespaceId 服务端过滤分流。
-const routeList = (resource: string, params?: Record<string, unknown>) => {
+// plugin-a 的版本历史:1.1.0(历史)、1.2.0(运行中)。改版本=把 1.1.0 重新激活。
+const historyEnvelope = envelope([
+  {
+    id: 100,
+    serviceId: 2,
+    pluginId: 3,
+    version: '1.1.0',
+    versionOrder: 1,
+    isActive: false,
+    isRolledBack: false,
+    publishTime: '2026-05-01T10:00:00Z',
+  },
+  {
+    id: 101,
+    serviceId: 2,
+    pluginId: 3,
+    version: '1.2.0',
+    versionOrder: 2,
+    isActive: true,
+    isRolledBack: false,
+    publishTime: '2026-06-01T10:00:00Z',
+  },
+]);
+
+// 按 resource 路由 list 返回。
+const routeList = (resource: string) => {
   switch (resource) {
-    case 'namespaces':
-      return namespacesEnvelope;
-    case 'services': {
-      // 带 namespaceId:表单级联(按命名空间隔离);不带:B2 筛选区拉全量服务。
-      if (params?.namespaceId === undefined) return allServicesEnvelope;
-      const nsId = Number(params.namespaceId);
-      return servicesByNamespace[nsId] ?? { count: 0, rows: [], page: 1, pageSize: 100, totalPage: 1 };
-    }
+    case 'services':
+      return servicesEnvelope;
+    case 'service-plugins':
+      return bindingsEnvelope;
     case 'plugins':
       return pluginsEnvelope;
     default:
-      return servicePluginsEnvelope;
+      return envelope([]);
   }
 };
 
-// 打开某个表单 Select 并展开下拉。
-// 用 form-item 的 combobox `id`(= dataIndex,如 'namespaceId')定位 —— 表头列名也叫「命名空间」,
-// 按文案找会撞表头;按 id 唯一锁定表单字段的下拉,稳。
-const openSelect = async (user: ReturnType<typeof userEvent.setup>, fieldId: string) => {
-  const combobox = await waitFor(() => {
-    const el = document.getElementById(fieldId);
-    if (!el) throw new Error(`combobox #${fieldId} 未渲染`);
-    return el;
-  });
+// 打开顶部服务下拉并选中 svc-demo(下拉项渲染在 portal 的 .ant-select-item-option-content)。
+const selectService = async (user: ReturnType<typeof userEvent.setup>, contains: string) => {
+  // 顶部只有一个 combobox(选服务);用 role 定位最稳。
+  const combobox = await screen.findByRole('combobox');
   await user.click(combobox);
+  const option = await screen.findByText(
+    (_t, node) =>
+      node?.classList.contains('ant-select-item-option-content') === true &&
+      node.textContent?.includes(contains) === true,
+  );
+  await user.click(option);
 };
 
-// 点选下拉中文案匹配的选项(选项渲染在 portal 的 .ant-select-item-option-content 内)。
+// 点选某个下拉项(portal 内 option content 文案匹配)。
 const clickOption = async (user: ReturnType<typeof userEvent.setup>, contains: string) => {
   const option = await screen.findByText(
     (_t, node) =>
@@ -143,187 +145,328 @@ const clickOption = async (user: ReturnType<typeof userEvent.setup>, contains: s
   await user.click(option);
 };
 
-describe('ServicePluginsPage', () => {
+describe('ServicePluginsPage(服务配置二级页)', () => {
   beforeEach(() => {
     list.mockReset();
+    listReleases.mockReset();
+    listReleaseHistory.mockReset();
     create.mockReset();
-    update.mockReset();
     remove.mockReset();
-    list.mockImplementation((resource: string, params?: Record<string, unknown>) =>
-      Promise.resolve(routeList(resource, params)),
-    );
+    reactivate.mockReset();
+    list.mockImplementation((resource: string) => Promise.resolve(routeList(resource)));
+    listReleases.mockResolvedValue(releasesEnvelope);
+    listReleaseHistory.mockResolvedValue(historyEnvelope);
   });
 
-  it('列表渲染(走 resources.list,列用后端可读名 namespaceCode/serviceCode/pluginCode)', async () => {
+  it('初始:加载服务列表,未选服务时显占位引导(不拉绑定)', async () => {
     render(<ServicePluginsPage />);
-    expect(await screen.findByText('svc-demo')).toBeInTheDocument();
-    expect(screen.getByText('ns-demo')).toBeInTheDocument();
-    expect(screen.getByText('plugin-demo')).toBeInTheDocument();
-    expect(list).toHaveBeenCalledWith('service-plugins', expect.anything());
+    expect(await screen.findByText('请选择一个服务以配置其插件')).toBeInTheDocument();
+    // 顶部服务下拉拉过 services。
+    await waitFor(() => expect(list).toHaveBeenCalledWith('services', expect.anything()));
+    // 未选服务:不应调 service-plugins。
+    expect(list).not.toHaveBeenCalledWith('service-plugins', expect.anything());
   });
 
-  it('关联绑定表无编辑:操作列不出现「编辑」(editable=false)', async () => {
-    render(<ServicePluginsPage />);
-    const cell = await screen.findByText('svc-demo');
-    const row = cell.closest('tr')!;
-    // 仅增删:行内有「删除」、无「编辑」。
-    expect(within(row).getByText('删除')).toBeInTheDocument();
-    expect(within(row).queryByText('编辑')).not.toBeInTheDocument();
-  });
-
-  it('三级级联走服务端过滤:选命名空间 → list(services,{namespaceId}) → 选服务 → list(plugins)', async () => {
+  it('选服务 → 拉该服务绑定(service-plugins?serviceId=)并渲染已绑插件 + join 当前版本(未发布兜底)', async () => {
     const user = userEvent.setup();
     render(<ServicePluginsPage />);
+    await screen.findByText('请选择一个服务以配置其插件');
 
-    // 列表先加载(确认 ProTable request 走了 resources.list)。
-    expect(await screen.findByText('svc-demo')).toBeInTheDocument();
+    await selectService(user, 'svc-demo');
 
-    // 打开新建 Drawer。
-    await user.click(screen.getByRole('button', { name: byNormalizedName('添加') }));
-
-    // 命名空间下拉的选项来自服务端 list('namespaces')(关联选择,非写死)。
-    await waitFor(() => {
-      expect(list).toHaveBeenCalledWith('namespaces', expect.anything());
-    });
-
-    // 选命名空间(下拉选项渲染在 portal,点选项文案 ns-demo)。
-    await openSelect(user, 'namespaceId');
-    await clickOption(user, 'ns-demo');
-
-    // 关键断言:选命名空间后,服务下拉调 list('services', { namespaceId }) —— 带服务端过滤参数,
-    // 而非客户端拉全量再 filter。namespaceId 取上面选中的命名空间 id(=1)。
-    await waitFor(() => {
-      expect(list).toHaveBeenCalledWith('services', expect.objectContaining({ namespaceId: 1 }));
-    });
-
-    // 选服务后,插件下拉调 list('plugins')。
-    await openSelect(user, 'serviceId');
-    await clickOption(user, 'svc-demo');
-
-    await waitFor(() => {
-      expect(list).toHaveBeenCalledWith('plugins', expect.anything());
-    });
-  });
-
-  it('点「添加」→ 选满级联 → 提交 → 调 create(service-plugins, {serviceId,pluginId}),C3 裁掉 namespaceId', async () => {
-    create.mockResolvedValue({ id: 12 });
-    const user = userEvent.setup();
-    render(<ServicePluginsPage />);
-
-    expect(await screen.findByText('svc-demo')).toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: byNormalizedName('添加') }));
-
-    // 命名空间。
-    await openSelect(user, 'namespaceId');
-    await clickOption(user, 'ns-demo');
-
-    // 服务(依赖命名空间,选项来自 list('services',{namespaceId}))。
-    await openSelect(user, 'serviceId');
-    await clickOption(user, 'svc-demo');
-
-    // 插件(依赖服务,选项来自 list('plugins'))。
-    await openSelect(user, 'pluginId');
-    await clickOption(user, 'plugin-demo');
-
-    // 提交。
-    await user.click(screen.getByRole('button', { name: byNormalizedName('确认') }));
-
-    // C3:提交体只含 serviceId/pluginId,**不含**仅用于级联的 namespaceId(裁干净,不留隐患)。
-    await waitFor(() => {
-      expect(create).toHaveBeenCalledWith(
-        'service-plugins',
-        expect.objectContaining({ serviceId: 2, pluginId: 3 }),
-      );
-    });
-    const payload = create.mock.calls[0]?.[1] as Record<string, unknown>;
-    expect(payload).not.toHaveProperty('namespaceId');
-
-    // B4 契约钉死:后端各 list 端点硬卡 pageSize le=200,前端级联/选项下拉一切取值 **必须 ≤ 200**,
-    // 否则真后端 422 下拉崩。逐一断言每次 list 的 pageSize 都不超过 200。
-    for (const call of list.mock.calls) {
-      const ps = (call[1] as { pageSize?: number } | undefined)?.pageSize;
-      if (ps !== undefined) expect(ps).toBeLessThanOrEqual(200);
-    }
-  });
-
-  // B3(409 文案):服务插件无 code 字段,409=重复绑定,文案须为「该插件已绑定该服务…」,非「编码已存在」。
-  it('重复绑定 409 → 提示「该插件已绑定该服务,请勿重复关联」(非「编码已存在」)', async () => {
-    create.mockRejectedValue({ response: { status: 409 } });
-    const user = userEvent.setup();
-    render(<ServicePluginsPage />);
-
-    expect(await screen.findByText('svc-demo')).toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: byNormalizedName('添加') }));
-
-    await openSelect(user, 'namespaceId');
-    await clickOption(user, 'ns-demo');
-    await openSelect(user, 'serviceId');
-    await clickOption(user, 'svc-demo');
-    await openSelect(user, 'pluginId');
-    await clickOption(user, 'plugin-demo');
-    await user.click(screen.getByRole('button', { name: byNormalizedName('确认') }));
-
-    // B3 关键:重复绑定的 409 文案贴切,不沿用默认「编码已存在」。
-    expect(
-      await screen.findByText((t) => t.includes('该插件已绑定该服务')),
-    ).toBeInTheDocument();
-    expect(screen.queryByText('编码已存在')).not.toBeInTheDocument();
-  });
-
-  // B2(按服务服务端过滤):开查询表单 → 选服务筛选项 → 查询 → list('service-plugins',{serviceId}) 透传后端。
-  it('筛选区按服务过滤:选筛选项 → list("service-plugins", {serviceId}) 带后端过滤参数', async () => {
-    const user = userEvent.setup();
-    render(<ServicePluginsPage />);
-
-    expect(await screen.findByText('svc-demo')).toBeInTheDocument();
-
-    // 筛选项 id=filterServiceId(避开表单 serviceId 撞 id);选项来自 list('services')。
-    await openSelect(user, 'filterServiceId');
-    await clickOption(user, 'svc-demo');
-    await user.click(screen.getByRole('button', { name: byNormalizedName('查询') }));
-
-    // B2 关键:筛选值 serviceId 透传到 list('service-plugins', { serviceId })(后端 ?serviceId= 过滤)。
-    await waitFor(() => {
+    // 关键:选服务后按 serviceId 服务端过滤拉绑定。
+    await waitFor(() =>
       expect(list).toHaveBeenCalledWith(
         'service-plugins',
         expect.objectContaining({ serviceId: 2 }),
-      );
-    });
+      ),
+    );
+    // 同时拉 releases 主表 join 版本。
+    await waitFor(() => expect(listReleases).toHaveBeenCalled());
+
+    // 两个已绑插件都渲染。
+    expect(await screen.findByText('plugin-a')).toBeInTheDocument();
+    expect(screen.getByText('plugin-b')).toBeInTheDocument();
+    // plugin-a 有 active 版本 1.2.0;plugin-b 无 → 「未发布」。
+    expect(screen.getByText('1.2.0')).toBeInTheDocument();
+    expect(screen.getByText('未发布')).toBeInTheDocument();
   });
 
-  it('A1 级联清空:选命名空间 A → 选其服务 → 改命名空间 B → 服务被清空(不残留 A 的服务,不会错配提交)', async () => {
+  it('绑定插件:打开弹窗(候选剔除已绑)→ 选 plugin-c → 提交调 create(service-plugins,{serviceId,pluginId})', async () => {
+    create.mockResolvedValue({ id: 13 });
+    const user = userEvent.setup();
+    render(<ServicePluginsPage />);
+    await screen.findByText('请选择一个服务以配置其插件');
+    await selectService(user, 'svc-demo');
+    await screen.findByText('plugin-a');
+
+    // 打开「绑定插件」弹窗。
+    await user.click(screen.getByRole('button', { name: byNormalizedName('绑定插件') }));
+    await waitFor(() => expect(list).toHaveBeenCalledWith('plugins', expect.anything()));
+
+    // 弹窗候选应剔除已绑(plugin-a/plugin-b),只剩 plugin-c —— 选它。
+    const dialog = await screen.findByRole('dialog');
+    const combobox = within(dialog).getByRole('combobox');
+    await user.click(combobox);
+    await clickOption(user, 'plugin-c');
+
+    // 点弹窗「绑定」确认。
+    await user.click(within(dialog).getByRole('button', { name: byNormalizedName('绑定') }));
+
+    // 关键断言:create('service-plugins', { serviceId: 2, pluginId: 5 })。
+    await waitFor(() =>
+      expect(create).toHaveBeenCalledWith(
+        'service-plugins',
+        expect.objectContaining({ serviceId: 2, pluginId: 5 }),
+      ),
+    );
+  });
+
+  it('解绑:点「解绑」→ Popconfirm 确认 → remove(service-plugins, id)', async () => {
+    remove.mockResolvedValue(undefined);
+    const user = userEvent.setup();
+    render(<ServicePluginsPage />);
+    await screen.findByText('请选择一个服务以配置其插件');
+    await selectService(user, 'svc-demo');
+
+    // 定位 plugin-a 所在行的「解绑」。
+    const cell = await screen.findByText('plugin-a');
+    const row = cell.closest('tr')!;
+    await user.click(within(row).getByText('解绑'));
+
+    // Popconfirm 气泡的确认按钮(okText=解绑);点它触发 remove。
+    const confirmBtn = await screen.findByRole('button', { name: byNormalizedName('解绑') });
+    await user.click(confirmBtn);
+
+    await waitFor(() => expect(remove).toHaveBeenCalledWith('service-plugins', 11));
+  });
+
+  it('改版本:打开版本抽屉 → listReleaseHistory → 非 active 行「切到此版本」调 reactivate({spvId})', async () => {
+    reactivate.mockResolvedValue({ id: 100 });
+    const user = userEvent.setup();
+    render(<ServicePluginsPage />);
+    await screen.findByText('请选择一个服务以配置其插件');
+    await selectService(user, 'svc-demo');
+
+    // 打开 plugin-a 的「版本历史 / 改版本」抽屉。
+    const cell = await screen.findByText('plugin-a');
+    const row = cell.closest('tr')!;
+    await user.click(within(row).getByText('版本历史 / 改版本'));
+
+    // 关键:抽屉按 serviceId+pluginId 拉历史。
+    await waitFor(() =>
+      expect(listReleaseHistory).toHaveBeenCalledWith(
+        expect.objectContaining({ serviceId: 2, pluginId: 3 }),
+      ),
+    );
+
+    // 历史出现两版;1.1.0 是非 active 行,有「切到此版本」按钮;1.2.0 是当前。
+    expect(await screen.findByText('1.1.0')).toBeInTheDocument();
+    const switchBtn = await screen.findByRole('button', { name: byNormalizedName('切到此版本') });
+    await user.click(switchBtn);
+
+    // 关键断言:reactivate({ spvId: 100 })(1.1.0 那行 id)。
+    await waitFor(() => expect(reactivate).toHaveBeenCalledWith({ spvId: 100 }));
+  });
+
+  it('重复绑定 409 → 提示「该插件已绑定该服务,请勿重复关联」', async () => {
+    create.mockRejectedValue({ response: { status: 409 } });
+    const user = userEvent.setup();
+    render(<ServicePluginsPage />);
+    await screen.findByText('请选择一个服务以配置其插件');
+    await selectService(user, 'svc-demo');
+    await screen.findByText('plugin-a');
+
+    await user.click(screen.getByRole('button', { name: byNormalizedName('绑定插件') }));
+    const dialog = await screen.findByRole('dialog');
+    const combobox = within(dialog).getByRole('combobox');
+    await user.click(combobox);
+    await clickOption(user, 'plugin-c');
+    await user.click(within(dialog).getByRole('button', { name: byNormalizedName('绑定') }));
+
+    expect(
+      await screen.findByText((t) => t.includes('该插件已绑定该服务')),
+    ).toBeInTheDocument();
+  });
+
+  it('空态:服务无绑定 → 显「该服务暂未绑定插件」', async () => {
+    list.mockImplementation((resource: string) =>
+      Promise.resolve(resource === 'service-plugins' ? envelope([]) : routeList(resource)),
+    );
+    const user = userEvent.setup();
+    render(<ServicePluginsPage />);
+    await screen.findByText('请选择一个服务以配置其插件');
+    await selectService(user, 'svc-demo');
+
+    expect(
+      await screen.findByText((t) => t.includes('该服务暂未绑定插件')),
+    ).toBeInTheDocument();
+  });
+
+  it('错误态:拉绑定失败 → 显错误 + 重试按钮,点重试重新拉取', async () => {
+    let failNext = true;
+    list.mockImplementation((resource: string) => {
+      if (resource === 'service-plugins') {
+        if (failNext) {
+          failNext = false;
+          return Promise.reject(new Error('boom'));
+        }
+        return Promise.resolve(bindingsEnvelope);
+      }
+      return Promise.resolve(routeList(resource));
+    });
+    const user = userEvent.setup();
+    render(<ServicePluginsPage />);
+    await screen.findByText('请选择一个服务以配置其插件');
+    await selectService(user, 'svc-demo');
+
+    // 首次失败:错误提示出现。
+    expect(await screen.findByText('加载该服务的插件绑定失败')).toBeInTheDocument();
+    // 点重试 → 第二次成功 → 渲染绑定。
+    await user.click(screen.getByRole('button', { name: byNormalizedName('重试') }));
+    expect(await screen.findByText('plugin-a')).toBeInTheDocument();
+  });
+
+  it('服务列表加载失败 → 页面级错误 + 重试,点重试后渲染下拉占位', async () => {
+    let failServices = true;
+    list.mockImplementation((resource: string) => {
+      if (resource === 'services') {
+        if (failServices) {
+          failServices = false;
+          return Promise.reject(new Error('svc-boom'));
+        }
+        return Promise.resolve(servicesEnvelope);
+      }
+      return Promise.resolve(routeList(resource));
+    });
     const user = userEvent.setup();
     render(<ServicePluginsPage />);
 
-    expect(await screen.findByText('svc-demo')).toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: byNormalizedName('添加') }));
+    expect(await screen.findByText('加载服务列表失败')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: byNormalizedName('重试') }));
+    // 第二次成功 → 回到「请选择一个服务」占位。
+    expect(await screen.findByText('请选择一个服务以配置其插件')).toBeInTheDocument();
+  });
 
-    // 选命名空间 A(ns-demo,id=1)。
-    await openSelect(user, 'namespaceId');
-    await clickOption(user, 'ns-demo');
+  it('版本抽屉:该插件无已发布版本(历史空)→ 显「暂无已发布版本」引导', async () => {
+    listReleaseHistory.mockResolvedValue(envelope([]));
+    const user = userEvent.setup();
+    render(<ServicePluginsPage />);
+    await screen.findByText('请选择一个服务以配置其插件');
+    await selectService(user, 'svc-demo');
 
-    // 选 A 的服务(svc-demo,id=2)。
-    await openSelect(user, 'serviceId');
-    await clickOption(user, 'svc-demo');
+    // plugin-b 未发布;打开其版本抽屉。
+    const cell = await screen.findByText('plugin-b');
+    const row = cell.closest('tr')!;
+    await user.click(within(row).getByText('版本历史 / 改版本'));
 
-    // 选中后,serviceId 字段渲染出已选项文案 svc-demo。
-    const serviceField = document.getElementById('serviceId')!.closest('.ant-select')!;
-    await waitFor(() =>
-      expect(serviceField.querySelector('.ant-select-selection-item')?.textContent).toContain(
-        'svc-demo',
+    expect(
+      await screen.findByText((t) => t.includes('该插件暂无已发布版本')),
+    ).toBeInTheDocument();
+  });
+
+  it('版本抽屉:历史加载失败 → 抽屉内错误 + 重试,点重试后渲染历史', async () => {
+    let failHistory = true;
+    listReleaseHistory.mockImplementation(() => {
+      if (failHistory) {
+        failHistory = false;
+        return Promise.reject(new Error('hist-boom'));
+      }
+      return Promise.resolve(historyEnvelope);
+    });
+    const user = userEvent.setup();
+    render(<ServicePluginsPage />);
+    await screen.findByText('请选择一个服务以配置其插件');
+    await selectService(user, 'svc-demo');
+
+    const cell = await screen.findByText('plugin-a');
+    const row = cell.closest('tr')!;
+    await user.click(within(row).getByText('版本历史 / 改版本'));
+
+    // 抽屉内错误态 + 重试。
+    expect(await screen.findByText('加载版本历史失败')).toBeInTheDocument();
+    // 抽屉内的「重试」(与页面无其它重试按钮共存,取最后一个=抽屉内)。
+    const retries = await screen.findAllByRole('button', { name: byNormalizedName('重试') });
+    await user.click(retries[retries.length - 1]);
+    expect(await screen.findByText('1.1.0')).toBeInTheDocument();
+  });
+
+  it('改版本失败 → 不抛错(由全局拦截器兜底),按钮恢复可点', async () => {
+    reactivate.mockRejectedValue({ response: { status: 409 } });
+    const user = userEvent.setup();
+    render(<ServicePluginsPage />);
+    await screen.findByText('请选择一个服务以配置其插件');
+    await selectService(user, 'svc-demo');
+
+    const cell = await screen.findByText('plugin-a');
+    const row = cell.closest('tr')!;
+    await user.click(within(row).getByText('版本历史 / 改版本'));
+    const switchBtn = await screen.findByRole('button', { name: byNormalizedName('切到此版本') });
+    await user.click(switchBtn);
+
+    await waitFor(() => expect(reactivate).toHaveBeenCalledWith({ spvId: 100 }));
+    // 失败后按钮仍在(loading 复位),不崩溃。
+    expect(
+      await screen.findByRole('button', { name: byNormalizedName('切到此版本') }),
+    ).toBeInTheDocument();
+  });
+
+  it('解绑失败 → 不抛错(由全局拦截器兜底),行仍在', async () => {
+    remove.mockRejectedValue(new Error('del-boom'));
+    const user = userEvent.setup();
+    render(<ServicePluginsPage />);
+    await screen.findByText('请选择一个服务以配置其插件');
+    await selectService(user, 'svc-demo');
+
+    const cell = await screen.findByText('plugin-a');
+    const row = cell.closest('tr')!;
+    await user.click(within(row).getByText('解绑'));
+    const confirmBtn = await screen.findByRole('button', { name: byNormalizedName('解绑') });
+    await user.click(confirmBtn);
+
+    await waitFor(() => expect(remove).toHaveBeenCalledWith('service-plugins', 11));
+    // 失败后该行仍在(未误删 UI)。
+    expect(screen.getByText('plugin-a')).toBeInTheDocument();
+  });
+
+  it('绑定弹窗:全部插件已绑 → 候选为空,notFoundContent 提示「已绑定全部可用插件」', async () => {
+    // 插件全集 = 已绑的两个 → 候选剔空。
+    list.mockImplementation((resource: string) =>
+      Promise.resolve(
+        resource === 'plugins'
+          ? envelope([
+              { id: 3, code: 'plugin-a' },
+              { id: 4, code: 'plugin-b' },
+            ])
+          : routeList(resource),
       ),
     );
+    const user = userEvent.setup();
+    render(<ServicePluginsPage />);
+    await screen.findByText('请选择一个服务以配置其插件');
+    await selectService(user, 'svc-demo');
+    await screen.findByText('plugin-a');
 
-    // 改命名空间为 B(ns-other,id=10)。
-    await openSelect(user, 'namespaceId');
-    await clickOption(user, 'ns-other');
+    await user.click(screen.getByRole('button', { name: byNormalizedName('绑定插件') }));
+    const dialog = await screen.findByRole('dialog');
+    await user.click(within(dialog).getByRole('combobox'));
+    expect(
+      await screen.findByText((t) => t.includes('该服务已绑定全部可用插件')),
+    ).toBeInTheDocument();
+  });
 
-    // A1 关键断言:父级变更后,serviceId 已选值被清空 —— 不再残留 A 的 svc-demo
-    // (旧实现仅靠 dependencies 重拉选项,值不清 → 提交会带 A 的 serviceId=2 与 B 错配)。
-    await waitFor(() =>
-      expect(serviceField.querySelector('.ant-select-selection-item')?.textContent ?? '').not.toContain(
-        'svc-demo',
-      ),
-    );
+  it('B4 契约:所有 list / releases 调用 pageSize ≤ 200(后端硬卡,>200 会 422)', async () => {
+    const user = userEvent.setup();
+    render(<ServicePluginsPage />);
+    await screen.findByText('请选择一个服务以配置其插件');
+    await selectService(user, 'svc-demo');
+    await screen.findByText('plugin-a');
+    await user.click(screen.getByRole('button', { name: byNormalizedName('绑定插件') }));
+    await waitFor(() => expect(list).toHaveBeenCalledWith('plugins', expect.anything()));
+
+    for (const call of [...list.mock.calls, ...listReleases.mock.calls, ...listReleaseHistory.mock.calls]) {
+      const ps = (call[call.length - 1] as { pageSize?: number } | undefined)?.pageSize;
+      if (ps !== undefined) expect(ps).toBeLessThanOrEqual(200);
+    }
   });
 });
