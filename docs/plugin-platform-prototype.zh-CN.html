@@ -37,6 +37,15 @@
   +新增: 实例实时日志查看器(模拟流式 tail)——实例页/详情加「日志」动作(离线/stale 拦截);新 logModal 终端风格(深色等宽+行号+级别配色),定时(500-900ms)追加假行模拟「浏览器⇄platform SSE⇄hub WS⇄agent docker logs --tail 500 -f」;暂停/继续(停启定时器)、清屏、自动滚动开关、tail 500 上限(超出从顶部丢弃)、状态条(●实时/⏸已暂停);关闭/切走/Esc 必 clearInterval 不留孤儿;复用 syncMask/closeTopLayer
   +精简: 删除「概览」页(整块 section + 侧栏「总览」组与项 + renderOverview 函数及全部调用);默认落地页改为「服务」(#services class=page active,侧栏服务项 active,面包屑「配置/服务」);switchNs 去掉 renderOverview 调用(仅重渲染实例/获取记录/服务页),ignoreInbox 改调 renderServicesPage;删除随概览失效的 _nsLabel/_nsScopeText(保留 _nsNodes/_nsAgents/_nsServices,仍被实例/服务页统计卡复用)
   +精简: 服务列表(已纳管 tab)服务名列去掉冗余「已纳管」标签(整 tab 已是已纳管)+ 内联「详情›」;详情改为操作列首个动作(详情/配置/镜像/发布),服务名列只留服务名
+  +修复(ultracode 2026-06-22 演示态自洽一组):
+     · M-1 已纳管表改数据驱动(renderManaged 从 _nsServices/SERVICES 渲染,实例=NODES 实算 在跑/发现、对账=_svcRecon 计算,与详情/统计卡同源);一键纳管 saveService 真 push SERVICES + adopt 时删 INBOX + 重渲染;统一 wms-prod 数据(去静态 6插件/0-4)
+     · 单一真相重构:SERVICES 去掉静态 inst/recon/reconCls,实例与对账一律按 NODES 实算(_svcNodes/_svcRunning/_svcRecon);canDeploy/startDeploy/openReapply/startReapply/syncInstance 全改 NODES 驱动
+     · M-2 发布收敛:startDeploy done 回调 commitDeploy 后调 _converge(svc)(收敛 NODES 实际→意图)+ renderNodes/renderServicesPage,发布完漂移真消失;M-3 实例 active 从 SERVICES 意图派生(renderNodes/openNode),漂移判据统一「实例实际 vs 服务意图」(_nodePluginDrift,复用 _nodeImgDrift 范式)
+     · M-4 doUpub 改「已暂存绑定 X(去发布生效)」+ 跳配置页,与 bind/unbind/changeVersion 一致(不裸 push+假投放)
+     · M-6 新建/纳管抽屉去恒等,改 service_code(分发)/nacos_service_name(发现滚动)两字段(默认预填同值、可分别编辑)
+     · M-7 加跨机样例 tamagawa-wms(同 nacos 名跨 tamagawa-test + rolltest-agent 各 1 实例);canDeploy 涉及 agent 全在线才放行、startDeploy 按 agent 分组串行 + 进度标注跨 agent + 集群健康门文案
+     · H-7 获取记录改回源粒度(去 per-容器行 + 命中/回源列,改 ns/服务 + 回源插件@版本 + 回源时间;FETCH_RECORDS/renderFetch/openFetchDetail 同改)
+     · L-1 收敛目标取服务意图版本(_intentVer)非任一已对齐实例;L-2 _converge/syncInstance 补 renderServicesPage;L-3 openLog 复位 logShowNo
 -->
 
 <style>
@@ -288,15 +297,8 @@
         <div id="svc-managed" class="svc-panel">
         <div class="card" style="padding:0">
           <table>
-            <thead><tr><th>命名空间</th><th>服务名</th><th>别名</th><th>已绑插件</th><th>实例(在跑/纳管)</th><th>对账</th><th>操作</th></tr></thead>
-            <tbody>
-              <tr data-ns="tamagawa-test"><td>tamagawa-test</td><td><span class="tag t-blue">wms-test-admin</span></td><td>WMS 管理端</td><td>5 个</td><td>2 / 2</td><td><span class="tag t-warn">版本漂移</span></td>
-                <td class="acts"><a onclick="openService('wms-test-admin')">详情</a><a onclick="openServiceConfig('wms-test-admin')">配置</a><a onclick="openServiceImage('wms-test-admin')">镜像</a><a onclick="openDeploy('wms-test-admin')">发布</a></td></tr>
-              <tr data-ns="rolltest-agent"><td>rolltest-agent</td><td><span class="tag t-blue">rolltest</span></td><td>滚动测试</td><td>2 个</td><td>2 / 2</td><td><span class="tag t-ok">正常</span></td>
-                <td class="acts"><a onclick="openService('rolltest')">详情</a><a onclick="openServiceConfig('rolltest')">配置</a><a onclick="openServiceImage('rolltest')">镜像</a><a onclick="openDeploy('rolltest')">发布</a></td></tr>
-              <tr data-ns="k8s-prod-a"><td>k8s-prod-a</td><td><span class="tag t-blue">wms-prod</span></td><td>WMS 生产</td><td>6 个</td><td>0 / 4</td><td><span class="tag t-err">纳管未起</span></td>
-                <td class="acts"><a onclick="openService('wms-prod')">详情</a><a onclick="openServiceConfig('wms-prod')">配置</a><a onclick="openServiceImage('wms-prod')">镜像</a><a onclick="openDeploy('wms-prod')">发布</a></td></tr>
-            </tbody>
+            <thead><tr><th>命名空间</th><th>服务名</th><th>别名</th><th>已绑插件</th><th>实例(在跑/发现)</th><th>对账</th><th>操作</th></tr></thead>
+            <tbody id="svcManagedBody"></tbody>
           </table>
         </div>
         <div class="sub" style="color:var(--ink3);margin-top:8px">对账 = 意图(已纳管 Service)⋈ 现实(自动发现实例),by nacos 服务名,实时算。</div>
@@ -378,16 +380,16 @@
         </div>
       </section>
 
-      <!-- 获取记录 -->
+      <!-- 获取记录(回源粒度,H-7)-->
       <section id="fetch" class="page">
-        <div class="page-h"><div><h1>获取记录</h1><div class="sub">按 命名空间 + 服务 + 实例 聚合;插件@版本在「详情」里</div></div></div>
+        <div class="page-h"><div><h1>获取记录</h1><div class="sub">回源粒度:按 命名空间 + 服务 聚合(非 per-容器);插件@版本在「详情」里</div></div></div>
         <div class="card" style="padding:0">
           <table>
-            <thead><tr><th>命名空间</th><th>服务</th><th>实例(容器)</th><th>最近拉取</th><th>插件数</th><th>操作</th></tr></thead>
+            <thead><tr><th>命名空间</th><th>服务</th><th>最近回源</th><th>回源插件数</th><th>操作</th></tr></thead>
             <tbody id="fetchBody"></tbody>
           </table>
         </div>
-        <div class="banner"><span>🗄️</span><div>每行 = 一个实例的拉包汇总(命名空间 + 服务 + 实例);点「详情」看该实例拉了哪些插件@版本 + 命中/回源。同主机多容器同包只回源一次。</div></div>
+        <div class="banner"><span>🗄️</span><div>每行 = 一个 <b>命名空间 + 服务</b> 的<b>回源</b>汇总。平台 <code>fetch_record</code> 只记<b>回源粒度</b>(哪个 ns/服务何时回了哪个版本的源);agent 命中本机缓存<b>不回源</b>故不在此 —— 同主机多容器共享缓存的 per-容器命中以 <b>agent 本地日志</b>为权威,平台不可见。</div></div>
       </section>
 
       <!-- 操作审计 -->
@@ -417,10 +419,12 @@
   <div class="db">
     <div class="field"><label><span class="req">*</span>命名空间</label>
       <select class="input" id="dNs"><option value="">请选择命名空间</option><option>tamagawa-test</option><option>rolltest-agent</option><option>k8s-prod-a</option></select></div>
-    <div class="field"><label><span class="req">*</span>服务编码（= nacos 服务名）</label><input class="input" id="dSvc" placeholder="请输入，如 wms-test-admin">
-      <div class="hint">key 约定：serviceCode = nacosServiceName，发现的实例据此 link 到本服务。</div></div>
-    <div class="field"><label>服务别名</label><input class="input" placeholder="请输入"></div>
-    <div class="banner" id="drawerNote"><span>💡</span><div>服务是<b>逻辑层</b>：命名空间 + 服务名(= nacos) + 插件;<b>不涉及目录 / 镜像</b>(那是实例的事,自动发现)。</div></div>
+    <div class="field"><label><span class="req">*</span>service_code（分发标识）</label><input class="input" id="dCode" placeholder="请输入，如 wms-test-admin" oninput="onCodeInput()">
+      <div class="hint">分发链按 service_code 取插件清单。</div></div>
+    <div class="field"><label><span class="req">*</span>nacos_service_name（发现 / 滚动）</label><input class="input" id="dNacos" placeholder="默认同 service_code，可改">
+      <div class="hint">发现的实例 + 跨机滚动按 nacos 名 link;<b>默认预填 = service_code,可分别编辑</b>(两列、非恒等)。</div></div>
+    <div class="field"><label>服务别名</label><input class="input" id="dAlias" placeholder="请输入"></div>
+    <div class="banner" id="drawerNote"><span>💡</span><div>服务是<b>逻辑层</b>：命名空间 + service_code + nacos 名 + 插件;<b>不涉及目录 / 镜像</b>(那是实例的事,自动发现)。</div></div>
   </div>
   <div class="df"><button class="btn" onclick="closeDrawer()">取消</button><button class="btn pri" onclick="saveService()">确定</button></div>
 </div>
@@ -564,22 +568,40 @@
   document.querySelectorAll('nav a').forEach(function(a){a.addEventListener('click',function(){go(a.dataset.target)})});
   function openDrawer(){document.getElementById('drawer').classList.add('on');syncMask()}
   function closeDrawer(){document.getElementById('drawer').classList.remove('on');syncMask()}
-  var adoptMode=false;
+  var adoptMode=false, _nacosEdited=false;
+  // nacos 名默认跟随 service_code(直到用户手动改过 nacos 字段)
+  function onCodeInput(){ if(!_nacosEdited){var c=document.getElementById('dCode').value;document.getElementById('dNacos').value=c;} }
   function openManual(){
-    adoptMode=false;
+    adoptMode=false;_nacosEdited=false;
     document.getElementById('drawerTitle').textContent='手动预建服务';
-    document.getElementById('dNs').value='';document.getElementById('dSvc').value='';
-    document.getElementById('drawerNote').innerHTML='<span>💡</span><div>首次上线前预置插件集用（绕开"服务还没起 → 拉空"的鸡生蛋）。服务是逻辑层(命名空间 + 服务名 + 插件),<b>不涉及目录 / 镜像</b>。</div>';
+    document.getElementById('dNs').value='';document.getElementById('dCode').value='';document.getElementById('dNacos').value='';document.getElementById('dAlias').value='';
+    document.getElementById('drawerNote').innerHTML='<span>💡</span><div>首次上线前预置插件集用（绕开"服务还没起 → 拉空"的鸡生蛋）。服务是逻辑层(命名空间 + service_code + nacos 名 + 插件),<b>不涉及目录 / 镜像</b>。</div>';
+    var na=document.getElementById('dNacos'); if(na)na.oninput=function(){_nacosEdited=true;};
     openDrawer();
   }
   function openAdopt(ns,svc){
-    adoptMode=true;
+    adoptMode=true;_nacosEdited=false;
     document.getElementById('drawerTitle').textContent='从发现纳管服务';
-    document.getElementById('dNs').value=ns;document.getElementById('dSvc').value=svc;
-    document.getElementById('drawerNote').innerHTML='<span>✅</span><div>已从发现<b>预填</b>命名空间与 nacos 名（零敲）。确定后建 Service，再去「服务插件」配插件即可。</div>';
+    document.getElementById('dNs').value=ns;document.getElementById('dCode').value=svc;document.getElementById('dNacos').value=svc;document.getElementById('dAlias').value='';
+    document.getElementById('drawerNote').innerHTML='<span>✅</span><div>已从发现<b>预填</b>命名空间、service_code 与 nacos 名（默认同值,可分别改）。确定后建 Service 并从未纳管移除。</div>';
+    var na=document.getElementById('dNacos'); if(na)na.oninput=function(){_nacosEdited=true;};
     openDrawer();
   }
-  function saveService(){var n=document.getElementById('dSvc').value||'服务';closeDrawer();toast(adoptMode?('已纳管 '+n+'，去「服务插件」配插件'):'服务已创建（手动预建）');}
+  function saveService(){
+    var ns=document.getElementById('dNs').value, code=(document.getElementById('dCode').value||'').trim();
+    var nacos=(document.getElementById('dNacos').value||'').trim()||code, alias=(document.getElementById('dAlias').value||'').trim();
+    if(!ns){toast('请选择命名空间');return;}
+    if(!code){toast('请填写 service_code');return;}
+    if(SERVICES[code]){toast('服务 '+code+' 已存在');return;}
+    // 真落库:push 一条到 SERVICES(意图初始空插件,去配置页绑);adopt 则从 INBOX 删对应项
+    SERVICES[code]={ns:ns,nacos:nacos,alias:alias||code,plugins:[]};
+    SERVICES[code].image=''; SERVICES[code].deployedImage=''; SERVICES[code].deployedPlugins=[];
+    if(adoptMode)INBOX=INBOX.filter(function(x){return !(x.ns===ns&&x.svc===code);});
+    closeDrawer();
+    initNsSwitch(); renderServicesPage(); renderNodes();
+    filterPage(document.getElementById('globalSearch')?document.getElementById('globalSearch').value:'');
+    toast(adoptMode?('已纳管 '+code+'，去「配置」绑插件'):('服务已创建 '+code+'（手动预建）'));
+  }
   document.addEventListener('keydown',function(e){if(e.key==='Escape'){closeTopLayer();}});
   function toggleSidebar(){document.querySelector('.sidebar').classList.toggle('open');}
   function svcTab(which){
@@ -614,14 +636,16 @@
     return {imgChanged:imgChanged,imgFrom:s.deployedImage,imgTo:s.image,pc:pc,none:(!imgChanged&&pc.length===0)};
   }
   function hasPending(svc){ return !svcDiff(svc).none; }
-  // canDeploy:统一投放守卫(agent 在线 + 有在跑实例),列表/详情/实例抽屉共用,杜绝各判一次
+  // 该服务涉及的 agent/ns 集合(跨机服务 = 多个);取自 NODES 实际落点,fallback 到 SERVICES.ns
+  function _svcAgents(svc){ var s=SERVICES[svc]||{}; var set={}; _svcNodes(svc).forEach(function(k){set[NODES[k].ns]=1;}); if(!Object.keys(set).length&&s.ns)set[s.ns]=1; return Object.keys(set); }
+  // canDeploy:统一投放守卫(涉及的每个 agent 都在线 + 有在跑实例),列表/详情/实例抽屉共用,杜绝各判一次
   function canDeploy(svc){
     var s=SERVICES[svc]; if(!s)return {ok:false,reason:'未知服务'};
-    var a=AGENTS[s.ns]; if(!a||!a.online)return {ok:false,reason:'agent 离线（'+s.ns+'）,无法投放'};
-    if(!s.inst||!s.inst.length)return {ok:false,reason:'无在跑实例（纳管未起）,无法投放'};
+    var offline=_svcAgents(svc).filter(function(ns){var a=AGENTS[ns];return !a||!a.online;});
+    if(offline.length)return {ok:false,reason:'agent 离线（'+offline.join('、')+'）,无法投放'};
+    if(!_svcRunning(svc).length)return {ok:false,reason:'无在跑实例（纳管未起）,无法投放'};
     return {ok:true};
   }
-  function _driftedInsts(svc){ return ((SERVICES[svc]||{}).inst||[]).filter(function(i){return !i[2];}); }
   function _blockedModal(svc,reason){
     document.getElementById('deployBody').innerHTML='<h3>🚫 无法投放 · '+svc+'</h3><div class="desc" style="margin:8px 0 16px">'+reason+'</div><div style="display:flex;justify-content:flex-end"><button class="btn" onclick="closePublish()">知道了</button></div>';
     document.getElementById('publishModal').classList.add('on');syncMask();
@@ -690,55 +714,59 @@
     var head='本次应用到各实例 —— '+(mech==='pull-redeploy'?'镜像变更 → <b>pull-redeploy</b> 逐实例(含插件刷新)':'仅插件变更 → <b>滚动 restart</b> 逐实例');
     var body='<h3>🚀 发布 · '+svc+'</h3><div class="desc">'+head+'</div>';
     body+='<div class="card" style="background:var(--soft);margin-bottom:14px"><div style="font-size:13px;line-height:1.9">'+lines+'</div></div>';
-    var instN=((SERVICES[svc]||{}).inst||[]).length;
+    var instN=_svcRunning(svc).length;
     body+='<label style="display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--ink3);margin-bottom:12px;cursor:pointer"><input type="checkbox" id="simFail"'+(instN<2?' disabled':'')+'> 模拟某实例失败(演示「失败即停 + 集群健康门」'+(instN<2?',需 ≥2 实例':'')+')</label>';
     body+='<div style="display:flex;justify-content:flex-end;gap:10px"><button class="btn" onclick="closePublish()">取消</button><button class="btn pri" onclick="startDeploy(\''+svc+'\',\''+mech+'\')">确认发布</button></div>';
     document.getElementById('deployBody').innerHTML=body;
     document.getElementById('publishModal').classList.add('on');syncMask();
   }
+  // 跨机服务把实例按 agent 分组、组内连续(演示跨 agent 串行);返回 {names:[显示名], keys:[实例key]}
+  function _rolloutOrder(svc){
+    var s=SERVICES[svc]||{}, running=_svcRunning(svc), cross=!!s.crossNs;
+    running.sort(function(a,b){ return (NODES[a].ns+a).localeCompare(NODES[b].ns+b); });
+    return { keys:running, names:running.map(function(k){ return cross?(k+'  ['+NODES[k].ns+']'):k; }) };
+  }
   function startDeploy(svc,mech){
     var g=canDeploy(svc); if(!g.ok){toast(g.reason);return;}
     var sf=document.getElementById('simFail'); var simFail=!!(sf&&sf.checked);
-    var inst=((SERVICES[svc]||{}).inst||[]).map(function(i){return i[0];});
-    if(!inst.length){toast('无在跑实例,无法投放');return;}
+    var ord=_rolloutOrder(svc), names=ord.names;
+    if(!names.length){toast('无在跑实例,无法投放');return;}
+    var cross=!!(SERVICES[svc]||{}).crossNs;
     var steps=mech==='pull-redeploy'?['drain（排空连接）…','docker compose pull 新镜像…','down 旧容器…','up 新容器…','等待 /health/ready…','经 agent 重拉插件…']:['drain（排空连接）…','docker 重启…','等待 /health/ready…','经 agent 重拉插件…'];
-    _lastRollNames=inst.slice();
+    _lastRollNames=names.slice();
+    var head='逐实例零中断'+(cross?'(跨 agent 串行 + 每步集群健康门 ≥1)':'')+':'+steps.join(' → ');
     // 失败注入:让第 2 个实例(index 1)在 ready 步骤失败,演示「前 1 个已新版,失败即停」
-    var opts=simFail?{fail:{at:Math.min(1,inst.length-1),step:Math.max(0,steps.length-2),reason:'/health/ready 超时(drain 502)'},retry:true}:null;
-    var done=function(){commitDeploy(svc);toast('发布完成（'+mech+'）');};
+    var opts=simFail?{fail:{at:Math.min(1,names.length-1),step:Math.max(0,steps.length-2),reason:'/health/ready 超时(drain 502;集群健康门拦截)'},retry:true}:null;
+    var done=function(){commitDeploy(svc);_converge(svc);renderNodes();renderServicesPage();toast('发布完成（'+mech+'）');};
     // 重试时清掉失败注入(模拟修好实例后重投),让重试能真正成功
-    _lastRollout=function(){ _rollout(svc,'🚀 重试投放 · '+svc+'（'+mech+'）','逐实例零中断:'+steps.join(' → '),steps,inst,done,null); };
-    _rollout(svc,'🚀 发布中 · '+svc+'（'+mech+'）','逐实例零中断:'+steps.join(' → '),steps,inst,done,opts);
+    _lastRollout=function(){ _rollout(svc,'🚀 重试投放 · '+svc+'（'+mech+'）',head,steps,names,done,null); };
+    _rollout(svc,'🚀 发布中 · '+svc+'（'+mech+'）',head,steps,names,done,opts);
   }
   // openReapply / startReapply:实例漂移修复(active 已是目标,某实例没拉到)——强制重新投放,不改意图
   function openReapply(svc){
     var g=canDeploy(svc); if(!g.ok){_blockedModal(svc,g.reason);return;}
-    var drifted=_driftedInsts(svc), all=((SERVICES[svc]||{}).inst||[]);
-    var list=(drifted.length?drifted:all).map(function(i){return i[0];});
-    var head=drifted.length?('检测到 '+drifted.length+' 个实例版本漂移,将强制重新投放到:'):'所有实例与已发布态一致,可强制重新投放以确保一致:';
+    var drifted=_svcRunning(svc).filter(function(k){return _nodeDrift(k);});
+    var list=(drifted.length?drifted:_svcRunning(svc));
+    var head=drifted.length?('检测到 '+drifted.length+' 个实例漂移,将强制重新投放到:'):'所有实例与已发布态一致,可强制重新投放以确保一致:';
     var body='<h3>🔁 强制重新投放 · '+svc+'</h3><div class="desc">'+head+'</div>'+
-      '<div class="card" style="background:var(--soft);margin-bottom:14px"><div style="font-size:13px;line-height:1.9">'+list.map(function(n){return '🔄 '+n;}).join('<br>')+'</div></div>'+
+      '<div class="card" style="background:var(--soft);margin-bottom:14px"><div style="font-size:13px;line-height:1.9">'+list.map(function(k){return '🔄 '+k;}).join('<br>')+'</div></div>'+
       '<div class="desc" style="margin-bottom:14px;color:var(--ink3)">不改变插件/镜像意图,仅把当前已发布版本重新喂给实例(滚动 restart)。</div>'+
       '<div style="display:flex;justify-content:flex-end;gap:10px"><button class="btn" onclick="closePublish()">取消</button><button class="btn pri" onclick="startReapply(\''+svc+'\')">确认重新投放</button></div>';
     document.getElementById('deployBody').innerHTML=body;
     document.getElementById('publishModal').classList.add('on');syncMask();
   }
-  function _convergeInst(svc){
-    var s=SERVICES[svc]; if(!s||!s.inst)return;
-    var good=(s.inst.filter(function(i){return i[2];})[0]||[])[1];
-    s.inst.forEach(function(i){ if(good)i[1]=good; i[2]=true; });
-    Object.keys(NODES).forEach(function(k){ if(NODES[k].svc===svc&&!NODES[k].stale){NODES[k].plugins.forEach(function(p){p[2]=p[1];});if(s.image)NODES[k].image=s.image;} });
-    s.recon='正常'; s.reconCls='t-ok';
-    renderNodes();
-  }
+  // 把单个实例(NODE)收敛到服务意图:实际版本=意图版本(L-1)、镜像=意图镜像。active([1]) 渲染时按意图派生,这里无需动。
+  function _convergeNode(key){ var n=NODES[key]; if(!n||n.stale)return; var s=SERVICES[n.svc]||{}; n.plugins.forEach(function(p){var iv=_intentVer(n.svc,p[0]); if(iv!==undefined)p[2]=iv;}); if(s.image)n.image=s.image; }
+  function _converge(svc){ _svcRunning(svc).forEach(_convergeNode); renderNodes(); renderServicesPage(); }  // L-2:补 renderServicesPage
   function startReapply(svc){
     var g=canDeploy(svc); if(!g.ok){toast(g.reason);return;}
-    var drifted=_driftedInsts(svc), all=((SERVICES[svc]||{}).inst||[]);
-    var names=(drifted.length?drifted:all).map(function(i){return i[0];});
+    var drifted=_svcRunning(svc).filter(function(k){return _nodeDrift(k);});
+    var names=(drifted.length?drifted:_svcRunning(svc));
     var steps=['drain（排空连接）…','docker 重启…','等待 /health/ready…','经 agent 重拉插件…'];
     _lastRollNames=names.slice();
-    _lastRollout=function(){ _rollout(svc,'🔁 重新投放中 · '+svc,'把已发布态重新喂给落后实例:'+steps.join(' → '),steps,names,function(){_convergeInst(svc);toast('已同步漂移实例');}); };
-    _rollout(svc,'🔁 重新投放中 · '+svc,'把已发布态重新喂给落后实例:'+steps.join(' → '),steps,names,function(){_convergeInst(svc);toast('已同步漂移实例');});
+    var done=function(){_converge(svc);toast('已同步漂移实例');};
+    _lastRollout=function(){ _rollout(svc,'🔁 重新投放中 · '+svc,'把已发布态重新喂给落后实例:'+steps.join(' → '),steps,names,done); };
+    _rollout(svc,'🔁 重新投放中 · '+svc,'把已发布态重新喂给落后实例:'+steps.join(' → '),steps,names,done);
   }
   function syncInstance(svc,instKey){
     var g=canDeploy(svc); if(!g.ok){toast(g.reason);return;}
@@ -746,9 +774,7 @@
     document.getElementById('publishModal').classList.add('on');syncMask();
     var steps=['drain（排空连接）…','docker 重启…','等待 /health/ready…','经 agent 重拉插件…'];
     _rollout(svc,'🔁 同步实例 · '+instKey,'把已发布态重新喂给该实例(不改意图):'+steps.join(' → '),steps,[instKey],function(){
-      var n=NODES[instKey]; if(n){n.plugins.forEach(function(p){p[2]=p[1];});var sv=SERVICES[svc];if(sv&&sv.image)n.image=sv.image;}
-      var s=SERVICES[svc]; if(s&&s.inst){var good=(s.inst.filter(function(i){return i[2];})[0]||[])[1];var row=s.inst.filter(function(i){return i[0]===instKey;})[0];if(row){if(good)row[1]=good;row[2]=true;}if(!s.inst.some(function(i){return !i[2];})){s.recon='正常';s.reconCls='t-ok';}}
-      renderNodes();
+      _convergeNode(instKey); renderNodes(); renderServicesPage();  // L-2
       toast('已同步实例 '+instKey);
     });
   }
@@ -798,7 +824,7 @@
     var keys=_nsNodes();
     var ag=_nsAgents(), onAg=ag.filter(function(n){return AGENTS[n].online;});
     var healthy=keys.filter(function(k){return NODES[k].running&&!NODES[k].stale;});
-    var behind=keys.filter(function(k){return NODES[k].plugins.some(function(p){return p[1]!==p[2];})||_nodeImgDrift(k);});
+    var behind=keys.filter(function(k){return _nodeDrift(k);});   // M-3:漂移=实例实际 vs 服务意图
     var st=document.getElementById('nodesStat'); if(st){
       st.innerHTML=
         '<div class="c"><div class="l">在线 agent</div><div class="v">'+onAg.length+' <span style="font-size:14px;color:var(--ink3)">/ '+ag.length+'</span></div></div>'+
@@ -810,7 +836,7 @@
     tb.innerHTML=keys.length?keys.map(function(k){
       var n=NODES[k];
       var stTag=n.stale?'<span class="tag t-off"><span class="dot" style="background:var(--ink3)"></span>离线·stale</span>':(n.running?'<span class="tag t-ok"><span class="dot" style="background:var(--ok)"></span>在线·健康</span>':'<span class="tag t-warn"><span class="dot" style="background:var(--warn)"></span>已停');
-      var verBehind=n.plugins.some(function(p){return p[1]!==p[2];})?' <span class="tag t-warn">版本落后</span>':'';
+      var verBehind=_nodePluginDrift(k)?' <span class="tag t-warn">版本落后</span>':'';   // M-3:实际 vs 意图
       var imgBehind=_nodeImgDrift(k)?' <span class="tag t-warn">镜像漂移</span>':'';
       var acts=n.stale
         ? '<a onclick="openNode(\''+k+'\')">详情</a><a onclick="nodeAct(\''+k+'\',\'启动\')">启动</a><span style="color:var(--ink3)" title="agent 离线,日志/运维不可用">日志</span><span style="color:var(--ink3)" title="agent 离线,运维不可用">运维不可用</span>'
@@ -835,6 +861,11 @@
     'wms-prod-a1':{ns:'k8s-prod-a',svc:'wms-prod',project:'prod-a1',dir:'/data/orchidea/prod/a1',image:'oci.bignof.com/nocobase-pro:release.1.7.x-1.7.19-rc.20260301080000',health:'离线 · stale',running:false,stale:true,
       plugins:[['@business/plugin-mom-wms','2.1.0','2.1.0'],['@orchisky/plugin-dictionary','1.3.2','1.3.2']]},
     'wms-prod-a2':{ns:'k8s-prod-a',svc:'wms-prod',project:'prod-a2',dir:'/data/orchidea/prod/a2',image:'oci.bignof.com/nocobase-pro:release.1.7.x-1.7.19-rc.20260301080000',health:'离线 · stale',running:false,stale:true,
+      plugins:[['@business/plugin-mom-wms','2.1.0','2.1.0'],['@orchisky/plugin-dictionary','1.3.2','1.3.2']]},
+    // M-7 跨机服务 tamagawa-wms 的实例:tw-a1 在 tamagawa-test、tw-b1 在 rolltest-agent(同 nacos 名跨 2 agent)
+    'tamagawa-wms-a1':{ns:'tamagawa-test',svc:'tamagawa-wms',project:'tw-a1',dir:'/data/orchidea/tw/a1',image:'oci.bignof.com/nocobase-pro:release.1.7.x_v2-1.7.20-rc.20260527091211',health:'在线 · 健康',running:true,
+      plugins:[['@business/plugin-mom-wms','2.1.0','2.1.0'],['@orchisky/plugin-dictionary','1.3.2','1.3.2']]},
+    'tamagawa-wms-b1':{ns:'rolltest-agent',svc:'tamagawa-wms',project:'tw-b1',dir:'/data/rolltest/tw-b1',image:'oci.bignof.com/nocobase-pro:release.1.7.x_v2-1.7.20-rc.20260527091211',health:'在线 · 健康',running:true,
       plugins:[['@business/plugin-mom-wms','2.1.0','2.1.0'],['@orchisky/plugin-dictionary','1.3.2','1.3.2']]}
   };
   function _imgTag(s){ s=s||''; var i=s.lastIndexOf(':'); return i>=0?s.slice(i+1):s; }
@@ -854,10 +885,10 @@
       '<tr><td style="color:var(--ink3)">镜像</td><td>'+imgCell+'</td></tr>'+
       '<tr><td style="color:var(--ink3)">状态</td><td>'+escapeHtml(n.health)+'</td></tr></table>';
     if(n.stale)basic+='<div class="banner" style="background:var(--soft);border-color:var(--line2);color:var(--ink2);margin-bottom:14px"><span>⚠️</span><div>该实例所属 agent <b>离线</b>:台账为最近一次发现的快照(stale),运维命令暂不可达。可在 agent 恢复后「启动」。</div></div>';
-    var anyDrift=n.plugins.some(function(p){return p[1]!==p[2];});
-    var pl='<h3 style="font-size:14px;margin:4px 0 8px">插件（active / 实际）'+(anyDrift?' <span class="tag t-warn">有漂移</span>':' <span class="tag t-ok">全一致</span>')+'</h3>'+
-      '<table><thead><tr><th>插件</th><th>active</th><th>实际</th><th></th></tr></thead><tbody>'+
-      n.plugins.map(function(p){var d=p[1]!==p[2];return '<tr><td class="mono">'+p[0]+'</td><td><span class="tag t-blue">'+p[1]+'</span></td><td>'+(d?'<span class="tag t-warn">'+p[2]+'</span>':'<span class="tag t-ok">'+p[2]+'</span>')+'</td><td>'+(d&&!n.stale?'<a style="color:var(--pri);cursor:pointer" onclick="syncInstance(\''+n.svc+'\',\''+key+'\')">同步该实例</a>':'')+'</td></tr>';}).join('')+'</tbody></table>';
+    var anyDrift=_nodePluginDrift(key);   // M-3:实例实际 vs 服务意图(active 从 SERVICES 派生)
+    var pl='<h3 style="font-size:14px;margin:4px 0 8px">插件（服务意图 / 实例实际）'+(anyDrift?' <span class="tag t-warn">有漂移</span>':' <span class="tag t-ok">全一致</span>')+'</h3>'+
+      '<table><thead><tr><th>插件</th><th>意图(active)</th><th>实际</th><th></th></tr></thead><tbody>'+
+      n.plugins.map(function(p){var iv=_intentVer(n.svc,p[0]); var act=(iv!==undefined?iv:p[1]); var d=(iv!==undefined&&p[2]!==iv);return '<tr><td class="mono">'+p[0]+'</td><td><span class="tag t-blue">'+act+'</span></td><td>'+(d?'<span class="tag t-warn">'+p[2]+'</span>':'<span class="tag t-ok">'+p[2]+'</span>')+'</td><td>'+(d&&!n.stale?'<a style="color:var(--pri);cursor:pointer" onclick="syncInstance(\''+n.svc+'\',\''+key+'\')">同步该实例</a>':'')+'</td></tr>';}).join('')+'</tbody></table>';
     if(imgDrift&&!n.stale)pl+='<div class="desc" style="margin-top:10px">镜像漂移:实例实际镜像与服务意图不一致,「同步该实例」会按 pull-redeploy 把它拉到意图镜像。</div>';
     var ops='<h3 style="font-size:14px;margin:18px 0 8px">操作</h3><div style="display:flex;gap:8px;flex-wrap:wrap">'+
       '<button class="btn" onclick="nodeAct(\''+key+'\',\'启动\')">启动</button>'+
@@ -954,6 +985,7 @@
     var g=_logCanView(key); if(!g.ok){toast(g.reason);return;}
     _logKey=key; _logLines=[]; _logSeq=0; _logAuto=true;
     var as=document.getElementById('logAutoScroll'); if(as)as.checked=true;
+    var sn=document.getElementById('logShowNo'); if(sn)sn.checked=true;   // L-3:复位行号开关,与 autoScroll 对称
     document.getElementById('logTitle').textContent='实例日志 · '+key;
     // 初始 tail:先灌一批"历史"行(像 docker logs --tail 进来先回放最近若干行)
     _pushLogLines(12);
@@ -1017,16 +1049,36 @@
     body+=keys.length?('<table><tbody>'+keys.map(function(k){var n=NODES[k];return '<tr><td class="mono" style="cursor:pointer" onclick="closeInfoDrawer();openNode(\''+k+'\')"><a style="color:var(--pri)">'+k+'</a></td><td>'+(n.stale?'<span class="tag t-off">stale</span>':(n.running?'<span class="tag t-ok">在跑</span>':'<span class="tag t-warn">已停</span>'))+'</td></tr>';}).join('')+'</tbody></table>'):'<div class="desc">'+(a.online?'暂无发现实例':'agent 离线,等待恢复后重新发现')+'</div>';
     _openInfo('Agent · '+code,body);
   }
+  // 服务=意图(单一真相):plugins=意图插件@版本;nacos=nacos 服务名(对账/滚动 key,默认=service_code 可分别编辑);
+  // 实例/对账/版本一律按 NODES 实算(见 _svcNodeKeys/_svcRunningInsts/_svcRecon),不再各存一份静态数字。
   var SERVICES={
-    'wms-test-admin':{ns:'tamagawa-test',alias:'WMS 管理端',recon:'版本漂移',reconCls:'t-warn',
-      plugins:[['@business/plugin-mom-wms','2.1.0'],['@orchisky/plugin-dictionary','1.3.2'],['@business/plugin-tamagawa-storage','2.0.0'],['@orchisky/plugin-menu-page','1.1.0'],['@orchisky/plugin-login-setting','1.0.4']],
-      inst:[['wms-test-admin','2.1.0',true],['wms-test-admin2','2.0.3',false]]},
-    'rolltest':{ns:'rolltest-agent',alias:'滚动测试',recon:'正常',reconCls:'t-ok',
-      plugins:[['@orchisky/plugin-menu-page','1.1.0'],['@orchisky/plugin-dictionary','1.3.2']],
-      inst:[['rolltest-node1','1.1.0',true],['rolltest-node2','1.1.0',true]]},
-    'wms-prod':{ns:'k8s-prod-a',alias:'WMS 生产',recon:'纳管未起',reconCls:'t-err',
-      plugins:[['@business/plugin-mom-wms','2.1.0'],['@orchisky/plugin-dictionary','1.3.2']],inst:[]}
+    'wms-test-admin':{ns:'tamagawa-test',nacos:'wms-test-admin',alias:'WMS 管理端',
+      plugins:[['@business/plugin-mom-wms','2.1.0'],['@orchisky/plugin-dictionary','1.3.2'],['@business/plugin-tamagawa-storage','2.0.0'],['@orchisky/plugin-menu-page','1.1.0'],['@orchisky/plugin-login-setting','1.0.4']]},
+    'rolltest':{ns:'rolltest-agent',nacos:'rolltest',alias:'滚动测试',
+      plugins:[['@orchisky/plugin-menu-page','1.1.0'],['@orchisky/plugin-dictionary','1.3.2']]},
+    'wms-prod':{ns:'k8s-prod-a',nacos:'wms-prod',alias:'WMS 生产',
+      plugins:[['@business/plugin-mom-wms','2.1.0'],['@orchisky/plugin-dictionary','1.3.2']]},
+    // M-7 跨机服务:同 nacos 名 tamagawa-wms 的实例落在 2 个 ns/agent(tamagawa-test + rolltest-agent),演示跨 agent 串行 + 集群健康门
+    'tamagawa-wms':{ns:'tamagawa-test',nacos:'tamagawa-wms',alias:'玉川 WMS(跨机)',crossNs:true,agents:['tamagawa-test','rolltest-agent'],
+      plugins:[['@business/plugin-mom-wms','2.1.0'],['@orchisky/plugin-dictionary','1.3.2']]}
   };
+  // ===== 服务-实例派生(单一真相,M-1/M-3):一律按 NODES 实算 =====
+  function _svcNodes(svc){ return Object.keys(NODES).filter(function(k){return NODES[k].svc===svc;}); }          // 该服务全部发现实例
+  function _svcRunning(svc){ return _svcNodes(svc).filter(function(k){return NODES[k].running&&!NODES[k].stale;}); } // 在跑实例
+  function _intentVer(svc,pkg){ var s=SERVICES[svc]; if(!s)return undefined; var p=(s.plugins||[]).filter(function(x){return x[0]===pkg;})[0]; return p?p[1]:undefined; }
+  // 实例某插件是否漂移 = 实际([2]) ≠ 服务意图(从 SERVICES 派生);active([1]) 渲染时也按意图覆盖
+  function _nodePluginDrift(key){ var n=NODES[key]; if(!n||n.stale)return false; return n.plugins.some(function(p){var iv=_intentVer(n.svc,p[0]); return iv!==undefined && p[2]!==iv;}); }
+  function _nodeDrift(key){ return _nodePluginDrift(key)||_nodeImgDrift(key); }
+  // 服务对账(计算,供列表/详情/统计卡同源):无在跑→纳管未起;有漂移→漂移;否则正常。stale-only(发现但全离线)按纳管未起
+  function _svcRecon(svc){
+    var running=_svcRunning(svc), all=_svcNodes(svc);
+    if(!running.length)return {label:'纳管未起',cls:'t-err'};
+    var drift=running.some(function(k){return _nodeDrift(k);});
+    if(drift)return {label:'版本/镜像漂移',cls:'t-warn'};
+    return {label:'正常',cls:'t-ok'};
+  }
+  // 兼容旧调用:_driftedInsts 返回该服务在跑但漂移的实例 key(供 openReapply/startReapply)
+  function _driftedInsts(svc){ return _svcRunning(svc).filter(function(k){return _nodeDrift(k);}).map(function(k){return [k];}); }
   // 未纳管(inbox)服务:数据驱动,「忽略」即移除行 + 角标 -1(M15)
   var INBOX=[
     {ns:'tamagawa-test',svc:'wms-test-portal',running:'1 在跑',since:'2026-06-18 08:50'},
@@ -1040,12 +1092,24 @@
     var mc=document.getElementById('tabManagedCount'); if(mc)mc.textContent=_nsServices().length;
     var ic=document.getElementById('tabInboxCount'); if(ic)ic.textContent=INBOX.filter(function(x){return CURRENT_NS==='all'||x.ns===CURRENT_NS;}).length;
   }
-  // 服务页统计卡:按 ns + 实时数据算(M15 忽略后联动、G4 ns 联动)
+  // 已纳管服务表(M-1,数据驱动:从 _nsServices/SERVICES 渲染,实例/对账按 NODES 实算,与详情/统计卡同源)
+  function renderManaged(){
+    var tb=document.getElementById('svcManagedBody'); if(!tb)return;
+    var svc=_nsServices();
+    tb.innerHTML=svc.length?svc.map(function(s){
+      var o=SERVICES[s], rec=_svcRecon(s), run=_svcRunning(s).length, total=_svcNodes(s).length;
+      var cross=o.crossNs?' <span class="tag t-blue" title="同 nacos 名跨多 agent/ns">跨机</span>':'';
+      return '<tr data-ns="'+o.ns+'"><td>'+o.ns+'</td><td><span class="tag t-blue">'+s+'</span>'+cross+'</td><td>'+escapeHtml(o.alias||'')+'</td>'+
+        '<td>'+o.plugins.length+' 个</td><td>'+run+' / '+total+'</td><td><span class="tag '+rec.cls+'">'+rec.label+'</span></td>'+
+        '<td class="acts"><a onclick="openService(\''+s+'\')">详情</a><a onclick="openServiceConfig(\''+s+'\')">配置</a><a onclick="openServiceImage(\''+s+'\')">镜像</a><a onclick="openDeploy(\''+s+'\')">发布</a></td></tr>';
+    }).join(''):'<tr><td colspan="7" style="color:var(--ink3);padding:18px;text-align:center">该命名空间暂无已纳管服务</td></tr>';
+  }
+  // 服务页统计卡:按 ns + 实时数据算(M15 忽略后联动、G4 ns 联动、M-1 实例从 NODES 实算)
   function renderServicesPage(){
     var svc=_nsServices();
     var unadopted=INBOX.filter(function(x){return CURRENT_NS==='all'||x.ns===CURRENT_NS;}).length;
-    var notStarted=svc.filter(function(s){return (SERVICES[s].inst||[]).length===0;}).length;
-    var drift=svc.filter(function(s){return _driftedInsts(s).length>0||((SERVICES[s].inst||[]).some(function(i){return NODES[i[0]]&&_nodeImgDrift(i[0]);}));}).length;
+    var notStarted=svc.filter(function(s){return _svcRunning(s).length===0;}).length;
+    var drift=svc.filter(function(s){return _svcRunning(s).some(function(k){return _nodeDrift(k);});}).length;
     var st=document.getElementById('svcStat'); if(st){
       st.innerHTML=
         '<div class="c"><div class="l">在跑未纳管</div><div class="v" style="color:var(--warn)">'+unadopted+'</div></div>'+
@@ -1053,6 +1117,7 @@
         '<div class="c"><div class="l">漂移(版本/镜像)</div><div class="v" style="color:var(--warn)">'+drift+'</div></div>'+
         '<div class="c"><div class="l">已纳管</div><div class="v">'+svc.length+'</div></div>';
     }
+    renderManaged();
     renderInbox();
   }
   function ignoreInbox(svc){
@@ -1065,13 +1130,16 @@
   }
   function openService(svc){
     var s=SERVICES[svc];if(!s)return;
-    var ac=_imgAppliedCount(svc);
+    var ac=_imgAppliedCount(svc), rec=_svcRecon(svc);
     var imgTag=ac.total?'<span class="tag '+(ac.applied===ac.total?'t-ok':'t-warn')+'">'+ac.applied+'/'+ac.total+' 实例已应用</span>':'<span class="tag t-off">无在跑实例</span>';
-    var basic='<table style="margin-bottom:14px"><tr><td style="color:var(--ink3);width:120px">命名空间</td><td>'+s.ns+'</td></tr><tr><td style="color:var(--ink3)">服务名</td><td class="mono">'+svc+'</td></tr><tr><td style="color:var(--ink3)">别名</td><td>'+s.alias+'</td></tr>'+
-      '<tr><td style="color:var(--ink3)">对账(版本)</td><td><span class="tag '+s.reconCls+'">'+s.recon+'</span></td></tr>'+
+    var nsRow=s.crossNs?('<tr><td style="color:var(--ink3);width:120px">命名空间</td><td>'+_svcAgents(svc).join('、')+' <span class="tag t-blue">跨机</span></td></tr><tr><td style="color:var(--ink3)">nacos 服务名</td><td class="mono">'+(s.nacos||svc)+'</td></tr>')
+      :('<tr><td style="color:var(--ink3);width:120px">命名空间</td><td>'+s.ns+'</td></tr><tr><td style="color:var(--ink3)">nacos 服务名</td><td class="mono">'+(s.nacos||svc)+'</td></tr>');
+    var basic='<table style="margin-bottom:14px">'+nsRow+'<tr><td style="color:var(--ink3)">service_code</td><td class="mono">'+svc+'</td></tr><tr><td style="color:var(--ink3)">别名</td><td>'+escapeHtml(s.alias||'')+'</td></tr>'+
+      '<tr><td style="color:var(--ink3)">对账(版本)</td><td><span class="tag '+rec.cls+'">'+rec.label+'</span></td></tr>'+
       '<tr><td style="color:var(--ink3)">对账(镜像)</td><td title="'+escapeHtml(s.image||'')+'">'+imgTag+'</td></tr></table>';
-    var pl='<h3 style="font-size:14px;margin:4px 0 8px">绑定插件（active）</h3><table><tbody>'+s.plugins.map(function(p){return '<tr><td class="mono">'+p[0]+'</td><td><span class="tag t-blue">'+p[1]+'</span></td><td><a style="color:var(--pri);cursor:pointer" onclick="openVersionHistory(\''+p[0]+'\')">历史</a></td></tr>';}).join('')+'</tbody></table>';
-    var inst=s.inst.length?('<h3 style="font-size:14px;margin:16px 0 8px">实例（实际版本 / 镜像）</h3><table><tbody>'+s.inst.map(function(i){var id=NODES[i[0]]&&_nodeImgDrift(i[0]);return '<tr><td class="mono" style="cursor:pointer" onclick="closeInfoDrawer();openNode(\''+i[0]+'\')"><a style="color:var(--pri)">'+i[0]+'</a></td><td>'+(i[2]?'<span class="tag t-ok">'+i[1]+'</span>':'<span class="tag t-warn">'+i[1]+' 漂移</span>')+(id?' <span class="tag t-warn">镜像漂移</span>':'')+'</td></tr>';}).join('')+'</tbody></table>'):'<div class="desc" style="margin-top:14px">暂无在跑实例（纳管未起）。</div>';
+    var pl='<h3 style="font-size:14px;margin:4px 0 8px">绑定插件（意图 active）</h3><table><tbody>'+s.plugins.map(function(p){return '<tr><td class="mono">'+p[0]+'</td><td><span class="tag t-blue">'+p[1]+'</span></td><td><a style="color:var(--pri);cursor:pointer" onclick="openVersionHistory(\''+p[0]+'\')">历史</a></td></tr>';}).join('')+'</tbody></table>';
+    var nodes=_svcNodes(svc);
+    var inst=nodes.length?('<h3 style="font-size:14px;margin:16px 0 8px">实例（'+_svcRunning(svc).length+' 在跑 / '+nodes.length+' 发现）</h3><table><tbody>'+nodes.map(function(k){var n=NODES[k];var vd=_nodePluginDrift(k),id=_nodeImgDrift(k);var stat=n.stale?'<span class="tag t-off">stale</span>':(n.running?'<span class="tag t-ok">在跑</span>':'<span class="tag t-warn">已停</span>');return '<tr><td class="mono" style="cursor:pointer" onclick="closeInfoDrawer();openNode(\''+k+'\')"><a style="color:var(--pri)">'+k+'</a>'+(s.crossNs?' <span style="color:var(--ink3);font-size:12px">['+n.ns+']</span>':'')+'</td><td>'+stat+(vd?' <span class="tag t-warn">版本漂移</span>':'')+(id?' <span class="tag t-warn">镜像漂移</span>':'')+'</td></tr>';}).join('')+'</tbody></table>'):'<div class="desc" style="margin-top:14px">暂无发现实例。</div>';
     var ops='<div style="display:flex;gap:8px;margin-top:16px;flex-wrap:wrap"><button class="btn pri" onclick="closeInfoDrawer();openDeploy(\''+svc+'\')">发布</button><button class="btn" onclick="closeInfoDrawer();openServiceConfig(\''+svc+'\')">配置</button><button class="btn" onclick="closeInfoDrawer();openServiceImage(\''+svc+'\')">镜像</button></div>';
     _openInfo('服务 · '+svc,basic+pl+inst+ops);
   }
@@ -1137,7 +1205,8 @@
   var SERVICE_IMAGES={
     'wms-test-admin':[['oci.bignof.com/nocobase-pro:release.1.7.x_v2-1.7.20-rc.20260527091211','2026-05-27 09:12',true],['oci.bignof.com/nocobase-pro:release.1.7.x_v2-1.7.20-rc.20260512143000','2026-05-12 14:30',false],['oci.bignof.com/nocobase-pro:release.1.7.x-1.7.19-rc.20260420103000','2026-04-20 10:30',false]],
     'rolltest':[['oci.bignof.com/nocobase-pro:release.1.7.x_v2-1.7.20-rc.20260621104239','2026-06-21 10:42',true],['oci.bignof.com/nocobase-pro:release.1.7.x_v2-1.7.20-rc.20260615142000','2026-06-15 14:20',false]],
-    'wms-prod':[['oci.bignof.com/nocobase-pro:release.1.7.x-1.7.19-rc.20260301080000','2026-03-01 08:00',true]]
+    'wms-prod':[['oci.bignof.com/nocobase-pro:release.1.7.x-1.7.19-rc.20260301080000','2026-03-01 08:00',true]],
+    'tamagawa-wms':[['oci.bignof.com/nocobase-pro:release.1.7.x_v2-1.7.20-rc.20260527091211','2026-05-27 09:12',true],['oci.bignof.com/nocobase-pro:release.1.7.x_v2-1.7.20-rc.20260512143000','2026-05-12 14:30',false]]
   };
   var _siSvc='wms-test-admin';
   function openServiceImage(svc){ _siSvc=svc; go('serviceimage'); renderServiceImage(svc); }
@@ -1165,22 +1234,23 @@
     var a=SERVICE_IMAGES[svc]||[]; var img=(typeof idx==='number')?(a[idx]&&a[idx][0]):idx; if(!img)return;
     setCurrentImage(svc,img); renderServiceImage(svc); toast('已暂存回滚到该镜像（去「发布」生效）');
   }
+  // 回源粒度(H-7):一行 = 一个 ns+service 的回源汇总;plugins=[[包,回源版本,回源时间],...](无 per-容器、无命中标志——命中不回源)
   var FETCH_RECORDS=[
-    {ns:'tamagawa-test',svc:'wms-test-admin',inst:'wms-test-admin',last:'2026-06-18 09:15:22',plugins:[['@business/plugin-mom-wms','2.1.0','命中'],['@orchisky/plugin-dictionary','1.3.2','回源'],['@business/plugin-tamagawa-storage','2.0.0','命中'],['@orchisky/plugin-menu-page','1.1.0','命中'],['@orchisky/plugin-login-setting','1.0.4','命中']]},
-    {ns:'tamagawa-test',svc:'wms-test-admin',inst:'wms-test-admin2',last:'2026-06-18 09:10:03',plugins:[['@business/plugin-mom-wms','2.0.3','命中'],['@orchisky/plugin-dictionary','1.3.2','命中']]},
-    {ns:'rolltest-agent',svc:'rolltest',inst:'rolltest-node1',last:'2026-06-12 14:22:51',plugins:[['@orchisky/plugin-menu-page','1.1.0','回源'],['@orchisky/plugin-dictionary','1.3.2','回源']]},
-    {ns:'rolltest-agent',svc:'rolltest',inst:'rolltest-node2',last:'2026-06-12 14:23:05',plugins:[['@orchisky/plugin-menu-page','1.1.0','命中'],['@orchisky/plugin-dictionary','1.3.2','命中']]}
+    {ns:'tamagawa-test',svc:'wms-test-admin',last:'2026-06-18 09:15:22',plugins:[['@business/plugin-mom-wms','2.1.0','2026-06-18 09:15:22'],['@orchisky/plugin-dictionary','1.3.2','2026-06-18 09:10:41']]},
+    {ns:'rolltest-agent',svc:'rolltest',last:'2026-06-12 14:22:51',plugins:[['@orchisky/plugin-menu-page','1.1.0','2026-06-12 14:22:51'],['@orchisky/plugin-dictionary','1.3.2','2026-06-12 14:22:55']]},
+    {ns:'tamagawa-test',svc:'tamagawa-wms',last:'2026-06-19 11:02:13',plugins:[['@business/plugin-mom-wms','2.1.0','2026-06-19 11:02:13'],['@orchisky/plugin-dictionary','1.3.2','2026-06-19 11:02:18']]}
   ];
   function renderFetch(){
     var tb=document.getElementById('fetchBody'); if(!tb)return;
-    tb.innerHTML=FETCH_RECORDS.map(function(f,i){return '<tr data-ns="'+f.ns+'"><td>'+f.ns+'</td><td><span class="tag t-blue">'+f.svc+'</span></td><td class="mono">'+f.inst+'</td><td class="mono" style="color:var(--ink3)">'+f.last+'</td><td>'+f.plugins.length+'</td><td class="acts"><a onclick="openFetchDetail('+i+')">详情</a></td></tr>';}).join('');
+    tb.innerHTML=FETCH_RECORDS.map(function(f,i){return '<tr data-ns="'+f.ns+'"><td>'+f.ns+'</td><td><span class="tag t-blue">'+f.svc+'</span></td><td class="mono" style="color:var(--ink3)">'+f.last+'</td><td>'+f.plugins.length+'</td><td class="acts"><a onclick="openFetchDetail('+i+')">详情</a></td></tr>';}).join('');
   }
   function openFetchDetail(i){
     var f=FETCH_RECORDS[i]; if(!f)return;
-    var body='<table style="margin-bottom:6px"><tr><td style="color:var(--ink3);width:90px">命名空间</td><td>'+f.ns+'</td></tr><tr><td style="color:var(--ink3)">服务</td><td class="mono">'+f.svc+'</td></tr><tr><td style="color:var(--ink3)">实例</td><td class="mono">'+f.inst+'</td></tr><tr><td style="color:var(--ink3)">最近拉取</td><td class="mono">'+f.last+'</td></tr></table>'+
-      '<h3 style="font-size:14px;margin:10px 0 8px">拉取的插件</h3><table><thead><tr><th>插件</th><th>版本</th><th>来源</th></tr></thead><tbody>'+
-      f.plugins.map(function(p){return '<tr><td class="mono">'+p[0]+'</td><td><span class="tag t-blue">'+p[1]+'</span></td><td>'+(p[2]==='命中'?'<span class="tag t-ok">缓存命中</span>':'<span class="tag t-blue">回源平台</span>')+'</td></tr>';}).join('')+'</tbody></table>';
-    _openInfo('拉包详情 · '+f.inst,body);
+    var body='<table style="margin-bottom:6px"><tr><td style="color:var(--ink3);width:90px">命名空间</td><td>'+f.ns+'</td></tr><tr><td style="color:var(--ink3)">服务</td><td class="mono">'+f.svc+'</td></tr><tr><td style="color:var(--ink3)">最近回源</td><td class="mono">'+f.last+'</td></tr></table>'+
+      '<div class="desc" style="margin:8px 0">回源粒度:仅记「该 ns/服务何时回了哪个版本的源」。命中本机缓存不回源故不在此;per-容器命中以 agent 本地日志为权威。</div>'+
+      '<h3 style="font-size:14px;margin:10px 0 8px">回源的插件</h3><table><thead><tr><th>插件</th><th>回源版本</th><th>回源时间</th></tr></thead><tbody>'+
+      f.plugins.map(function(p){return '<tr><td class="mono">'+p[0]+'</td><td><span class="tag t-blue">'+p[1]+'</span></td><td class="mono" style="color:var(--ink3)">'+p[2]+'</td></tr>';}).join('')+'</tbody></table>';
+    _openInfo('回源详情 · '+f.svc,body);
   }
   function servicesOfNs(ns){return Object.keys(SERVICES).filter(function(s){return SERVICES[s].ns===ns;});}
   // 插件上传(M15):选择文件→暂存→上传后插入「最近上传」一行
@@ -1232,8 +1302,12 @@
     var svc=document.getElementById('upubSvc').value,p=_upubPlugin;
     if(!svc){toast('该命名空间暂无服务,先去纳管');return;}
     var ver=PLUGIN_LATEST[p]||'1.0.0';
-    if(SERVICES[svc]&&!SERVICES[svc].plugins.some(function(x){return x[0]===p;}))SERVICES[svc].plugins.push([p,ver]);
-    closeUpub();toast('已发布 '+p+'@'+ver+' → '+svc+'(已绑定并触发投放)');
+    var added=false;
+    if(SERVICES[svc]&&!SERVICES[svc].plugins.some(function(x){return x[0]===p;})){SERVICES[svc].plugins.push([p,ver]);added=true;}
+    closeUpub();
+    // M-4:与 bind/unbind/changeVersion 一致——暂存,去发布生效(不裸 push+假投放文案)
+    openServiceConfig(svc);
+    toast(added?('已暂存绑定 '+p+'（去「发布」生效）'):(p+' 已绑定,无需重复'));
   }
   function closePublish(){document.getElementById('publishModal').classList.remove('on');syncMask()}
   var tt;
