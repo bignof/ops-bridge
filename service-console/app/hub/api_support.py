@@ -1,5 +1,5 @@
 from __future__ import annotations
-from app.hub.config import settings as _hub_settings
+from app.config import settings as _hub_settings
 
 import hmac
 import json

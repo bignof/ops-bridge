@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 from fastapi import HTTPException, status
 
 if TYPE_CHECKING:  # 仅类型提示,避免运行时硬依赖具体类型
-    from app.hub.config import Settings
+    from app.config import Settings
 
 # 模块级滑窗:记录每次"通过"的 force 操作时间戳(time.monotonic 秒)。
 _force_op_timestamps: deque[float] = deque()

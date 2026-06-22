@@ -30,7 +30,6 @@ from app.routers.system import router as system_router
 # _handle_agent_message / _remote_address 在此 import 即成为 app.main 模块全局,
 # 供 hub 路由 / WS 经 `import app.main as main_module; main_module.X` 取用。
 from app.hub.api_support import _handle_agent_message, _remote_address  # noqa: F401 (经 main_module 取用)
-from app.hub.config import settings as hub_settings
 from app.hub.db import Database as HubDatabase
 from app.hub.store import HubState
 from app.hub.routers.agent_ws import router as agent_ws_router
@@ -52,8 +51,8 @@ database = Database(settings.database_url)
 # 守卫);S4 合 DB 后并入 database。
 hub_database = HubDatabase(settings.hub_database_url)
 hub_state = HubState(
-    heartbeat_timeout=hub_settings.heartbeat_timeout,
-    command_history_limit=hub_settings.command_history_limit,
+    heartbeat_timeout=settings.heartbeat_timeout,
+    command_history_limit=settings.command_history_limit,
     database=hub_database,
 )
 

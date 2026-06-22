@@ -1,4 +1,4 @@
-from app.hub.config import settings as _hub_settings
+from app.config import settings as _hub_settings
 import asyncio
 import logging
 import uuid

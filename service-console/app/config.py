@@ -21,6 +21,18 @@ class Settings:
     hub_admin_token: str = os.getenv("HUB_ADMIN_TOKEN", "")
     plugin_storage_dir: str = os.getenv("PLUGIN_STORAGE_DIR", "./data/plugins")
     plugin_download_base_url: str = os.getenv("PLUGIN_DOWNLOAD_BASE_URL", "")
+    # ── 并入的 hub 配置(S3;原 service-hub/app/config.py)──
+    # admin_token:hub 控制链路由(/api/agents 等)的 X-Admin-Token 自校验(与平台 JWT 正交)。
+    admin_token: str = os.getenv("ADMIN_TOKEN", "")
+    heartbeat_timeout: int = int(os.getenv("HEARTBEAT_TIMEOUT", "90"))
+    command_history_limit: int = int(os.getenv("COMMAND_HISTORY_LIMIT", "200"))
+    rolling_settle_sec: int = int(os.getenv("ROLLING_SETTLE_SEC", "35"))
+    rolling_shutdown_timeout: int = int(os.getenv("ROLLING_SHUTDOWN_TIMEOUT", "60"))
+    rolling_ready_timeout: int = int(os.getenv("ROLLING_READY_TIMEOUT", "180"))
+    rolling_cmd_timeout: int = int(os.getenv("ROLLING_CMD_TIMEOUT", "480"))
+    list_instances_timeout: int = int(os.getenv("LIST_INSTANCES_TIMEOUT", "10"))
+    force_op_max_per_window: int = int(os.getenv("FORCE_OP_MAX_PER_WINDOW", "10"))
+    force_op_window_sec: int = int(os.getenv("FORCE_OP_WINDOW_SEC", "60"))
 
 
 settings = Settings()
