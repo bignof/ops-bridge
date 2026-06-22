@@ -61,6 +61,9 @@ PLUGIN_CACHE_MAX_BYTES = int(os.getenv('PLUGIN_CACHE_MAX_BYTES', str(2 * 1024 * 
 PLUGIN_SERVE_HOST      = os.getenv('PLUGIN_SERVE_HOST', '127.0.0.1')
 PLUGIN_SERVE_PORT      = int(os.getenv('PLUGIN_SERVE_PORT', '18082'))
 
+# --- 自动发现上报(P3):周期把本机 compose 容器(含 stopped)+ nacos 实例经 WS 报给 console ---
+DISCOVERY_INTERVAL     = int(os.getenv('DISCOVERY_INTERVAL', '30'))  # 秒;<=0 = 禁用发现上报线程
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'

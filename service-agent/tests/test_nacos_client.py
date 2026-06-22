@@ -126,3 +126,94 @@ def test_list_instances_http_error_no_response(monkeypatch):
     with pytest.raises(RuntimeError) as ei:
         nacos_client.list_healthy_instances("svc")
     assert "SECRET" not in str(ei.value)
+
+
+# --- list_all_instances(P3 发现:全服务全实例,含不健康)---
+
+
+def test_list_all_instances_requires_server(monkeypatch):
+    monkeypatch.setattr(config, "NACOS_SERVER", "")
+    with pytest.raises(RuntimeError):
+        nacos_client.list_all_instances()
+
+
+def test_list_all_instances_collects_all_services_unfiltered(monkeypatch):
+    monkeypatch.setattr(config, "NACOS_SERVER", "1.2.3.4:8848")
+    monkeypatch.setattr(config, "NACOS_CONTEXT_PATH", "/nacos")
+    monkeypatch.setattr(config, "NACOS_NAMESPACE", "dev")
+    monkeypatch.setattr(config, "NACOS_GROUP", "G")
+    monkeypatch.setattr(config, "NACOS_USERNAME", "")
+    calls = []
+
+    def fake_get_json(url, params=None, timeout=10):
+        calls.append(url)
+        if url.endswith("/v1/ns/service/list"):
+            assert params["namespaceId"] == "dev"
+            return {"doms": ["svc-a", "svc-b"]}
+        if url.endswith("/v1/ns/instance/list"):
+            svc = params["serviceName"]
+            return {"hosts": [{"ip": "10.0.0.1", "port": 18029, "healthy": svc == "svc-a"}]}
+        raise AssertionError(url)
+
+    monkeypatch.setattr(http_client, "get_json", fake_get_json)
+    out = nacos_client.list_all_instances()
+    assert out == [
+        {"serviceName": "svc-a", "ip": "10.0.0.1", "port": 18029, "healthy": True},
+        {"serviceName": "svc-b", "ip": "10.0.0.1", "port": 18029, "healthy": False},  # 含不健康
+    ]
+    assert calls[0].endswith("/v1/ns/service/list")
+
+
+def test_list_all_instances_login_token_propagates(monkeypatch):
+    monkeypatch.setattr(config, "NACOS_SERVER", "1.2.3.4:8848")
+    monkeypatch.setattr(config, "NACOS_CONTEXT_PATH", "/nacos")
+    monkeypatch.setattr(config, "NACOS_NAMESPACE", "")
+    monkeypatch.setattr(config, "NACOS_GROUP", "G")
+    monkeypatch.setattr(config, "NACOS_USERNAME", "nacos")
+    monkeypatch.setattr(nacos_client, "_login", lambda: "tok-9")
+    seen = []
+
+    def fake_get_json(url, params=None, timeout=10):
+        seen.append(params.get("accessToken"))
+        if url.endswith("/service/list"):
+            return {"doms": ["s"]}
+        return {"hosts": []}
+
+    monkeypatch.setattr(http_client, "get_json", fake_get_json)
+    nacos_client.list_all_instances()
+    assert seen == ["tok-9", "tok-9"]  # service/list + instance/list 都带同一 token(登录只一次)
+
+
+def test_list_all_instances_service_list_error_strips_token(monkeypatch):
+    monkeypatch.setattr(config, "NACOS_SERVER", "1.2.3.4:8848")
+    monkeypatch.setattr(config, "NACOS_CONTEXT_PATH", "/nacos")
+    monkeypatch.setattr(config, "NACOS_NAMESPACE", "")
+    monkeypatch.setattr(config, "NACOS_GROUP", "G")
+    monkeypatch.setattr(config, "NACOS_USERNAME", "")
+
+    def boom(url, params=None, timeout=10):
+        raise requests.HTTPError("403 accessToken=SECRET", response=FakeResp(status=403))
+
+    monkeypatch.setattr(http_client, "get_json", boom)
+    with pytest.raises(RuntimeError) as ei:
+        nacos_client.list_all_instances()
+    assert "SECRET" not in str(ei.value)
+    assert "403" in str(ei.value)
+
+
+def test_list_all_instances_instance_list_error_no_response_strips_token(monkeypatch):
+    monkeypatch.setattr(config, "NACOS_SERVER", "1.2.3.4:8848")
+    monkeypatch.setattr(config, "NACOS_CONTEXT_PATH", "/nacos")
+    monkeypatch.setattr(config, "NACOS_NAMESPACE", "")
+    monkeypatch.setattr(config, "NACOS_GROUP", "G")
+    monkeypatch.setattr(config, "NACOS_USERNAME", "")
+
+    def fake(url, params=None, timeout=10):
+        if url.endswith("/service/list"):
+            return {"doms": ["s"]}
+        raise requests.HTTPError("boom accessToken=SECRET")  # response None → "?"
+
+    monkeypatch.setattr(http_client, "get_json", fake)
+    with pytest.raises(RuntimeError) as ei:
+        nacos_client.list_all_instances()
+    assert "SECRET" not in str(ei.value)

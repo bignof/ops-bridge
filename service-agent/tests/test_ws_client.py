@@ -29,8 +29,10 @@ def _import_ws_client(monkeypatch: pytest.MonkeyPatch, **env_overrides: str):
 def test_connection_state_and_open_close_error(monkeypatch: pytest.MonkeyPatch) -> None:
     module = _import_ws_client(monkeypatch)
     heartbeat_calls: list[object] = []
+    discovery_calls: list[object] = []
 
     monkeypatch.setattr(module, "_start_heartbeat", lambda ws: heartbeat_calls.append(ws))
+    monkeypatch.setattr(module, "start_discovery_reporter", lambda ws: discovery_calls.append(ws))
     monkeypatch.setattr(module.time, "time", lambda: 123.0)
 
     ws = SimpleNamespace(keep_running=True)
@@ -44,6 +46,7 @@ def test_connection_state_and_open_close_error(monkeypatch: pytest.MonkeyPatch) 
     assert state["last_disconnect_ts"] == 123.0
     assert state["last_error"] == "boom"
     assert heartbeat_calls == [ws]
+    assert discovery_calls == [ws]  # P3-3:连上后启动发现上报
 
 
 def test_on_open_sends_register_frame_with_capabilities(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -54,6 +57,7 @@ def test_on_open_sends_register_frame_with_capabilities(monkeypatch: pytest.Monk
 
     # 避免起心跳线程；同时断言它仍被调用（不回归）。
     monkeypatch.setattr(module, "_start_heartbeat", lambda ws: heartbeat_calls.append(ws))
+    monkeypatch.setattr(module, "start_discovery_reporter", lambda ws: None)  # 避免起发现线程
     monkeypatch.setattr(module, "send_message", lambda ws, payload: sent.append(payload))
     monkeypatch.setattr(module.time, "time", lambda: 123.0)
 

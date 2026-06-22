@@ -6,6 +6,7 @@ import time
 import websocket
 
 from config import AGENT_ID, AGENT_KEY, AGENT_VERSION, HEARTBEAT_INTERVAL, WS_URL
+from core.discovery_reporter import start_discovery_reporter
 from core.handlers import HANDLERS, dispatch, send_message
 from core.log_sessions import start_log_session, stop_log_session
 from core.rolling import handle_graceful_restart, handle_list_instances
@@ -52,6 +53,7 @@ def _on_open(ws):
         'agentVersion': AGENT_VERSION,
     })
     _start_heartbeat(ws)
+    start_discovery_reporter(ws)  # P3-3:连上后周期发现上报(DISCOVERY_INTERVAL<=0 则跳过)
 
 
 def _on_message(ws, message):
