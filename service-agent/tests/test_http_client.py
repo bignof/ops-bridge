@@ -81,3 +81,56 @@ def test_post_headers_default_none_passthrough(monkeypatch):
     assert http_client.post("http://x", headers=None) == (200, "ok")
     assert captured.get("headers") is None
     assert captured.get("allow_redirects") is False
+
+
+def test_get_json_forwards_headers(monkeypatch):
+    # P1-3：回源拉清单须带 Authorization: Bearer <pull-token>
+    captured = {}
+    def fake_get(url, params=None, timeout=10, **kwargs):
+        captured.update(kwargs)
+        return FakeResp(payload={"ok": 1})
+    monkeypatch.setattr(requests, "get", fake_get)
+    assert http_client.get_json("http://x", headers={"Authorization": "Bearer t"}) == {"ok": 1}
+    assert captured.get("headers") == {"Authorization": "Bearer t"}
+    assert captured.get("allow_redirects") is False
+
+
+class FakeStreamResp:
+    def __init__(self, chunks=(b"a", b"b"), status=200):
+        self._chunks = chunks
+        self.status_code = status
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(str(self.status_code))
+    def iter_content(self, chunk_size=1):
+        for c in self._chunks:
+            yield c
+
+
+def test_download_streams_to_file_skips_empty_chunks(monkeypatch, tmp_path):
+    captured = {}
+    def fake_get(url, headers=None, timeout=60, allow_redirects=False, stream=False, **k):
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["stream"] = stream
+        captured["allow_redirects"] = allow_redirects
+        return FakeStreamResp(chunks=[b"PKG", b"", b"DATA"])  # 空块应被跳过
+    monkeypatch.setattr(requests, "get", fake_get)
+    dest = tmp_path / "out.tgz"
+    http_client.download("http://x/d/1", str(dest), headers={"Authorization": "Bearer t"})
+    assert dest.read_bytes() == b"PKGDATA"
+    assert captured["stream"] is True          # 须流式,避免大包全载内存
+    assert captured["allow_redirects"] is False  # H1：禁跟随重定向
+    assert captured["headers"] == {"Authorization": "Bearer t"}
+
+
+def test_download_raises_on_4xx_without_writing(monkeypatch, tmp_path):
+    monkeypatch.setattr(requests, "get", lambda url, **k: FakeStreamResp(status=404))
+    dest = tmp_path / "out.tgz"
+    with pytest.raises(requests.HTTPError):
+        http_client.download("http://x/d/1", str(dest))
+    assert not dest.exists()  # raise_for_status 在打开文件前抛,不留半截文件

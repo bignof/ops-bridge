@@ -20,7 +20,7 @@ P4 的 publish→自动滚动 依赖 §4.1 协调器(同批,不可早于它)
 - **A(agent 侧)可与 M 并行**;P2 依赖 P1。
 - **P4 自动触发依赖 §4.1 协调器**(评审 M1/L1),二者同批。
 
-**进度**:P0 设计冻结基线已出 · **P1-1 ✓**(167cc65)· **P1-4 ✓** · 计划已并 console-merge(1dbdfae)· 已过 ultracode 二轮评审(2026-06-22)收口 · **M 合并 S1–S8 全部完成 ✅**(96c8c71→2d0dd71;hub+platform→单一 service-console,单库 12 表,进程内直调,373 测试绿,顶层只剩 service-agent+service-console)。**下一步:P1-2/P1-3(agent worker-facing + 回源)、P2(worker)、P3+(发现/实例页/投放,均落 service-console)**。
+**进度**:P0 设计冻结基线已出 · **P1-1 ✓**(167cc65)· **P1-4 ✓** · 计划已并 console-merge(1dbdfae)· 已过 ultracode 二轮评审(2026-06-22)收口 · **M 合并 S1–S8 全部完成 ✅**(96c8c71→2d0dd71;hub+platform→单一 service-console,单库 12 表,进程内直调,373 测试绿,顶层只剩 service-agent+service-console)· ultracode 遗留清理 ✅(7434e73)+ fixture 收口 ✅(99a245f)· **P1-2/P1-3 ✓**(agent worker-facing server + 回源;213 agent 测试绿,覆盖率 97.77%)。**下一步:P2(worker `sync-plugins.js` 配置 + mode2 gate + M4 验收)、P3+(发现/实例页/投放,均落 service-console)**。
 
 ---
 
@@ -60,8 +60,8 @@ P4 的 publish→自动滚动 依赖 §4.1 协调器(同批,不可早于它)
 | ID | 任务 | 仓库 / 模块 | 前置 | 验收 |
 | --- | --- | --- | --- | --- |
 | **P1-1 ✓** | **agent 插件缓存模块**:内容寻址(键=`attachmentId`)、容量上限 + LRU、`PLUGIN_CACHE_DIR`、并发同包 per-key 锁 | service-agent `services/plugin_cache.py` | P0 | **已完成**(167cc65,7 例 + 全量 179 passed) |
-| P1-2 | **worker-facing HTTP**:`GET /plugins?service=` + `GET /download/{attachmentId}`;**独立 server 绑 `PLUGIN_SERVE_HOST` 默认 `127.0.0.1`**(不复用 `HEALTH_HOST` 的 0.0.0.0)、`PLUGIN_SERVE_PORT`;**忽略 worker 传入 ns、恒用本 ns** | service-agent(新 server 模块) | P1-1 | 本机 curl 通;**从另一台 curl 被拒**(L4) |
-| P1-3 | **agent→console 回源**:持 pull-token 调 console `/api/distribution/{plugins,download}`,清单 `url` 改写指向自己;回源喂 `plugin_cache.get_or_fetch` | service-agent + service-console(复用 `distribution.py`) | P1-1 | 未命中 → 回源一次 → 落缓存 → 喂 worker |
+| **P1-2 ✓** | **worker-facing HTTP**:`GET /plugins?service=` + `GET /download/{attachmentId}`;**独立 server 绑 `PLUGIN_SERVE_HOST` 默认 `127.0.0.1`**(不复用 `HEALTH_HOST` 的 0.0.0.0)、`PLUGIN_SERVE_PORT`;**忽略 worker 传入 ns、恒用本 ns** | service-agent `core/plugin_server.py` | P1-1 | **已完成**(`maybe_start_plugin_server` 仅配齐才起;url 改写 echo Host;未配→503;213 测试绿)。**rolltest 床 curl 验收待联调** |
+| **P1-3 ✓** | **agent→console 回源**:持 pull-token 调 console `/api/distribution/{plugins,download}`,清单 `url` 改写指向自己;回源喂 `plugin_cache.get_or_fetch` | service-agent `services/plugin_distribution.py`(复用 console `distribution.py`) | P1-1 | **已完成**(`fetch_manifest`/`attachment_id_from_url`/`download_to`;namespace 恒用本 ns;`http_client.download` 流式禁跳转;未命中→回源一次→落缓存→喂 worker) |
 | **P1-4 ✓** | 配置项:`PLATFORM_URL`/`PULL_TOKEN`/`PLUGIN_NAMESPACE`/`PLUGIN_CACHE_DIR`/`PLUGIN_CACHE_MAX_BYTES`/`PLUGIN_SERVE_HOST`/`PLUGIN_SERVE_PORT` | service-agent `config.py` | — | **已完成**(随 P1-1) |
 
 **P1 验收(rolltest 床)**:worker 经本机 agent 拉到插件,缓存命中 / 回源各一次。
