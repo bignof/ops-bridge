@@ -38,6 +38,12 @@ WHITELIST_PREFIXES: tuple[str, ...] = (
     "/auth/login",
     "/api/distribution/",
     "/health",
+    # 并入的 hub 控制链路由(S2):这些端点走 hub 自带的 admin-token(X-Admin-Token)自校验,
+    # 不走平台 JWT;放行后由各端点内的 _require_admin_token 把关(与 /api/distribution 同思路)。
+    # 注:/api/agents 同时覆盖 /api/agents/{id}/logs/stream 与 /api/agents/{id}/commands。
+    "/api/agents",
+    "/api/commands",
+    "/api/rolling-restart",
 )
 
 

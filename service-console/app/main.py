@@ -26,6 +26,19 @@ from app.routers.service_plugins import router as service_plugins_router
 from app.routers.services import router as services_router
 from app.routers.system import router as system_router
 
+# ── 并入的 hub 模块(S2;原 service-hub,控制链:agent-WS / 命令 / 滚动 / 日志)──
+# _handle_agent_message / _remote_address 在此 import 即成为 app.main 模块全局,
+# 供 hub 路由 / WS 经 `import app.main as main_module; main_module.X` 取用。
+from app.hub.api_support import _handle_agent_message, _remote_address  # noqa: F401 (经 main_module 取用)
+from app.hub.config import settings as hub_settings
+from app.hub.db import Database as HubDatabase
+from app.hub.store import HubState
+from app.hub.routers.agent_ws import router as agent_ws_router
+from app.hub.routers.agents import router as agents_router
+from app.hub.routers.commands import router as commands_router
+from app.hub.routers.logs import router as logs_router
+from app.hub.routers.rolling import router as rolling_router
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -34,6 +47,16 @@ logger = logging.getLogger(__name__)
 # 后取 `main_module.database`,禁止模块级 `from app.main import database`),不在 app/db.py 建。
 database = Database(settings.database_url)
 
+# 并入的 hub 单例(S2):hub_state 落点在此(hub 路由 / WS 经 main_module.hub_state 取用)。
+# hub_database 过渡期独立(settings.hub_database_url,避免与 console 库共用 DATABASE_URL 撞 _managed_tables
+# 守卫);S4 合 DB 后并入 database。
+hub_database = HubDatabase(settings.hub_database_url)
+hub_state = HubState(
+    heartbeat_timeout=hub_settings.heartbeat_timeout,
+    command_history_limit=hub_settings.command_history_limit,
+    database=hub_database,
+)
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -41,6 +64,13 @@ async def lifespan(_: FastAPI):
     if not settings.jwt_secret or len(settings.jwt_secret) < 32:
         raise RuntimeError("PLATFORM_JWT_SECRET 未配置或过短(须 ≥32 字符)")
     database.init_schema()
+    # 并入的 hub(S2):建 hub 表 + 恢复中断的滚动任务。**务必保留 interrupt_running_rolling**,
+    # 否则重启后中断的滚动永不被标 interrupted(评审 M-9)。
+    hub_database.init_schema()
+    await hub_state.initialize()
+    interrupted = await hub_state.interrupt_running_rolling()
+    if interrupted:
+        logger.warning("启动恢复:发现 %s 个中断的滚动任务,已标记 interrupted", interrupted)
     yield
 
 
@@ -85,3 +115,10 @@ app.include_router(distribution_router)
 app.include_router(fetch_records_router)
 app.include_router(nodes_router)
 app.include_router(node_operations_router)  # Task 10b:/api/node-operations(与 /api/nodes 平级)
+# 并入的 hub 路由(S2):hub 自带 admin-token 自校验,已在 SessionGuard 白名单放行(见 middleware)。
+# 不含 hub system 路由(console 已有自己的 /health)。
+app.include_router(agents_router)
+app.include_router(commands_router)
+app.include_router(logs_router)
+app.include_router(rolling_router)
+app.include_router(agent_ws_router)
