@@ -1,0 +1,1290 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>服务插件分发平台 · 原型</title>
+<!-- ── 原型迭代日志(/loop「更人性化/易用/闭环」,每轮追加,防重复 + 跨压缩可续)──
+  v1: 概览首页(健康总览 + 待处理 inbox,每条一键跳转闭环)+ Esc 关抽屉/弹窗
+  v2: 发布→滚动投放进度视图(逐实例 drain→重启→就绪→重拉,动画 + 完成跳审计,替代裸 toast)
+  v3: 顶栏全局搜索 = 本页表格实时过滤;切页自动清空
+  v4: 节点详情抽屉(点容器名 drill-down:基本信息 + 插件 active/实际 + 漂移标 + 一键投放 + 操作)
+  v5: 危险操作确认弹窗(停止/重部署 经 nodeAct 先确认);mask/Esc 统一收口所有弹层
+  v6: 版本历史抽屉(插件页"版本历史" → 版本时间线 + 一键设 active 触发投放)
+  v7: Agent 详情/缓存面板(命名空间页点 agent → 在线/命中率/回源/缓存包/节点)
+  v8: 服务 drill-down 详情(服务页点服务 → 基本信息 + 绑定插件 + 实例 + 对账 + 发布/配置)
+  v9: 灰度发布(发布弹窗投放范围:全部/灰度先 1 个,进度区分保留旧版)
+  v10: 响应式(窄屏侧栏抽屉化 + 汉堡菜单,drawer 全宽,卡片/grid 自适应)
+  v11: 暗色模式(顶栏 🌙 切换 + localStorage 记忆)
+  +手动: 服务页纳管状态标签;操作列「绑定插件」(服务级·不选节点·选插件即绑·去重=ALL_PLUGINS−已绑·假数据 PLUGIN_LATEST)
+  +手动: 「服务插件」页改数据驱动(读 SERVICES,服务下拉切换),绑定后跳该页并新增行;支持解绑;绑定/解绑写回 SERVICES,服务详情同步
+  +手动: 服务去「目录/镜像」措辞(逻辑层 = ns + 服务名(=nacos) + 插件);插件页扩到全目录假数据(10);插件上传加「最近上传」列表 + 发布(选 ns+服务→绑定并投放)
+  +手动: 服务列表改标签页(已纳管 / 未纳管)切换;概览"去纳管"直达未纳管 tab
+  +手动: 服务插件页降级为「服务→配置」二级页(去侧栏项,服务只读锁定,带返回);改版本=选版本弹窗;顶部按钮改名「发布」
+  +手动: 服务行操作 = 配置/镜像/发布(去重的「绑定插件」已删);新增「镜像配置」二级页(当前镜像+发布新镜像+历史+回滚,pull-redeploy)
+  +修复: 初始化 renderServicePlugins 调用早于 SERVICES 定义→脚本中断→已挪到脚本末尾(playwright 验证)
+  +手动: 统一发布(desired-state):编辑=暂存意图(插件/镜像),一个「发布」算 diff 自动选机制(仅插件→restart;含镜像→pull-redeploy);发布弹窗出变更摘要+逐节点动画+commit;镜像页带「待发布」标(playwright 验证 diff/机制/commit)
+  +手动: 删「插件发布」独立页(统一发布后冗余);「获取记录」改 命名空间+服务+实例 聚合,插件@版本进「详情」抽屉
+  +手动: 术语统一——「节点」页改名「实例」(列 容器/工程→容器、目录去自动、删来源、命名空间(agent)→命名空间、服务名(nacos)→服务名、命名空间页表头改命名空间);实例操作简化为 启动/停止/更新(更新=拉到服务期望态,取代 重启/重部署);概览统计卡可点跳转+最近操作/拉包加查看全部
+  +修复(ultracode 评审 H6/M14/G3): 区分「意图待发布(diff publish)」与「实例漂移(强制重新投放)」——概览 CTA/节点抽屉漂移行改走 openReapply/syncInstance 不再走 diff 死胡同;统一 canDeploy 守卫(agent 离线/无在跑实例→阻断弹窗不假成功);删 svc-1/svc-2 伪造兜底;强制重新投放/同步实例跑动画后真实收敛(清漂移+对账转正常)。playwright 全程验证
+  +清理(ultracode 评审 Medium/Low/完整性遗漏):
+     · G4 命名空间切换器:顶栏死文本→真实 <select>,切 ns 过滤所有页表格 + 概览/服务/实例统计卡(口径与各页一致);实例页改 NODES 数据驱动,补 rolltest/k8s-prod-a 发现实例(离线标 stale,docker 含 stopped 仍上报)
+     · M13/G5 发布失败即停:_rollout 加失败注入(发布弹窗「模拟某实例失败」开关)→ 失败标红 + 停后续 + 不 commit + 「集群健康跌破阈值已中止」+ 回滚已切新版/重试(前 N-1 保留)
+     · M15 真实反馈:忽略未纳管=移除行+角标-1(数据驱动 INBOX);上传=往「最近上传」插行;新建命名空间=表单→show-once 返回 agentKey+pull-token;刷新/重新发现=进行中→完成两态
+     · M16 镜像漂移:_nodeImgDrift 纳入实例页/实例详情/服务对账(对账(镜像));镜像配置页「当前镜像」旁标「N/M 实例已应用」;同步/重新投放后实例镜像一并收敛
+     · L5/L10 切页/切 tab 复位:go()/svcTab() 后重套 filterPage(ns+搜索);L7 syncMask:共享遮罩按「任一弹层 .on 即保留」,点遮罩/Esc 只关最上层;L9 镜像输入 escapeHtml+事件委托(data-idx);L11 运行时「节点」→「实例」;L13 单实例「更新」按 diff 选 restart/pull-redeploy、搜索 0 命中补占位
+  —— ultracode 评审项清理到位;后续按需:概览趋势图 / 接真实接口 / 失败回滚事务落库(对应 G5 设计侧)
+  +新增: 实例实时日志查看器(模拟流式 tail)——实例页/详情加「日志」动作(离线/stale 拦截);新 logModal 终端风格(深色等宽+行号+级别配色),定时(500-900ms)追加假行模拟「浏览器⇄platform SSE⇄hub WS⇄agent docker logs --tail 500 -f」;暂停/继续(停启定时器)、清屏、自动滚动开关、tail 500 上限(超出从顶部丢弃)、状态条(●实时/⏸已暂停);关闭/切走/Esc 必 clearInterval 不留孤儿;复用 syncMask/closeTopLayer
+  +精简: 删除「概览」页(整块 section + 侧栏「总览」组与项 + renderOverview 函数及全部调用);默认落地页改为「服务」(#services class=page active,侧栏服务项 active,面包屑「配置/服务」);switchNs 去掉 renderOverview 调用(仅重渲染实例/获取记录/服务页),ignoreInbox 改调 renderServicesPage;删除随概览失效的 _nsLabel/_nsScopeText(保留 _nsNodes/_nsAgents/_nsServices,仍被实例/服务页统计卡复用)
+  +精简: 服务列表(已纳管 tab)服务名列去掉冗余「已纳管」标签(整 tab 已是已纳管)+ 内联「详情›」;详情改为操作列首个动作(详情/配置/镜像/发布),服务名列只留服务名
+-->
+
+<style>
+  :root{
+    --pri:#1677ff; --pri-bg:#e6f4ff; --pri-d:#0958d9;
+    --ink:rgba(0,0,0,.88); --ink2:rgba(0,0,0,.65); --ink3:rgba(0,0,0,.45);
+    --line:#f0f0f0; --line2:#d9d9d9; --bg:#f5f5f5; --card:#fff;
+    --ok:#52c41a; --okbg:#f6ffed; --warn:#faad14; --warnbg:#fffbe6; --err:#ff4d4f; --errbg:#fff2f0;
+    --soft:#fafafa; --soft2:#f6f8fa;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-size:14px;
+    font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",Roboto,Arial,sans-serif}
+  .app{display:flex;min-height:100vh}
+  /* sidebar */
+  .sidebar{width:224px;background:#fff;border-right:1px solid var(--line);flex:0 0 224px;
+    display:flex;flex-direction:column;position:sticky;top:0;height:100vh;overflow:auto}
+  .brand{font-weight:700;font-size:16px;padding:18px 20px;color:var(--ink);letter-spacing:.3px}
+  nav{padding:4px 10px 20px}
+  nav .group{font-size:12px;color:var(--ink3);padding:14px 12px 6px}
+  nav a{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;color:var(--ink2);
+    text-decoration:none;cursor:pointer;margin:2px 0;font-size:14px}
+  nav a .ic{width:18px;text-align:center;opacity:.8}
+  nav a:hover{background:#f5f5f5}
+  nav a.active{background:var(--pri-bg);color:var(--pri);font-weight:600}
+  /* main */
+  main{flex:1;min-width:0;display:flex;flex-direction:column}
+  .topbar{height:56px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;
+    justify-content:space-between;padding:0 24px;position:sticky;top:0;z-index:5}
+  .topbar .crumb{color:var(--ink2);font-size:14px}
+  .topbar .crumb b{color:var(--ink)}
+  .topbar .user{display:flex;align-items:center;gap:10px;color:var(--ink2);font-size:13px}
+  .topbar .avatar{width:30px;height:30px;border-radius:50%;background:var(--pri);color:#fff;
+    display:flex;align-items:center;justify-content:center;font-size:13px}
+  .content{padding:20px 24px;flex:1}
+  .page{display:none} .page.active{display:block}
+  .page-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+  .page-h h1{font-size:20px;margin:0}
+  .page-h .sub{color:var(--ink3);font-size:13px;margin-top:3px}
+  .card{background:var(--card);border-radius:10px;padding:16px 18px;box-shadow:0 1px 2px rgba(0,0,0,.03);
+    border:1px solid var(--line);margin-bottom:16px}
+  .banner{background:var(--pri-bg);border:1px solid #91caff;border-radius:8px;padding:10px 14px;
+    color:#0958d9;font-size:13px;margin-bottom:14px;display:flex;gap:8px;align-items:flex-start}
+  .toolbar{display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap}
+  .toolbar .sp{flex:1}
+  /* buttons */
+  .btn{border:1px solid var(--line2);background:#fff;color:var(--ink);padding:5px 14px;border-radius:7px;
+    cursor:pointer;font-size:14px;display:inline-flex;align-items:center;gap:6px;transition:.15s}
+  .btn:hover{color:var(--pri);border-color:var(--pri)}
+  .btn.pri{background:var(--pri);border-color:var(--pri);color:#fff}
+  .btn.pri:hover{background:var(--pri-d);border-color:var(--pri-d);color:#fff}
+  .btn.sm{padding:2px 10px;font-size:13px}
+  .btn.danger:hover{color:var(--err);border-color:var(--err)}
+  .input{border:1px solid var(--line2);border-radius:7px;padding:5px 11px;font-size:14px;width:220px;outline:none}
+  .input:focus{border-color:var(--pri);box-shadow:0 0 0 2px var(--pri-bg)}
+  /* table */
+  table{width:100%;border-collapse:collapse;font-size:13.5px;background:#fff}
+  thead th{background:#fafafa;text-align:left;padding:11px 12px;color:var(--ink2);font-weight:600;
+    border-bottom:1px solid var(--line);white-space:nowrap}
+  tbody td{padding:11px 12px;border-bottom:1px solid var(--line);color:var(--ink);vertical-align:middle}
+  tbody tr:hover{background:#fafcff}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;color:var(--ink2)}
+  /* tags */
+  .tag{display:inline-block;padding:1px 9px;border-radius:5px;font-size:12px;line-height:1.7;border:1px solid transparent}
+  .t-ok{background:var(--okbg);color:#389e0d;border-color:#b7eb8f}
+  .t-off{background:#fafafa;color:var(--ink3);border-color:#d9d9d9}
+  .t-warn{background:var(--warnbg);color:#d48806;border-color:#ffe58f}
+  .t-err{background:var(--errbg);color:#cf1322;border-color:#ffccc7}
+  .t-blue{background:var(--pri-bg);color:var(--pri-d);border-color:#91caff}
+  .t-auto{background:#f9f0ff;color:#722ed1;border-color:#d3adf7}
+  .dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:5px}
+  .acts{display:flex;gap:4px;flex-wrap:wrap}
+  .acts a{color:var(--pri);cursor:pointer;font-size:13px}
+  .acts a:hover{color:var(--pri-d);text-decoration:underline}
+  .acts a.danger{color:var(--err)}
+  .stat{display:flex;gap:14px;margin-bottom:16px;flex-wrap:wrap}
+  .stat .c{background:#fff;border:1px solid var(--line);border-radius:10px;padding:14px 18px;flex:1;min-width:150px}
+  .stat .c .l{color:var(--ink3);font-size:13px} .stat .c .v{font-size:26px;font-weight:700;margin-top:4px}
+  .todo{display:flex;align-items:center;gap:12px;padding:11px 18px;cursor:pointer;border-bottom:1px solid var(--line)}
+  .todo:last-child{border-bottom:none} .todo:hover{background:#fafcff}
+  .todo .ti{width:30px;height:30px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:15px;flex:0 0 auto;background:var(--soft)}
+  .todo .ti.warn{background:var(--warnbg)} .todo .ti.err{background:var(--errbg)} .todo .ti.blue{background:var(--pri-bg)}
+  .todo .tt{flex:1} .todo .tt b{font-size:14px} .todo .td{font-size:12.5px;color:var(--ink3);margin-top:2px}
+  .todo .tgo{color:var(--pri);font-size:13px;white-space:nowrap}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .rollout{display:flex;flex-direction:column;gap:10px;margin-top:6px}
+  .ri{display:flex;align-items:center;gap:12px;border:1px solid var(--line);border-radius:8px;padding:10px 14px;transition:.2s}
+  .ri .rn{font-weight:600;flex:0 0 160px} .ri .rs{flex:1;color:var(--ink2);font-size:13px}
+  .ri.active{background:var(--pri-bg);border-color:#91caff} .ri.done{background:var(--okbg);border-color:#b7eb8f}
+  .ri.fail{background:var(--errbg);border-color:#ffccc7} .ri.fail .rs{color:#cf1322;font-weight:600}
+  .ri.skip{opacity:.55} .ri.rollback{background:var(--warnbg);border-color:#ffe58f}
+  .tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);margin:8px 0 14px}
+  .tabs .tab{padding:9px 16px;cursor:pointer;color:var(--ink2);border-bottom:2px solid transparent;margin-bottom:-1px;font-size:14px;display:inline-flex;align-items:center;gap:7px}
+  .tabs .tab:hover{color:var(--pri)}
+  .tabs .tab.active{color:var(--pri);border-bottom-color:var(--pri);font-weight:600}
+  /* drawer */
+  .mask{position:fixed;inset:0;background:rgba(0,0,0,.45);opacity:0;pointer-events:none;transition:.2s;z-index:20}
+  .mask.on{opacity:1;pointer-events:auto}
+  .drawer{position:fixed;top:0;right:0;height:100vh;width:480px;max-width:92vw;background:#fff;z-index:21;
+    transform:translateX(100%);transition:.25s;display:flex;flex-direction:column;box-shadow:-6px 0 16px rgba(0,0,0,.08)}
+  .drawer.on{transform:translateX(0)}
+  .drawer .dh{display:flex;align-items:center;gap:12px;padding:16px 22px;border-bottom:1px solid var(--line);font-size:16px;font-weight:600}
+  .drawer .dh .x{margin-left:auto;cursor:pointer;color:var(--ink3);font-size:20px;line-height:1}
+  .drawer .db{padding:20px 22px;overflow:auto;flex:1}
+  .drawer .df{padding:12px 22px;border-top:1px solid var(--line);display:flex;justify-content:flex-end;gap:10px}
+  .field{margin-bottom:18px}
+  .field label{display:block;margin-bottom:6px;font-size:14px}
+  .field label .req{color:var(--err);margin-right:3px}
+  .field .input{width:100%}
+  .field .hint{color:var(--ink3);font-size:12px;margin-top:5px}
+  /* modal */
+  .modal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;z-index:22}
+  .modal.on{display:flex}
+  .modal .box{background:#fff;border-radius:12px;width:440px;max-width:92vw;padding:22px 24px;box-shadow:0 8px 30px rgba(0,0,0,.18)}
+  .modal h3{margin:0 0 6px;font-size:17px}
+  .modal .desc{color:var(--ink2);font-size:13.5px;margin-bottom:14px;white-space:pre-line}
+  /* 日志查看器(终端风格,实时 tail) */
+  .modal .box.logbox{width:860px;max-width:94vw;padding:0;overflow:hidden;display:flex;flex-direction:column;max-height:84vh}
+  .logbox .lh{display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--line)}
+  .logbox .lh .lt{font-size:15px;font-weight:600}
+  .logbox .lh .lsub{font-size:12px;color:var(--ink3)}
+  .logbox .lh .x{margin-left:auto;cursor:pointer;color:var(--ink3);font-size:20px;line-height:1}
+  .logbox .lctl{display:flex;align-items:center;gap:8px;padding:8px 18px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+  .logbox .lctl .sp{flex:1}
+  .logbox .lctl label{display:flex;align-items:center;gap:5px;font-size:12.5px;color:var(--ink2);cursor:pointer}
+  .logterm{background:#0b0f1a;color:#cfe3ff;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.65;
+    padding:12px 14px;overflow:auto;flex:1;min-height:300px;white-space:pre-wrap;word-break:break-word}
+  .logterm .ln{display:flex;gap:10px}
+  .logterm .ln .no{color:#5b6b86;flex:0 0 auto;-webkit-user-select:none;user-select:none;text-align:right;min-width:36px}
+  .logterm .ln .tx{flex:1}
+  .logterm .lv-INFO{color:#cfe3ff} .logterm .lv-WARN{color:#ffd66b} .logterm .lv-ERROR{color:#ff8a8a} .logterm .lv-DEBUG{color:#8a99ad}
+  .logterm .tsp{color:#6ee7a8} .logterm .lvl{font-weight:700}
+  .logbar{display:flex;align-items:center;gap:8px;padding:8px 18px;border-top:1px solid var(--line);font-size:12.5px;color:var(--ink2)}
+  .logbar .live{color:var(--ok);font-weight:600} .logbar .paused{color:var(--warn);font-weight:600}
+  body.dark .logterm{background:#070b14}
+  /* toast */
+  .toast{position:fixed;top:18px;left:50%;transform:translateX(-50%) translateY(-20px);background:#fff;
+    border:1px solid var(--line);border-left:4px solid var(--ok);border-radius:8px;padding:10px 16px;
+    box-shadow:0 6px 16px rgba(0,0,0,.12);opacity:0;pointer-events:none;transition:.25s;z-index:30;font-size:14px;max-width:80vw}
+  .toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
+  select.input{appearance:auto}
+  .codepill{background:var(--soft2);border:1px solid var(--line);border-radius:6px;padding:8px 12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;word-break:break-all;color:#cf1322}
+  .hamburger{display:none;background:none;border:none;font-size:20px;cursor:pointer;color:var(--ink2);padding:4px 8px;margin-right:4px}
+  .iconbtn{padding:5px 10px;font-size:15px}
+  @media(max-width:760px){
+    .sidebar{position:fixed;left:0;top:0;height:100vh;z-index:25;transform:translateX(-100%);box-shadow:2px 0 12px rgba(0,0,0,.15)}
+    .sidebar.open{transform:translateX(0)}
+    .hamburger{display:block}
+    .content{padding:14px} .topbar{padding:0 14px}
+    #globalSearch{width:120px!important}
+    .drawer{width:100vw} .stat .c{min-width:120px} .grid2{grid-template-columns:1fr}
+    .page-h{flex-direction:column;align-items:flex-start;gap:8px}
+  }
+  body.dark{--ink:#e6edf6;--ink2:#c2ccda;--ink3:#8a99ad;--line:#2b3852;--line2:#3d4d6a;--bg:#0d1424;--card:#161f33;--soft:#1c2740;--soft2:#0d1424}
+  body.dark .sidebar,body.dark .topbar,body.dark .drawer,body.dark .stat .c,body.dark .modal .box,body.dark .toast{background:var(--card)}
+  body.dark thead th{background:#1c2740;color:var(--ink2)}
+  body.dark tbody tr:hover,body.dark nav a:hover,body.dark .todo:hover{background:#1c2740}
+  body.dark .banner{background:#16243f;border-color:#2c4a7a;color:#a9c7ff}
+  body.dark code{background:#1c2740;color:#ff9fb0}
+  body.dark .input{background:#0d1424;color:var(--ink);border-color:var(--line2)}
+  body.dark .btn{background:#1b2740;color:var(--ink);border-color:var(--line2)} body.dark .btn.pri{background:var(--pri);color:#fff}
+  body.dark .mono{color:var(--ink3)} body.dark .codepill{background:#0d1424}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">服务插件分发平台</div>
+    <nav>
+      <div class="group">配置</div>
+      <a data-target="namespaces"><span class="ic">🗂️</span>命名空间</a>
+      <a data-target="services" class="active"><span class="ic">🔗</span>服务</a>
+      <a data-target="plugins"><span class="ic">🧩</span>插件</a>
+      <div class="group">发布</div>
+      <a data-target="upload"><span class="ic">⬆️</span>插件上传</a>
+      <a data-target="fetch"><span class="ic">📥</span>获取记录</a>
+      <div class="group">运维</div>
+      <a data-target="nodes"><span class="ic">🖥️</span>实例</a>
+      <a data-target="ops"><span class="ic">📋</span>操作审计</a>
+    </nav>
+  </aside>
+
+  <main>
+    <header class="topbar">
+      <div style="display:flex;align-items:center"><button class="hamburger" onclick="toggleSidebar()">☰</button><div class="crumb">配置 / <b id="crumb">服务</b></div></div>
+      <div style="display:flex;align-items:center;gap:12px">
+        <input class="input" id="globalSearch" placeholder="🔍 过滤本页…" oninput="filterPage(this.value)" style="width:230px">
+        <button class="btn iconbtn" id="darkBtn" onclick="toggleDark()" title="切换暗色">🌙</button>
+        <div class="user"><span style="color:var(--ink3)">命名空间</span><select class="input" id="nsSwitch" onchange="switchNs(this.value)" style="width:auto;min-width:140px" title="切换命名空间(过滤各页)"></select><div class="avatar">A</div></div>
+      </div>
+    </header>
+    <div class="content">
+
+      <!-- 实例 -->
+      <section id="nodes" class="page">
+        <div class="page-h"><div><h1>实例</h1><div class="sub">运行实例(容器),由 agent 自动发现上报</div></div>
+          <button class="btn" onclick="busyBtn(this,'🔄 重新发现','发现中…','已完成全量重新发现',renderNodes)">🔄 重新发现</button></div>
+        <div class="banner"><span>💡</span><div>实例由各服务器上的 <b>agent</b> 周期性从 <b>nacos + docker labels</b> 自动发现并上报(含目录 / 镜像 / 容器),<b>无需手工录入</b>。同一服务名的多个容器(如 admin / 2admin)自动各算一个实例。</div></div>
+        <div class="stat" id="nodesStat"></div>
+        <div class="card" style="padding:0">
+          <table>
+            <thead><tr><th>命名空间</th><th>服务</th><th>容器</th><th>目录</th><th>镜像</th><th>状态</th><th>操作</th></tr></thead>
+            <tbody id="nodesBody"></tbody>
+          </table>
+        </div>
+        <div class="sub" style="color:var(--ink3)">说明:插件/镜像按<b>服务</b>下发(同服务各实例一致);启动/停止/更新按<b>实例</b>单独操作。「更新」= 把该实例拉到服务期望态(最新镜像 + 插件)。</div>
+      </section>
+
+      <!-- 命名空间 -->
+      <section id="namespaces" class="page">
+        <div class="page-h"><div><h1>命名空间</h1><div class="sub">命名空间 = agent（一台一个，code = agentId，1:1）</div></div>
+          <button class="btn pri" onclick="openNewNs()">+ 新建命名空间</button></div>
+        <div class="banner"><span>🔑</span><div>每个 agent 持本命名空间的 <b>pull-token</b>（worker 拉插件经本机 agent，worker 自身<b>零凭据</b>）。pull-token 轮换即时生效、show-once。</div></div>
+        <div class="card" style="padding:0">
+          <table>
+            <thead><tr><th>命名空间</th><th>名称</th><th>agent 在线</th><th>实例数</th><th>pull-token</th><th>操作</th></tr></thead>
+            <tbody>
+              <tr data-ns="tamagawa-test"><td class="mono" style="cursor:pointer" onclick="openAgent('tamagawa-test')"><a style="color:var(--pri)">tamagawa-test</a></td><td>玉川测试环境</td><td><span class="tag t-ok">在线</span></td><td>2</td><td><span class="tag t-ok">已配置</span></td>
+                <td class="acts"><a onclick="rotateToken('tamagawa-test')">轮换 pull-token</a><a onclick="rotateToken('agentKey')">轮换 agentKey</a></td></tr>
+              <tr data-ns="rolltest-agent"><td class="mono" style="cursor:pointer" onclick="openAgent('rolltest-agent')"><a style="color:var(--pri)">rolltest-agent</a></td><td>滚动测试床</td><td><span class="tag t-ok">在线</span></td><td>3</td><td><span class="tag t-ok">已配置</span></td>
+                <td class="acts"><a onclick="rotateToken('rolltest-agent')">轮换 pull-token</a><a onclick="rotateToken('agentKey')">轮换 agentKey</a></td></tr>
+              <tr data-ns="k8s-prod-a"><td class="mono" style="cursor:pointer" onclick="openAgent('k8s-prod-a')"><a style="color:var(--pri)">k8s-prod-a</a></td><td>生产 A</td><td><span class="tag t-off">离线</span></td><td>4</td><td><span class="tag t-ok">已配置</span></td>
+                <td class="acts"><a onclick="rotateToken('k8s-prod-a')">轮换 pull-token</a><a onclick="rotateToken('agentKey')">轮换 agentKey</a></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 服务 -->
+      <section id="services" class="page active">
+        <div class="page-h"><div><h1>服务</h1><div class="sub">逻辑服务 = 插件策略落点；实例自动发现，服务一键纳管</div></div>
+          <button class="btn" onclick="openManual()">+ 手动预建</button></div>
+        <div class="banner"><span>🔁</span><div>服务这层只关心「装哪些插件、什么版本」，<b>目录 / 镜像 / nacos 由实例自动发现</b>。常规走「<b>从发现一键纳管</b>」（零敲）；「手动预建」仅用于首次上线前预置插件集（绕开鸡生蛋）。<b>服务不纯自动建</b>——纳管 + 配插件是显式动作。</div></div>
+        <div class="stat" id="svcStat"></div>
+
+        <div class="tabs">
+          <a class="tab active" data-tab="managed" onclick="svcTab('managed')">已纳管 <span class="tag t-ok" id="tabManagedCount">3</span></a>
+          <a class="tab" data-tab="inbox" onclick="svcTab('inbox')">未纳管 <span class="tag t-warn" id="tabInboxCount">2</span></a>
+        </div>
+        <div id="svc-inbox" class="svc-panel" style="display:none">
+        <div class="card" style="padding:0">
+          <table>
+            <thead><tr><th>命名空间</th><th>服务名</th><th>发现实例</th><th>首次发现</th><th>操作</th></tr></thead>
+            <tbody id="svcInboxBody"></tbody>
+          </table>
+        </div>
+
+        </div>
+        <div id="svc-managed" class="svc-panel">
+        <div class="card" style="padding:0">
+          <table>
+            <thead><tr><th>命名空间</th><th>服务名</th><th>别名</th><th>已绑插件</th><th>实例(在跑/纳管)</th><th>对账</th><th>操作</th></tr></thead>
+            <tbody>
+              <tr data-ns="tamagawa-test"><td>tamagawa-test</td><td><span class="tag t-blue">wms-test-admin</span></td><td>WMS 管理端</td><td>5 个</td><td>2 / 2</td><td><span class="tag t-warn">版本漂移</span></td>
+                <td class="acts"><a onclick="openService('wms-test-admin')">详情</a><a onclick="openServiceConfig('wms-test-admin')">配置</a><a onclick="openServiceImage('wms-test-admin')">镜像</a><a onclick="openDeploy('wms-test-admin')">发布</a></td></tr>
+              <tr data-ns="rolltest-agent"><td>rolltest-agent</td><td><span class="tag t-blue">rolltest</span></td><td>滚动测试</td><td>2 个</td><td>2 / 2</td><td><span class="tag t-ok">正常</span></td>
+                <td class="acts"><a onclick="openService('rolltest')">详情</a><a onclick="openServiceConfig('rolltest')">配置</a><a onclick="openServiceImage('rolltest')">镜像</a><a onclick="openDeploy('rolltest')">发布</a></td></tr>
+              <tr data-ns="k8s-prod-a"><td>k8s-prod-a</td><td><span class="tag t-blue">wms-prod</span></td><td>WMS 生产</td><td>6 个</td><td>0 / 4</td><td><span class="tag t-err">纳管未起</span></td>
+                <td class="acts"><a onclick="openService('wms-prod')">详情</a><a onclick="openServiceConfig('wms-prod')">配置</a><a onclick="openServiceImage('wms-prod')">镜像</a><a onclick="openDeploy('wms-prod')">发布</a></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="sub" style="color:var(--ink3);margin-top:8px">对账 = 意图(已纳管 Service)⋈ 现实(自动发现实例),by nacos 服务名,实时算。</div>
+        </div>
+      </section>
+
+      <!-- 插件 -->
+      <section id="plugins" class="page">
+        <div class="page-h"><div><h1>插件</h1><div class="sub">插件包仓库（按包名管理多版本）</div></div>
+          <button class="btn pri" onclick="go('upload')">+ 上传插件</button></div>
+        <div class="card" style="padding:0">
+          <table>
+            <thead><tr><th>包名</th><th>最新版本</th><th>版本数</th><th>大小</th><th>更新时间</th><th>操作</th></tr></thead>
+            <tbody>
+              <tr><td class="mono">@business/plugin-mom-wms</td><td><span class="tag t-blue">2.1.0.20260618</span></td><td>7</td><td>4.2 MB</td><td>2026-06-18 09:14</td><td class="acts"><a onclick="openVersionHistory(this.closest('tr').querySelector('td').textContent.trim())">版本历史</a></td></tr>
+              <tr><td class="mono">@orchisky/plugin-dictionary</td><td><span class="tag t-blue">1.3.2.20260520</span></td><td>4</td><td>0.8 MB</td><td>2026-05-20 16:30</td><td class="acts"><a onclick="openVersionHistory(this.closest('tr').querySelector('td').textContent.trim())">版本历史</a></td></tr>
+              <tr><td class="mono">@business/plugin-tamagawa-storage</td><td><span class="tag t-blue">2.0.0.20260225</span></td><td>3</td><td>1.1 MB</td><td>2026-02-25 16:04</td><td class="acts"><a onclick="openVersionHistory(this.closest('tr').querySelector('td').textContent.trim())">版本历史</a></td></tr>
+              <tr><td class="mono">@orchisky/plugin-menu-page</td><td><span class="tag t-blue">1.1.0.20260410</span></td><td>2</td><td>0.5 MB</td><td>2026-04-10 11:02</td><td class="acts"><a onclick="openVersionHistory(this.closest('tr').querySelector('td').textContent.trim())">版本历史</a></td></tr>
+              <tr><td class="mono">@orchisky/plugin-login-setting</td><td><span class="tag t-blue">1.0.4.20260301</span></td><td>3</td><td>0.4 MB</td><td>2026-03-01 09:10</td><td class="acts"><a onclick="openVersionHistory(this.closest('tr').querySelector('td').textContent.trim())">版本历史</a></td></tr>
+              <tr><td class="mono">@orchisky/plugin-block-table</td><td><span class="tag t-blue">1.2.1.20260615</span></td><td>5</td><td>0.9 MB</td><td>2026-06-15 14:20</td><td class="acts"><a onclick="openVersionHistory(this.closest('tr').querySelector('td').textContent.trim())">版本历史</a></td></tr>
+              <tr><td class="mono">@business/plugin-qms-inspect</td><td><span class="tag t-blue">1.0.0.20260520</span></td><td>1</td><td>1.6 MB</td><td>2026-05-20 10:00</td><td class="acts"><a onclick="openVersionHistory(this.closest('tr').querySelector('td').textContent.trim())">版本历史</a></td></tr>
+              <tr><td class="mono">@orchisky/plugin-notice-manage</td><td><span class="tag t-blue">1.4.0.20260608</span></td><td>6</td><td>0.7 MB</td><td>2026-06-08 16:45</td><td class="acts"><a onclick="openVersionHistory(this.closest('tr').querySelector('td').textContent.trim())">版本历史</a></td></tr>
+              <tr><td class="mono">@orchisky/plugin-high-performance-table</td><td><span class="tag t-blue">2.3.0.20260610</span></td><td>9</td><td>1.3 MB</td><td>2026-06-10 11:30</td><td class="acts"><a onclick="openVersionHistory(this.closest('tr').querySelector('td').textContent.trim())">版本历史</a></td></tr>
+              <tr><td class="mono">@orchisky/plugin-pda-acl</td><td><span class="tag t-blue">1.0.6.20260512</span></td><td>2</td><td>0.3 MB</td><td>2026-05-12 08:55</td><td class="acts"><a onclick="openVersionHistory(this.closest('tr').querySelector('td').textContent.trim())">版本历史</a></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 服务插件 -->
+      <section id="serviceplugins" class="page">
+        <div class="page-h"><div><h1>服务配置</h1><div class="sub">为该服务配置插件与版本（worker 拉取的就是这份）</div></div>
+          <button class="btn pri" onclick="openDeploy(_spSvc)">🚀 发布</button></div>
+        <div class="toolbar">服务：<b id="spSvcLabel" class="mono">wms-test-admin</b><a style="color:var(--pri);cursor:pointer;font-size:13px;margin-left:12px" onclick="go('services')">← 返回服务列表</a><div class="sp"></div>
+          <button class="btn" onclick="openBind(_spSvc)">+ 绑定插件</button></div>
+        <div class="card" style="padding:0">
+          <table>
+            <thead><tr><th>插件包</th><th>active 版本</th><th>操作</th></tr></thead>
+            <tbody id="spBody"></tbody>
+          </table>
+        </div>
+        <div class="banner"><span>🚀</span><div>「绑定 / 解绑」改的是<b>该服务装哪些插件</b>(服务级,无需选实例);「发布新版本」改 active 版本 → 触发<b>滚动重启</b>(逐实例零中断)→ 各实例启动经本机 agent 重拉。均下次重启生效。</div></div>
+      </section>
+
+      <!-- 镜像配置(服务二级页,不在侧栏)-->
+      <section id="serviceimage" class="page">
+        <div class="page-h"><div><h1>镜像配置</h1><div class="sub">编辑镜像意图(暂存)→「发布」统一应用(pull-redeploy);含历史 / 回滚</div></div><button class="btn pri" onclick="openDeploy(_siSvc)">🚀 发布</button></div>
+        <div class="toolbar">服务：<b id="siSvcLabel" class="mono">wms-test-admin</b><a style="color:var(--pri);cursor:pointer;font-size:13px;margin-left:12px" onclick="go('services')">← 返回服务列表</a></div>
+        <div class="card" style="max-width:820px">
+          <div class="field"><label>当前镜像</label><div class="codepill" id="siCurrent" style="color:var(--ink)"></div></div>
+          <div class="field"><label>发布新镜像</label><input class="input" id="siNewImage" style="width:100%" placeholder="oci.bignof.com/nocobase-pro:release.1.7.x_v2-..."></div>
+          <button class="btn" onclick="publishImage()">暂存为待发布镜像</button>
+        </div>
+        <h3 style="margin:18px 0 8px;font-size:15px">历史镜像</h3>
+        <div class="card" style="padding:0">
+          <table><thead><tr><th>镜像</th><th>发布时间</th><th>状态</th><th>操作</th></tr></thead><tbody id="siBody"></tbody></table>
+        </div>
+        <div class="banner"><span>🖥️</span><div>镜像「发布 / 回滚」= 对该服务各实例 <b>pull-redeploy</b>(逐实例 drain→拉镜像→重建→ready,零中断);镜像是<b>实例级</b>,这里集中管该服务用哪个镜像 + 历史回滚。</div></div>
+      </section>
+
+      <!-- 插件上传 -->
+      <section id="upload" class="page">
+        <div class="page-h"><div><h1>插件上传</h1><div class="sub">上传 .tgz（npm pack 规范），自动解析包名与版本</div></div></div>
+        <div class="card" style="max-width:620px">
+          <div class="field"><label><span class="req">*</span>插件包(.tgz)</label>
+            <div id="upDrop" style="border:1px dashed var(--line2);border-radius:10px;padding:30px;text-align:center;color:var(--ink3);cursor:pointer" onclick="pickUploadFile()">
+              ⬆️<div style="margin-top:8px" id="upDropText">点击或拖拽 .tgz 到此上传</div>
+              <div class="hint">从文件名/ package.json 自动提取 <code>packageName</code> 与 <code>version</code></div></div>
+          </div>
+          <div class="field"><label>备注</label><input class="input" id="upRemark" placeholder="可选，如：修复出库批次校验"></div>
+          <button class="btn pri" id="upBtn" onclick="doUpload()">上传</button>
+        </div>
+        <h3 style="margin:18px 0 8px;font-size:15px">最近上传</h3>
+        <div class="card" style="padding:0">
+          <table>
+            <thead><tr><th>插件包</th><th>版本</th><th>上传时间</th><th>操作</th></tr></thead>
+            <tbody id="uploadBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 获取记录 -->
+      <section id="fetch" class="page">
+        <div class="page-h"><div><h1>获取记录</h1><div class="sub">按 命名空间 + 服务 + 实例 聚合;插件@版本在「详情」里</div></div></div>
+        <div class="card" style="padding:0">
+          <table>
+            <thead><tr><th>命名空间</th><th>服务</th><th>实例(容器)</th><th>最近拉取</th><th>插件数</th><th>操作</th></tr></thead>
+            <tbody id="fetchBody"></tbody>
+          </table>
+        </div>
+        <div class="banner"><span>🗄️</span><div>每行 = 一个实例的拉包汇总(命名空间 + 服务 + 实例);点「详情」看该实例拉了哪些插件@版本 + 命中/回源。同主机多容器同包只回源一次。</div></div>
+      </section>
+
+      <!-- 操作审计 -->
+      <section id="ops" class="page">
+        <div class="page-h"><div><h1>操作审计</h1><div class="sub">实例运维命令审计（启动/停止/更新/滚动）</div></div></div>
+        <div class="card" style="padding:0">
+          <table>
+            <thead><tr><th>时间</th><th>操作</th><th>目标</th><th>方式</th><th>发起人</th><th>状态</th></tr></thead>
+            <tbody>
+              <tr><td class="mono">2026-06-18 09:15:00</td><td>rolling-restart</td><td>wms-test-admin（2 实例）</td><td>优雅</td><td>platform-admin</td><td><span class="tag t-ok">done</span></td></tr>
+              <tr><td class="mono">2026-06-18 09:01:33</td><td>pull-redeploy</td><td>wms-test-admin2</td><td>强制</td><td>platform-admin</td><td><span class="tag t-ok">success</span></td></tr>
+              <tr><td class="mono">2026-06-17 18:40:12</td><td>force-restart</td><td>wms-test-admin</td><td>强制</td><td>platform-admin</td><td><span class="tag t-ok">success</span></td></tr>
+              <tr><td class="mono">2026-06-17 18:39:50</td><td>stop</td><td>wms-test-admin2</td><td>优雅</td><td>platform-admin</td><td><span class="tag t-err">failed（drain 502）</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+    </div>
+  </main>
+</div>
+
+<!-- 新建服务 抽屉 -->
+<div class="mask" id="mask" onclick="closeTopLayer()"></div>
+<div class="drawer" id="drawer">
+  <div class="dh"><span id="drawerTitle">纳管服务</span><span class="x" onclick="closeDrawer()">×</span></div>
+  <div class="db">
+    <div class="field"><label><span class="req">*</span>命名空间</label>
+      <select class="input" id="dNs"><option value="">请选择命名空间</option><option>tamagawa-test</option><option>rolltest-agent</option><option>k8s-prod-a</option></select></div>
+    <div class="field"><label><span class="req">*</span>服务编码（= nacos 服务名）</label><input class="input" id="dSvc" placeholder="请输入，如 wms-test-admin">
+      <div class="hint">key 约定：serviceCode = nacosServiceName，发现的实例据此 link 到本服务。</div></div>
+    <div class="field"><label>服务别名</label><input class="input" placeholder="请输入"></div>
+    <div class="banner" id="drawerNote"><span>💡</span><div>服务是<b>逻辑层</b>：命名空间 + 服务名(= nacos) + 插件;<b>不涉及目录 / 镜像</b>(那是实例的事,自动发现)。</div></div>
+  </div>
+  <div class="df"><button class="btn" onclick="closeDrawer()">取消</button><button class="btn pri" onclick="saveService()">确定</button></div>
+</div>
+
+<!-- 实例详情 抽屉(数据模型层 = DiscoveredNode,UI 统一称「实例」)-->
+<div class="drawer" id="nodeDrawer">
+  <div class="dh"><span id="ndTitle">实例详情</span><span class="x" onclick="closeNodeDrawer()">×</span></div>
+  <div class="db" id="ndBody"></div>
+  <div class="df"><button class="btn" onclick="closeNodeDrawer()">关闭</button></div>
+</div>
+
+<!-- 通用详情抽屉(版本历史 / Agent 详情) -->
+<div class="drawer" id="infoDrawer">
+  <div class="dh"><span id="infoTitle">详情</span><span class="x" onclick="closeInfoDrawer()">×</span></div>
+  <div class="db" id="infoBody"></div>
+  <div class="df"><button class="btn" onclick="closeInfoDrawer()">关闭</button></div>
+</div>
+
+<!-- 危险操作 确认弹窗 -->
+<div class="modal" id="confirmModal">
+  <div class="box">
+    <h3 id="cfTitle">确认操作</h3>
+    <div class="desc" id="cfDesc"></div>
+    <div style="display:flex;justify-content:flex-end;gap:10px">
+      <button class="btn" onclick="closeConfirm()">取消</button>
+      <button class="btn pri" onclick="confirmOk()">确定</button>
+    </div>
+  </div>
+</div>
+
+<!-- 发布 modal -->
+<div class="modal" id="publishModal">
+  <div class="box"><div id="deployBody"></div></div>
+</div>
+
+<!-- 上传后发布 弹窗 -->
+<div class="modal" id="upubModal">
+  <div class="box">
+    <h3>发布插件 · <span id="upubPlugin"></span></h3>
+    <div class="desc">选择命名空间与服务,把该插件绑定到服务并设为 active(触发滚动投放)。</div>
+    <div class="field"><label>命名空间</label><select class="input" id="upubNs" onchange="upubFillSvc()" style="width:100%"></select></div>
+    <div class="field" style="margin-bottom:16px"><label>服务</label><select class="input" id="upubSvc" style="width:100%"></select></div>
+    <div style="display:flex;justify-content:flex-end;gap:10px">
+      <button class="btn" onclick="closeUpub()">取消</button>
+      <button class="btn pri" onclick="doUpub()">发布</button>
+    </div>
+  </div>
+</div>
+
+<!-- 绑定插件 弹窗 -->
+<div class="modal" id="bindModal">
+  <div class="box">
+    <h3>绑定插件 · <span id="bindSvc"></span></h3>
+    <div class="desc" id="bindHint">为该服务绑定一个插件（已绑定的不可重复选）。</div>
+    <div class="field" style="margin-bottom:16px"><label>选择插件</label>
+      <select class="input" id="bindSelect" style="width:100%"></select></div>
+    <div style="display:flex;justify-content:flex-end;gap:10px">
+      <button class="btn" onclick="closeBind()">取消</button>
+      <button class="btn pri" id="bindOkBtn" onclick="doBind()">绑定</button>
+    </div>
+  </div>
+</div>
+
+<!-- 新建命名空间 弹窗(provision agent → show-once 返回 agentKey + pull-token) -->
+<div class="modal" id="newNsModal">
+  <div class="box">
+    <div id="newNsStep1">
+      <h3>新建命名空间</h3>
+      <div class="desc">命名空间 = 一台 agent(1:1)。创建即 provision 一个 agent,并 <b>show-once</b> 返回 agentKey(控制链)+ pull-token(分发链)。</div>
+      <div class="field"><label><span class="req">*</span>命名空间 code（= agentId）</label><input class="input" id="newNsCode" placeholder="如 wms-prod-b" style="width:100%"></div>
+      <div class="field" style="margin-bottom:16px"><label>名称</label><input class="input" id="newNsName" placeholder="如 生产 B" style="width:100%"></div>
+      <div style="display:flex;justify-content:flex-end;gap:10px">
+        <button class="btn" onclick="closeNewNs()">取消</button>
+        <button class="btn pri" onclick="createNs()">创建并生成凭据</button>
+      </div>
+    </div>
+    <div id="newNsStep2" style="display:none">
+      <h3>✅ 命名空间已创建 · <span id="newNsCodeShow"></span></h3>
+      <div class="desc" style="color:var(--err)">以下两枚凭据 <b>仅显示这一次(show-once)</b>,请立即复制注入到该机 agent 配置;关闭后无法再次查看,只能轮换。</div>
+      <div class="field"><label>agentKey（控制链 · 注入 agent,hub 据此鉴权）</label><div class="codepill" id="newNsAgentKey"></div></div>
+      <div class="field" style="margin-bottom:16px"><label>pull-token（分发链 · worker 经本机 agent 拉插件凭据）</label><div class="codepill" id="newNsPullToken"></div></div>
+      <div style="display:flex;justify-content:flex-end;gap:10px">
+        <button class="btn pri" onclick="closeNewNs()">我已复制,关闭</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 实例实时日志 查看器(模拟:浏览器⇄platform(SSE)⇄hub(WS)⇄agent→docker logs --tail 500 -f)。关闭即停定时器,不留孤儿 -->
+<div class="modal" id="logModal">
+  <div class="box logbox">
+    <div class="lh"><span class="lt" id="logTitle">实例日志</span><span class="lsub">经 agent 实时 tail(docker logs --tail 500 -f),仅实时、不落库</span><span class="x" onclick="closeLog()">×</span></div>
+    <div class="lctl">
+      <button class="btn sm" id="logPauseBtn" onclick="toggleLogPause()">⏸ 暂停</button>
+      <button class="btn sm" onclick="clearLog()">🧹 清屏</button>
+      <label><input type="checkbox" id="logAutoScroll" checked onchange="onLogAutoScrollChange()"> 自动滚动</label>
+      <label><input type="checkbox" id="logShowNo" checked onchange="renderLogLines()"> 行号</label>
+      <div class="sp"></div>
+      <button class="btn sm" onclick="closeLog()">关闭</button>
+    </div>
+    <div class="logterm" id="logTerm" onscroll="onLogScroll()"></div>
+    <div class="logbar"><span id="logStatus" class="live">● 实时</span><div class="sp"></div><span id="logCount" style="color:var(--ink3)">0 行</span><span style="color:var(--ink3)">· 上限 500 行(--tail 500)</span></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+  var crumbMap={namespaces:['配置','命名空间'],services:['配置','服务'],plugins:['配置','插件'],
+    serviceplugins:['服务','配置'],serviceimage:['服务','镜像'],upload:['发布','插件上传'],
+    fetch:['发布','获取记录'],nodes:['运维','实例'],ops:['运维','操作审计']};
+  function escapeHtml(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
+  // syncMask(L7):共享 #mask 只要还有任一弹层(.drawer/.modal).on 就保留,杜绝关一个层连带掀掉别人的遮罩
+  var _LAYERS=['drawer','nodeDrawer','infoDrawer','confirmModal','publishModal','upubModal','bindModal','newNsModal','logModal'];
+  function syncMask(){
+    var any=_LAYERS.some(function(id){var el=document.getElementById(id);return el&&el.classList.contains('on');});
+    var m=document.getElementById('mask'); if(m)m.classList.toggle('on',any);
+  }
+  // 点遮罩 / Esc:只关最上层(modal 在 drawer 之上),不连带关掉底下的层
+  var _CLOSERS=[['confirmModal',closeConfirm],['logModal',closeLog],['newNsModal',closeNewNs],['bindModal',closeBind],['upubModal',closeUpub],['publishModal',closePublish],['nodeDrawer',closeNodeDrawer],['infoDrawer',closeInfoDrawer],['drawer',closeDrawer]];
+  function closeTopLayer(){
+    for(var i=0;i<_CLOSERS.length;i++){var el=document.getElementById(_CLOSERS[i][0]);if(el&&el.classList.contains('on')){_CLOSERS[i][1]();return;}}
+  }
+  function go(id){
+    document.querySelectorAll('.page').forEach(function(p){p.classList.remove('active')});
+    document.querySelectorAll('nav a').forEach(function(a){a.classList.remove('active')});
+    var pg=document.getElementById(id); if(pg)pg.classList.add('active');
+    var link=document.querySelector('nav a[data-target="'+id+'"]'); if(link)link.classList.add('active');
+    var c=crumbMap[id]||['','']; document.querySelector('.crumb').innerHTML=c[0]+' / <b id="crumb">'+c[1]+'</b>';
+    var gs=document.getElementById('globalSearch');if(gs)gs.value='';
+    var sb=document.querySelector('.sidebar');if(sb)sb.classList.remove('open');
+    closeLog();               // 切走必停日志流(关闭→agent kill docker logs,不留孤儿定时器)
+    if(id==='serviceplugins')renderServicePlugins();
+    if(id==='nodes')renderNodes();
+    if(id==='fetch')renderFetch();
+    if(id==='services')renderServicesPage();
+    if(id==='upload')renderUploads();
+    filterPage('');           // 切页复位:清空搜索 + 重套 ns 过滤(L5/L10)
+    window.scrollTo(0,0);
+  }
+  document.querySelectorAll('nav a').forEach(function(a){a.addEventListener('click',function(){go(a.dataset.target)})});
+  function openDrawer(){document.getElementById('drawer').classList.add('on');syncMask()}
+  function closeDrawer(){document.getElementById('drawer').classList.remove('on');syncMask()}
+  var adoptMode=false;
+  function openManual(){
+    adoptMode=false;
+    document.getElementById('drawerTitle').textContent='手动预建服务';
+    document.getElementById('dNs').value='';document.getElementById('dSvc').value='';
+    document.getElementById('drawerNote').innerHTML='<span>💡</span><div>首次上线前预置插件集用（绕开"服务还没起 → 拉空"的鸡生蛋）。服务是逻辑层(命名空间 + 服务名 + 插件),<b>不涉及目录 / 镜像</b>。</div>';
+    openDrawer();
+  }
+  function openAdopt(ns,svc){
+    adoptMode=true;
+    document.getElementById('drawerTitle').textContent='从发现纳管服务';
+    document.getElementById('dNs').value=ns;document.getElementById('dSvc').value=svc;
+    document.getElementById('drawerNote').innerHTML='<span>✅</span><div>已从发现<b>预填</b>命名空间与 nacos 名（零敲）。确定后建 Service，再去「服务插件」配插件即可。</div>';
+    openDrawer();
+  }
+  function saveService(){var n=document.getElementById('dSvc').value||'服务';closeDrawer();toast(adoptMode?('已纳管 '+n+'，去「服务插件」配插件'):'服务已创建（手动预建）');}
+  document.addEventListener('keydown',function(e){if(e.key==='Escape'){closeTopLayer();}});
+  function toggleSidebar(){document.querySelector('.sidebar').classList.toggle('open');}
+  function svcTab(which){
+    var m=document.getElementById('svc-managed'),i=document.getElementById('svc-inbox');
+    if(m)m.style.display=which==='managed'?'':'none';
+    if(i)i.style.display=which==='inbox'?'':'none';
+    document.querySelectorAll('#services .tab').forEach(function(t){t.classList.toggle('active',t.dataset.tab===which);});
+    // 切 tab 后重套当前过滤(ns + 搜索),避免上个 tab 的过滤把新面板行藏住(L10)
+    filterPage(document.getElementById('globalSearch')?document.getElementById('globalSearch').value:'');
+  }
+  function toggleDark(){var d=document.body.classList.toggle('dark');document.getElementById('darkBtn').textContent=d?'☀️':'🌙';try{localStorage.setItem('pp-dark',d?'1':'0');}catch(e){}}
+  (function(){try{if(localStorage.getItem('pp-dark')==='1'){document.body.classList.add('dark');var b=document.getElementById('darkBtn');if(b)b.textContent='☀️';}}catch(e){}})();
+  // ===== 统一发布(desired-state apply):编辑=暂存意图,发布=按 diff 应用 =====
+  function _pluginsCopy(svc){ return ((SERVICES[svc]||{}).plugins||[]).map(function(p){return [p[0],p[1]];}); }
+  function initServiceState(){
+    Object.keys(SERVICES).forEach(function(svc){
+      var imgs=SERVICE_IMAGES[svc]||[]; var cur=((imgs.filter(function(i){return i[2];})[0]||[])[0])||'';
+      if(!SERVICES[svc].image)SERVICES[svc].image=cur;
+      SERVICES[svc].deployedImage=SERVICES[svc].image;
+      SERVICES[svc].deployedPlugins=_pluginsCopy(svc);
+    });
+  }
+  function _shortImg(s){ s=s||''; var i=s.lastIndexOf(':'); return i>=0?('…'+s.slice(i)):(s||'(无)'); }
+  function svcDiff(svc){
+    var s=SERVICES[svc]||{plugins:[]};
+    var dep={}; (s.deployedPlugins||[]).forEach(function(p){dep[p[0]]=p[1];});
+    var cur={}; (s.plugins||[]).forEach(function(p){cur[p[0]]=p[1];});
+    var pc=[];
+    Object.keys(cur).forEach(function(c){ if(!(c in dep))pc.push({k:'+',c:c,to:cur[c]}); else if(dep[c]!==cur[c])pc.push({k:'~',c:c,from:dep[c],to:cur[c]}); });
+    Object.keys(dep).forEach(function(c){ if(!(c in cur))pc.push({k:'-',c:c,from:dep[c]}); });
+    var imgChanged=((s.image||'')!==(s.deployedImage||''));
+    return {imgChanged:imgChanged,imgFrom:s.deployedImage,imgTo:s.image,pc:pc,none:(!imgChanged&&pc.length===0)};
+  }
+  function hasPending(svc){ return !svcDiff(svc).none; }
+  // canDeploy:统一投放守卫(agent 在线 + 有在跑实例),列表/详情/概览/实例抽屉共用,杜绝各判一次
+  function canDeploy(svc){
+    var s=SERVICES[svc]; if(!s)return {ok:false,reason:'未知服务'};
+    var a=AGENTS[s.ns]; if(!a||!a.online)return {ok:false,reason:'agent 离线（'+s.ns+'）,无法投放'};
+    if(!s.inst||!s.inst.length)return {ok:false,reason:'无在跑实例（纳管未起）,无法投放'};
+    return {ok:true};
+  }
+  function _driftedInsts(svc){ return ((SERVICES[svc]||{}).inst||[]).filter(function(i){return !i[2];}); }
+  function _blockedModal(svc,reason){
+    document.getElementById('deployBody').innerHTML='<h3>🚫 无法投放 · '+svc+'</h3><div class="desc" style="margin:8px 0 16px">'+reason+'</div><div style="display:flex;justify-content:flex-end"><button class="btn" onclick="closePublish()">知道了</button></div>';
+    document.getElementById('publishModal').classList.add('on');syncMask();
+  }
+  // _rollout:逐实例零中断动画(发布 / 强制重新投放 / 同步实例 共用),inst 为空直接报错不伪造。
+  // opts(可选):{fail:{at,step,reason}, retry:Function} —— 注入「某实例失败 → 失败即停」(M13/G5);不传 opts 时行为与原先完全一致
+  function _rollout(svc,title,desc,steps,names,commitFn,opts){
+    if(!names.length){toast('无在跑实例,无法投放');return;}
+    opts=opts||{};
+    var rows=names.map(function(n,i){return '<div class="ri" id="dr'+i+'"><div class="rn">'+n+'</div><div class="rs" id="ds'+i+'">等待…</div></div>';}).join('');
+    document.getElementById('deployBody').innerHTML='<h3>'+title+'</h3><div class="desc">'+desc+'</div><div class="rollout">'+rows+'</div><div id="rolloutFoot" style="display:flex;justify-content:flex-end;margin-top:14px"><button class="btn pri" id="deployDone" style="display:none" onclick="closePublish();go(\'ops\')">完成 · 查看审计 →</button></div>';
+    function runNode(i,cb,onFail){
+      var ri=document.getElementById('dr'+i),rs=document.getElementById('ds'+i);ri.className='ri active';var s=0;
+      (function nx(){
+        // 失败注入:到达指定实例的指定步骤即失败,不再 ✓ 完成
+        if(opts.fail&&opts.fail.at===i&&s===(opts.fail.step||0)){ ri.className='ri fail'; rs.textContent='✗ 失败:'+(opts.fail.reason||'drain 502(实例未就绪)'); onFail(i); return; }
+        if(s>=steps.length){ ri.className='ri done';rs.textContent='✓ 完成';cb();return; }
+        rs.textContent=steps[s++];setTimeout(nx,500);
+      })();
+    }
+    (function seq(i){
+      if(i>=names.length){var b=document.getElementById('deployDone');if(b)b.style.display='inline-flex';if(commitFn)commitFn();return;}
+      runNode(i,function(){seq(i+1);},function(failIdx){ _rolloutFailed(svc,names,failIdx,opts); });
+    })(0);
+  }
+  // 失败即停后的收敛视图:已成功的前 N 个标「已新版」,失败实例标红,其后未动;给「回滚已动实例 / 重试」
+  function _rolloutFailed(svc,names,failIdx,opts){
+    // 把失败实例之后(未开始)的标 skip
+    for(var j=failIdx+1;j<names.length;j++){ var ri=document.getElementById('dr'+j),rs=document.getElementById('ds'+j); if(ri)ri.className='ri skip'; if(rs)rs.textContent='已中止(未投放)'; }
+    var doneN=failIdx; // 失败实例之前已成功的个数
+    var foot=document.getElementById('rolloutFoot');
+    if(foot)foot.outerHTML='<div id="rolloutFoot" style="margin-top:14px">'+
+      '<div class="banner" style="background:var(--errbg);border-color:#ffccc7;color:#cf1322;margin-bottom:12px"><span>⛔</span><div><b>集群健康跌破阈值(健康实例 ≥1),已中止后续投放。</b><br>已停在第 '+(failIdx+1)+' / '+names.length+' 个('+names[failIdx]+');前 '+doneN+' 个已切新版(可回滚),后 '+(names.length-failIdx-1)+' 个保持旧版未动。</div></div>'+
+      '<div style="display:flex;justify-content:flex-end;gap:10px">'+
+      (doneN>0?'<button class="btn" onclick="_rollback(\''+svc+'\','+failIdx+')">回滚已切新版的 '+doneN+' 个</button>':'')+
+      '<button class="btn" onclick="closePublish()">稍后处理</button>'+
+      '<button class="btn pri" onclick="'+(opts.retry?'_retryRollout(\''+svc+'\')':'closePublish()')+'">重试投放</button></div></div>';
+    toast('投放在第 '+(failIdx+1)+' 个实例失败,已中止');
+  }
+  var _lastRollout=null; // 存最近一次投放参数,供重试
+  function _retryRollout(svc){ if(_lastRollout)_lastRollout(); }
+  function _rollback(svc,failIdx){
+    // 把已切新版的前 failIdx 个回滚到旧版(原型:动画 + 不 commit,意图保持未发布)
+    var names=_lastRollNames||[];
+    var rb=names.slice(0,failIdx);
+    if(!rb.length){toast('无已切新版实例可回滚');return;}
+    var steps=['drain（排空连接）…','回滚到上一已部署版本…','等待 /health/ready…'];
+    _rollout(svc,'↩️ 回滚已动实例 · '+svc,'把已切新版的 '+rb.length+' 个实例回滚到上一已部署版本:'+steps.join(' → '),steps,rb,function(){ toast('已回滚 '+rb.length+' 个实例到旧版;本次发布意图保持未生效'); });
+  }
+  var _lastRollNames=null;
+  // openDeploy:意图待发布(diff publish)。无 diff 时不再死胡同——引导到强制重新投放
+  function openDeploy(svc){
+    var g=canDeploy(svc); if(!g.ok){_blockedModal(svc,g.reason);return;}
+    var d=svcDiff(svc), mech=d.imgChanged?'pull-redeploy':'restart';
+    if(d.none){
+      var drifted=_driftedInsts(svc);
+      var b0='<h3>🚀 发布 · '+svc+'</h3><div class="desc">意图与已部署一致,无待发布变更。</div>'+
+        '<div class="desc" style="margin:8px 0 16px;color:var(--ink3)">'+(drifted.length?('但有 '+drifted.length+' 个实例版本漂移(未拉全已发布态),可强制重新投放修复。'):'如怀疑实例漂移,可强制重新投放(滚动 restart)确保一致。')+'</div>'+
+        '<div style="display:flex;justify-content:flex-end;gap:10px"><button class="btn" onclick="closePublish()">取消</button><button class="btn pri" onclick="openReapply(\''+svc+'\')">强制重新投放…</button></div>';
+      document.getElementById('deployBody').innerHTML=b0;
+      document.getElementById('publishModal').classList.add('on');syncMask();
+      return;
+    }
+    var lines=''; if(d.imgChanged)lines+='🖥️ 镜像：<span class="mono">'+_shortImg(d.imgFrom)+'</span> → <span class="mono">'+_shortImg(d.imgTo)+'</span><br>';
+    d.pc.forEach(function(x){ lines+=(x.k==='+'?'➕ 绑定 ':x.k==='-'?'➖ 解绑 ':'🔄 ')+x.c+(x.k==='~'?(' '+x.from+'→'+x.to):(x.k==='+'?(' @'+x.to):''))+'<br>'; });
+    var head='本次应用到各实例 —— '+(mech==='pull-redeploy'?'镜像变更 → <b>pull-redeploy</b> 逐实例(含插件刷新)':'仅插件变更 → <b>滚动 restart</b> 逐实例');
+    var body='<h3>🚀 发布 · '+svc+'</h3><div class="desc">'+head+'</div>';
+    body+='<div class="card" style="background:var(--soft);margin-bottom:14px"><div style="font-size:13px;line-height:1.9">'+lines+'</div></div>';
+    var instN=((SERVICES[svc]||{}).inst||[]).length;
+    body+='<label style="display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--ink3);margin-bottom:12px;cursor:pointer"><input type="checkbox" id="simFail"'+(instN<2?' disabled':'')+'> 模拟某实例失败(演示「失败即停 + 集群健康门」'+(instN<2?',需 ≥2 实例':'')+')</label>';
+    body+='<div style="display:flex;justify-content:flex-end;gap:10px"><button class="btn" onclick="closePublish()">取消</button><button class="btn pri" onclick="startDeploy(\''+svc+'\',\''+mech+'\')">确认发布</button></div>';
+    document.getElementById('deployBody').innerHTML=body;
+    document.getElementById('publishModal').classList.add('on');syncMask();
+  }
+  function startDeploy(svc,mech){
+    var g=canDeploy(svc); if(!g.ok){toast(g.reason);return;}
+    var sf=document.getElementById('simFail'); var simFail=!!(sf&&sf.checked);
+    var inst=((SERVICES[svc]||{}).inst||[]).map(function(i){return i[0];});
+    if(!inst.length){toast('无在跑实例,无法投放');return;}
+    var steps=mech==='pull-redeploy'?['drain（排空连接）…','docker compose pull 新镜像…','down 旧容器…','up 新容器…','等待 /health/ready…','经 agent 重拉插件…']:['drain（排空连接）…','docker 重启…','等待 /health/ready…','经 agent 重拉插件…'];
+    _lastRollNames=inst.slice();
+    // 失败注入:让第 2 个实例(index 1)在 ready 步骤失败,演示「前 1 个已新版,失败即停」
+    var opts=simFail?{fail:{at:Math.min(1,inst.length-1),step:Math.max(0,steps.length-2),reason:'/health/ready 超时(drain 502)'},retry:true}:null;
+    var done=function(){commitDeploy(svc);toast('发布完成（'+mech+'）');};
+    // 重试时清掉失败注入(模拟修好实例后重投),让重试能真正成功
+    _lastRollout=function(){ _rollout(svc,'🚀 重试投放 · '+svc+'（'+mech+'）','逐实例零中断:'+steps.join(' → '),steps,inst,done,null); };
+    _rollout(svc,'🚀 发布中 · '+svc+'（'+mech+'）','逐实例零中断:'+steps.join(' → '),steps,inst,done,opts);
+  }
+  // openReapply / startReapply:实例漂移修复(active 已是目标,某实例没拉到)——强制重新投放,不改意图
+  function openReapply(svc){
+    var g=canDeploy(svc); if(!g.ok){_blockedModal(svc,g.reason);return;}
+    var drifted=_driftedInsts(svc), all=((SERVICES[svc]||{}).inst||[]);
+    var list=(drifted.length?drifted:all).map(function(i){return i[0];});
+    var head=drifted.length?('检测到 '+drifted.length+' 个实例版本漂移,将强制重新投放到:'):'所有实例与已发布态一致,可强制重新投放以确保一致:';
+    var body='<h3>🔁 强制重新投放 · '+svc+'</h3><div class="desc">'+head+'</div>'+
+      '<div class="card" style="background:var(--soft);margin-bottom:14px"><div style="font-size:13px;line-height:1.9">'+list.map(function(n){return '🔄 '+n;}).join('<br>')+'</div></div>'+
+      '<div class="desc" style="margin-bottom:14px;color:var(--ink3)">不改变插件/镜像意图,仅把当前已发布版本重新喂给实例(滚动 restart)。</div>'+
+      '<div style="display:flex;justify-content:flex-end;gap:10px"><button class="btn" onclick="closePublish()">取消</button><button class="btn pri" onclick="startReapply(\''+svc+'\')">确认重新投放</button></div>';
+    document.getElementById('deployBody').innerHTML=body;
+    document.getElementById('publishModal').classList.add('on');syncMask();
+  }
+  function _convergeInst(svc){
+    var s=SERVICES[svc]; if(!s||!s.inst)return;
+    var good=(s.inst.filter(function(i){return i[2];})[0]||[])[1];
+    s.inst.forEach(function(i){ if(good)i[1]=good; i[2]=true; });
+    Object.keys(NODES).forEach(function(k){ if(NODES[k].svc===svc&&!NODES[k].stale){NODES[k].plugins.forEach(function(p){p[2]=p[1];});if(s.image)NODES[k].image=s.image;} });
+    s.recon='正常'; s.reconCls='t-ok';
+    renderNodes();
+  }
+  function startReapply(svc){
+    var g=canDeploy(svc); if(!g.ok){toast(g.reason);return;}
+    var drifted=_driftedInsts(svc), all=((SERVICES[svc]||{}).inst||[]);
+    var names=(drifted.length?drifted:all).map(function(i){return i[0];});
+    var steps=['drain（排空连接）…','docker 重启…','等待 /health/ready…','经 agent 重拉插件…'];
+    _lastRollNames=names.slice();
+    _lastRollout=function(){ _rollout(svc,'🔁 重新投放中 · '+svc,'把已发布态重新喂给落后实例:'+steps.join(' → '),steps,names,function(){_convergeInst(svc);toast('已同步漂移实例');}); };
+    _rollout(svc,'🔁 重新投放中 · '+svc,'把已发布态重新喂给落后实例:'+steps.join(' → '),steps,names,function(){_convergeInst(svc);toast('已同步漂移实例');});
+  }
+  function syncInstance(svc,instKey){
+    var g=canDeploy(svc); if(!g.ok){toast(g.reason);return;}
+    closeNodeDrawer();
+    document.getElementById('publishModal').classList.add('on');syncMask();
+    var steps=['drain（排空连接）…','docker 重启…','等待 /health/ready…','经 agent 重拉插件…'];
+    _rollout(svc,'🔁 同步实例 · '+instKey,'把已发布态重新喂给该实例(不改意图):'+steps.join(' → '),steps,[instKey],function(){
+      var n=NODES[instKey]; if(n){n.plugins.forEach(function(p){p[2]=p[1];});var sv=SERVICES[svc];if(sv&&sv.image)n.image=sv.image;}
+      var s=SERVICES[svc]; if(s&&s.inst){var good=(s.inst.filter(function(i){return i[2];})[0]||[])[1];var row=s.inst.filter(function(i){return i[0]===instKey;})[0];if(row){if(good)row[1]=good;row[2]=true;}if(!s.inst.some(function(i){return !i[2];})){s.recon='正常';s.reconCls='t-ok';}}
+      renderNodes();
+      toast('已同步实例 '+instKey);
+    });
+  }
+  function commitDeploy(svc){ var s=SERVICES[svc]; if(!s)return; s.deployedImage=s.image; s.deployedPlugins=_pluginsCopy(svc); }
+  // ===== 命名空间切换器(G4):CURRENT_NS='all' 看全局,否则只看该 ns =====
+  var CURRENT_NS='all';
+  function initNsSwitch(){
+    var sel=document.getElementById('nsSwitch'); if(!sel)return;
+    var opts='<option value="all">全部命名空间</option>'+Object.keys(AGENTS).map(function(n){return '<option value="'+n+'">'+n+'</option>';}).join('');
+    sel.innerHTML=opts; sel.value=CURRENT_NS;
+  }
+  function switchNs(ns){
+    CURRENT_NS=ns||'all';
+    renderNodes(); renderFetch(); renderServicesPage();
+    filterPage(document.getElementById('globalSearch')?document.getElementById('globalSearch').value:'');
+  }
+  // filterPage:同时套用「ns 过滤(data-ns)」+「搜索词」,并在 0 命中时补占位行(L5/L10/L13)
+  function filterPage(q){
+    q=(q||'').trim().toLowerCase();
+    var pg=document.querySelector('.page.active');if(!pg)return;
+    pg.querySelectorAll('table').forEach(function(tbl){
+      var body=tbl.tBodies[0]; if(!body)return;
+      var shown=0,total=0;
+      Array.prototype.forEach.call(body.rows,function(tr){
+        if(tr.getAttribute('data-empty')==='1')return; // 占位行不参与
+        total++;
+        var nsOk=(CURRENT_NS==='all')||!tr.hasAttribute('data-ns')||tr.getAttribute('data-ns')===CURRENT_NS;
+        var qOk=(!q||tr.textContent.toLowerCase().indexOf(q)>=0);
+        var vis=nsOk&&qOk; tr.style.display=vis?'':'none'; if(vis)shown++;
+      });
+      // 空态占位:本表有数据行但全被过滤掉时插一行
+      var ph=body.querySelector('tr[data-empty="1"]');
+      if(total>0&&shown===0){
+        if(!ph){ ph=document.createElement('tr'); ph.setAttribute('data-empty','1');
+          var cols=(tbl.tHead&&tbl.tHead.rows[0])?tbl.tHead.rows[0].cells.length:1;
+          ph.innerHTML='<td colspan="'+cols+'" style="color:var(--ink3);padding:18px;text-align:center">无匹配结果</td>'; body.appendChild(ph); }
+        ph.style.display='';
+      } else if(ph){ ph.style.display='none'; }
+    });
+  }
+  // ===== ns 维度过滤助手(G4):被实例页 / 服务页统计卡共用,按 CURRENT_NS 收窄 =====
+  function _nsNodes(){ return Object.keys(NODES).filter(function(k){return CURRENT_NS==='all'||NODES[k].ns===CURRENT_NS;}); }
+  function _nsAgents(){ return Object.keys(AGENTS).filter(function(n){return CURRENT_NS==='all'||n===CURRENT_NS;}); }
+  function _nsServices(){ return Object.keys(SERVICES).filter(function(s){return CURRENT_NS==='all'||SERVICES[s].ns===CURRENT_NS;}); }
+  // ===== 实例页(G4/L6):从 NODES 渲染,按 ns 过滤;离线 agent 的实例标 stale =====
+  function renderNodes(){
+    var keys=_nsNodes();
+    var ag=_nsAgents(), onAg=ag.filter(function(n){return AGENTS[n].online;});
+    var healthy=keys.filter(function(k){return NODES[k].running&&!NODES[k].stale;});
+    var behind=keys.filter(function(k){return NODES[k].plugins.some(function(p){return p[1]!==p[2];})||_nodeImgDrift(k);});
+    var st=document.getElementById('nodesStat'); if(st){
+      st.innerHTML=
+        '<div class="c"><div class="l">在线 agent</div><div class="v">'+onAg.length+' <span style="font-size:14px;color:var(--ink3)">/ '+ag.length+'</span></div></div>'+
+        '<div class="c"><div class="l">发现实例</div><div class="v">'+keys.length+'</div></div>'+
+        '<div class="c"><div class="l">健康实例</div><div class="v" style="color:var(--ok)">'+healthy.length+'</div></div>'+
+        '<div class="c"><div class="l">待更新(漂移)</div><div class="v" style="color:var(--warn)">'+behind.length+'</div></div>';
+    }
+    var tb=document.getElementById('nodesBody'); if(!tb)return;
+    tb.innerHTML=keys.length?keys.map(function(k){
+      var n=NODES[k];
+      var stTag=n.stale?'<span class="tag t-off"><span class="dot" style="background:var(--ink3)"></span>离线·stale</span>':(n.running?'<span class="tag t-ok"><span class="dot" style="background:var(--ok)"></span>在线·健康</span>':'<span class="tag t-warn"><span class="dot" style="background:var(--warn)"></span>已停');
+      var verBehind=n.plugins.some(function(p){return p[1]!==p[2];})?' <span class="tag t-warn">版本落后</span>':'';
+      var imgBehind=_nodeImgDrift(k)?' <span class="tag t-warn">镜像漂移</span>':'';
+      var acts=n.stale
+        ? '<a onclick="openNode(\''+k+'\')">详情</a><a onclick="nodeAct(\''+k+'\',\'启动\')">启动</a><span style="color:var(--ink3)" title="agent 离线,日志/运维不可用">日志</span><span style="color:var(--ink3)" title="agent 离线,运维不可用">运维不可用</span>'
+        : '<a onclick="openNode(\''+k+'\')">详情</a><a onclick="nodeAct(\''+k+'\',\'启动\')">启动</a><a class="danger" onclick="nodeAct(\''+k+'\',\'停止\')">停止</a><a onclick="nodeAct(\''+k+'\',\'更新\')">更新</a><a onclick="nodeAct(\''+k+'\',\'日志\')">日志</a>';
+      return '<tr data-ns="'+n.ns+'"><td>'+n.ns+'</td><td><span class="tag t-blue">'+n.svc+'</span></td>'+
+        '<td style="cursor:pointer" onclick="openNode(\''+k+'\')"><a style="color:var(--pri)">'+k+'</a></td>'+
+        '<td class="mono">'+escapeHtml(n.dir)+'</td><td class="mono" title="'+escapeHtml(n.image)+'">'+escapeHtml(_shortImg(n.image))+'</td>'+
+        '<td>'+stTag+verBehind+imgBehind+'</td><td><div class="acts">'+acts+'</div></td></tr>';
+    }).join(''):'<tr><td colspan="7" style="color:var(--ink3);padding:18px;text-align:center">该命名空间暂无发现实例</td></tr>';
+  }
+  // DiscoveredNode 全集(各 ns 由 agent 自动发现上报;UI 统一称「实例」)。stale=agent 离线时保留台账但标灰;running=容器是否在跑(docker 含 stopped 也上报)
+  var NODES={
+    'wms-test-admin':{ns:'tamagawa-test',svc:'wms-test-admin',project:'admin',dir:'/data/orchidea/test/admin',image:'oci.bignof.com/nocobase-pro:release.1.7.x_v2-1.7.20-rc.20260527091211',health:'在线 · 健康',running:true,
+      plugins:[['@business/plugin-mom-wms','2.1.0','2.1.0'],['@orchisky/plugin-dictionary','1.3.2','1.3.2'],['@business/plugin-tamagawa-storage','2.0.0','2.0.0'],['@orchisky/plugin-menu-page','1.1.0','1.1.0'],['@orchisky/plugin-login-setting','1.0.4','1.0.4']]},
+    'wms-test-admin2':{ns:'tamagawa-test',svc:'wms-test-admin',project:'2admin',dir:'/data/orchidea/test/2admin',image:'oci.bignof.com/nocobase-pro:release.1.7.x_v2-1.7.20-rc.20260512143000',health:'在线 · 健康',running:true,
+      plugins:[['@business/plugin-mom-wms','2.1.0','2.0.3'],['@orchisky/plugin-dictionary','1.3.2','1.3.2'],['@business/plugin-tamagawa-storage','2.0.0','2.0.0'],['@orchisky/plugin-menu-page','1.1.0','1.1.0'],['@orchisky/plugin-login-setting','1.0.4','1.0.4']]},
+    'rolltest-node1':{ns:'rolltest-agent',svc:'rolltest',project:'rolltest-node1',dir:'/data/rolltest/node1',image:'oci.bignof.com/nocobase-pro:release.1.7.x_v2-1.7.20-rc.20260621104239',health:'在线 · 健康',running:true,
+      plugins:[['@orchisky/plugin-menu-page','1.1.0','1.1.0'],['@orchisky/plugin-dictionary','1.3.2','1.3.2']]},
+    'rolltest-node2':{ns:'rolltest-agent',svc:'rolltest',project:'rolltest-node2',dir:'/data/rolltest/node2',image:'oci.bignof.com/nocobase-pro:release.1.7.x_v2-1.7.20-rc.20260621104239',health:'在线 · 健康',running:true,
+      plugins:[['@orchisky/plugin-menu-page','1.1.0','1.1.0'],['@orchisky/plugin-dictionary','1.3.2','1.3.2']]},
+    // k8s-prod-a 的 agent 离线:实例台账保留(stale)以便定位 dir/工程,容器为 stopped
+    'wms-prod-a1':{ns:'k8s-prod-a',svc:'wms-prod',project:'prod-a1',dir:'/data/orchidea/prod/a1',image:'oci.bignof.com/nocobase-pro:release.1.7.x-1.7.19-rc.20260301080000',health:'离线 · stale',running:false,stale:true,
+      plugins:[['@business/plugin-mom-wms','2.1.0','2.1.0'],['@orchisky/plugin-dictionary','1.3.2','1.3.2']]},
+    'wms-prod-a2':{ns:'k8s-prod-a',svc:'wms-prod',project:'prod-a2',dir:'/data/orchidea/prod/a2',image:'oci.bignof.com/nocobase-pro:release.1.7.x-1.7.19-rc.20260301080000',health:'离线 · stale',running:false,stale:true,
+      plugins:[['@business/plugin-mom-wms','2.1.0','2.1.0'],['@orchisky/plugin-dictionary','1.3.2','1.3.2']]}
+  };
+  function _imgTag(s){ s=s||''; var i=s.lastIndexOf(':'); return i>=0?s.slice(i+1):s; }
+  // 镜像漂移:实例实际 tag ≠ 服务意图 tag(M16)
+  function _nodeImgDrift(key){ var n=NODES[key]; if(!n||n.stale)return false; var s=SERVICES[n.svc]; if(!s||!s.image)return false; return _imgTag(n.image)!==_imgTag(s.image); }
+  // 某服务下:已应用服务意图镜像的实例数 / 总发现实例数(M16,镜像配置页「N/M 实例已应用」)
+  function _svcNodeKeys(svc){ return Object.keys(NODES).filter(function(k){return NODES[k].svc===svc;}); }
+  function _imgAppliedCount(svc){ var s=SERVICES[svc]||{}; var keys=_svcNodeKeys(svc); var ap=keys.filter(function(k){return !NODES[k].stale&&_imgTag(NODES[k].image)===_imgTag(s.image);}); return {applied:ap.length,total:keys.length}; }
+  function openNode(key){
+    var n=NODES[key];if(!n)return;
+    document.getElementById('ndTitle').textContent='实例详情 · '+key;
+    var imgDrift=_nodeImgDrift(key);
+    var s=SERVICES[n.svc]||{};
+    var imgCell='<span class="mono" title="'+escapeHtml(n.image)+'">'+escapeHtml(_shortImg(n.image))+'</span>'+(imgDrift?' <span class="tag t-warn" title="实例实际 tag ≠ 服务意图 '+escapeHtml(_shortImg(s.image))+'">镜像漂移</span>':' <span class="tag t-ok">与意图一致</span>');
+    var rows=[['命名空间',n.ns],['服务名',n.svc],['容器名',key],['compose 工程',n.project],['目录',n.dir]];
+    var basic='<table style="margin-bottom:16px">'+rows.map(function(r){return '<tr><td style="color:var(--ink3);width:120px">'+r[0]+'</td><td class="mono">'+escapeHtml(r[1])+'</td></tr>';}).join('')+
+      '<tr><td style="color:var(--ink3)">镜像</td><td>'+imgCell+'</td></tr>'+
+      '<tr><td style="color:var(--ink3)">状态</td><td>'+escapeHtml(n.health)+'</td></tr></table>';
+    if(n.stale)basic+='<div class="banner" style="background:var(--soft);border-color:var(--line2);color:var(--ink2);margin-bottom:14px"><span>⚠️</span><div>该实例所属 agent <b>离线</b>:台账为最近一次发现的快照(stale),运维命令暂不可达。可在 agent 恢复后「启动」。</div></div>';
+    var anyDrift=n.plugins.some(function(p){return p[1]!==p[2];});
+    var pl='<h3 style="font-size:14px;margin:4px 0 8px">插件（active / 实际）'+(anyDrift?' <span class="tag t-warn">有漂移</span>':' <span class="tag t-ok">全一致</span>')+'</h3>'+
+      '<table><thead><tr><th>插件</th><th>active</th><th>实际</th><th></th></tr></thead><tbody>'+
+      n.plugins.map(function(p){var d=p[1]!==p[2];return '<tr><td class="mono">'+p[0]+'</td><td><span class="tag t-blue">'+p[1]+'</span></td><td>'+(d?'<span class="tag t-warn">'+p[2]+'</span>':'<span class="tag t-ok">'+p[2]+'</span>')+'</td><td>'+(d&&!n.stale?'<a style="color:var(--pri);cursor:pointer" onclick="syncInstance(\''+n.svc+'\',\''+key+'\')">同步该实例</a>':'')+'</td></tr>';}).join('')+'</tbody></table>';
+    if(imgDrift&&!n.stale)pl+='<div class="desc" style="margin-top:10px">镜像漂移:实例实际镜像与服务意图不一致,「同步该实例」会按 pull-redeploy 把它拉到意图镜像。</div>';
+    var ops='<h3 style="font-size:14px;margin:18px 0 8px">操作</h3><div style="display:flex;gap:8px;flex-wrap:wrap">'+
+      '<button class="btn" onclick="nodeAct(\''+key+'\',\'启动\')">启动</button>'+
+      (n.stale
+        ?'<button class="btn" disabled title="agent 离线,无法拉取实时日志" style="opacity:.5;cursor:not-allowed">📜 日志</button><span style="align-self:center;color:var(--ink3)">agent 离线,停止/更新不可用</span>'
+        :'<button class="btn danger" onclick="nodeAct(\''+key+'\',\'停止\')">停止</button>'+
+         '<button class="btn" onclick="nodeAct(\''+key+'\',\'更新\')">更新</button>'+
+         '<button class="btn" onclick="nodeAct(\''+key+'\',\'日志\')">📜 日志</button>')+'</div>';
+    document.getElementById('ndBody').innerHTML=basic+pl+ops;
+    document.getElementById('nodeDrawer').classList.add('on');syncMask();
+  }
+  function closeNodeDrawer(){document.getElementById('nodeDrawer').classList.remove('on');syncMask();}
+  // 单实例「更新」(L13):算该实例 vs 服务意图的 diff,区分 restart / pull-redeploy,确认弹窗给出机制 + 变更摘要
+  function _instUpdatePlan(key){
+    var n=NODES[key]; if(!n)return {none:true,lines:'实例不存在'};
+    var s=SERVICES[n.svc]||{plugins:[]};
+    var imgDrift=_nodeImgDrift(key);
+    var actual={}; n.plugins.forEach(function(p){actual[p[0]]=p[2];});
+    var lines=[];
+    (s.plugins||[]).forEach(function(p){ var av=actual[p[0]]; if(av===undefined)lines.push('➕ '+p[0]+' @'+p[1]); else if(av!==p[1])lines.push('🔄 '+p[0]+' '+av+'→'+p[1]); });
+    if(imgDrift)lines.unshift('🖥️ 镜像 '+_shortImg(n.image)+' → '+_shortImg(s.image));
+    var mech=imgDrift?'pull-redeploy':'restart';
+    return {none:lines.length===0,mech:mech,lines:lines.join('<br>')||'已与服务意图一致',imgDrift:imgDrift,svc:n.svc};
+  }
+  function nodeAct(key,action){
+    var n=NODES[key];
+    if(action==='更新'){
+      if(n&&n.stale){toast('agent 离线,无法更新');return;}
+      var pl=_instUpdatePlan(key);
+      if(pl.none){toast('实例 '+key+' 已是服务期望态,无需更新');return;}
+      var mechTxt=pl.mech==='pull-redeploy'?'pull-redeploy(含镜像:drain→pull→重建→ready)':'滚动 restart(仅插件:drain→重启→ready)';
+      askConfirm('更新实例 · '+key,'按该实例与服务意图的 diff,将执行 '+mechTxt+'。变更:\n'+pl.lines.replace(/<br>/g,'\n')+'\n确认?',function(){ syncInstance(pl.svc,key); });
+      return;
+    }
+    if(action==='停止'){
+      if(n&&n.stale){toast('agent 离线,无法停止');return;}
+      askConfirm('确认停止','将对实例 '+key+' 执行停止(优雅:先 drain 再停)。确认?',function(){toast('已下发 停止 → '+key)});
+      return;
+    }
+    if(action==='日志'){ openLog(key); return; }
+    toast('已下发 '+action+' → '+key);
+  }
+  // ===== 实例实时日志查看器(模拟流式 tail)=====
+  // 真实链路:浏览器 ⇄ platform(SSE) ⇄ hub(WS) ⇄ agent → docker logs --tail 500 -f <容器>。原型用定时器追加假行模拟实时流。
+  var _LOG_MAX=500;                 // 对应 --tail 500:只保留最近 500 行,超出从顶部丢弃
+  var _logTimer=null;               // 定时器句柄 —— 关闭/切走/Esc 必 clearInterval,不留孤儿
+  var _logLines=[];                 // [{no,ts,lvl,text}]
+  var _logSeq=0;                    // 行号自增
+  var _logKey=null;                 // 当前实例
+  var _logAuto=true;                // 自动滚动
+  function _logCanView(key){ var n=NODES[key]; if(!n)return {ok:false,reason:'实例不存在'}; if(n.stale||(AGENTS[n.ns]&&!AGENTS[n.ns].online))return {ok:false,reason:'agent 离线,无法拉取实时日志'}; return {ok:true}; }
+  var _LOG_TEMPLATES=[
+    ['INFO','Application booted in {ms}ms, listening on :13000'],
+    ['INFO','[resourcer] {svc}:list 200 {ms}ms'],
+    ['INFO','[acl] role=admin allow {svc}:get'],
+    ['INFO','[plugin-manager] @business/plugin-mom-wms loaded (active 2.1.0)'],
+    ['INFO','[sync-plugins] pulled {n} plugins via local agent, cache hit'],
+    ['INFO','[db] query t_inbound_order findAndCount {ms}ms rows={n}'],
+    ['DEBUG','[pubsub] received message channel=interface-monitor skipSelf=true'],
+    ['DEBUG','[cron] egress-task tick: 0 pending'],
+    ['WARN','[lock-manager] redis lock contended key=egress:dispatch retry={n}'],
+    ['WARN','[http] slow request {svc}:export {ms}ms (>1000ms)'],
+    ['ERROR','[workflow] node execution failed: timeout after {ms}ms'],
+    ['INFO','[nacos] heartbeat ok instanceId={key}'],
+    ['INFO','[interface-monitor] ingress {svc}:create recorded, status=REVIEWED']
+  ];
+  function _fmtTs(){ var d=new Date(); function p(n){return (n<10?'0':'')+n;} return p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())+'.'+('00'+d.getMilliseconds()).slice(-3); }
+  function _genLogLine(key){
+    var n=NODES[key]||{svc:'app'};
+    var t=_LOG_TEMPLATES[Math.floor(Math.random()*_LOG_TEMPLATES.length)];
+    var txt=t[1].replace('{ms}',1+Math.floor(Math.random()*1200)).replace('{n}',1+Math.floor(Math.random()*9)).replace('{svc}',n.svc).replace('{key}',key);
+    return {no:++_logSeq,ts:_fmtTs(),lvl:t[0],text:txt};
+  }
+  function _pushLogLines(cnt){
+    for(var i=0;i<cnt;i++)_logLines.push(_genLogLine(_logKey));
+    if(_logLines.length>_LOG_MAX)_logLines=_logLines.slice(_logLines.length-_LOG_MAX); // tail 500:从顶部丢弃
+    renderLogLines();
+  }
+  function renderLogLines(){
+    var term=document.getElementById('logTerm'); if(!term)return;
+    var showNo=document.getElementById('logShowNo')?document.getElementById('logShowNo').checked:true;
+    term.innerHTML=_logLines.map(function(l){
+      return '<div class="ln"><span class="no" style="'+(showNo?'':'display:none')+'">'+l.no+'</span><span class="tx lv-'+l.lvl+'"><span class="tsp">'+l.ts+'</span> <span class="lvl">'+l.lvl+'</span> '+escapeHtml(l.text)+'</span></div>';
+    }).join('');
+    var cnt=document.getElementById('logCount'); if(cnt)cnt.textContent=_logLines.length+' 行';
+    if(_logAuto)term.scrollTop=term.scrollHeight;
+  }
+  function _startLogTimer(){
+    if(_logTimer)return;
+    _logTimer=setInterval(function(){ _pushLogLines(1+Math.floor(Math.random()*3)); }, 500+Math.floor(Math.random()*400));
+  }
+  function _stopLogTimer(){ if(_logTimer){clearInterval(_logTimer);_logTimer=null;} }
+  function openLog(key){
+    var g=_logCanView(key); if(!g.ok){toast(g.reason);return;}
+    _logKey=key; _logLines=[]; _logSeq=0; _logAuto=true;
+    var as=document.getElementById('logAutoScroll'); if(as)as.checked=true;
+    document.getElementById('logTitle').textContent='实例日志 · '+key;
+    // 初始 tail:先灌一批"历史"行(像 docker logs --tail 进来先回放最近若干行)
+    _pushLogLines(12);
+    document.getElementById('logModal').classList.add('on'); syncMask();
+    _logSetStatus(true); document.getElementById('logPauseBtn').textContent='⏸ 暂停';
+    _startLogTimer();
+  }
+  // 关闭即停:clearInterval 停掉定时器(对应 agent kill docker logs 进程,不留孤儿);幂等,go()/Esc/遮罩都可安全调
+  function closeLog(){
+    _stopLogTimer();
+    var m=document.getElementById('logModal'); if(m)m.classList.remove('on');
+    syncMask();
+  }
+  function toggleLogPause(){
+    var btn=document.getElementById('logPauseBtn');
+    if(_logTimer){ _stopLogTimer(); _logSetStatus(false); if(btn)btn.textContent='▶ 继续'; }
+    else { _startLogTimer(); _logSetStatus(true); if(btn)btn.textContent='⏸ 暂停'; }
+  }
+  function clearLog(){ _logLines=[]; renderLogLines(); }
+  function _logSetStatus(live){ var s=document.getElementById('logStatus'); if(s){s.className=live?'live':'paused';s.textContent=live?'● 实时':'⏸ 已暂停';} }
+  function onLogAutoScrollChange(){ _logAuto=document.getElementById('logAutoScroll').checked; if(_logAuto){var t=document.getElementById('logTerm');if(t)t.scrollTop=t.scrollHeight;} }
+  function onLogScroll(){
+    // 用户手动上滚 → 关掉自动滚动(贴底则恢复);纯体验,不影响定时器
+    var t=document.getElementById('logTerm'); if(!t)return;
+    var atBottom=(t.scrollHeight-t.scrollTop-t.clientHeight)<24;
+    if(!atBottom&&_logAuto){ _logAuto=false; var as=document.getElementById('logAutoScroll'); if(as)as.checked=false; }
+  }
+  var _cfFn=null;
+  function askConfirm(title,desc,fn){document.getElementById('cfTitle').textContent=title;document.getElementById('cfDesc').textContent=desc;_cfFn=fn;document.getElementById('confirmModal').classList.add('on');syncMask();}
+  function closeConfirm(){document.getElementById('confirmModal').classList.remove('on');syncMask();_cfFn=null;}
+  function confirmOk(){var f=_cfFn;closeConfirm();if(f)f();}
+  function closeInfoDrawer(){document.getElementById('infoDrawer').classList.remove('on');syncMask();}
+  function _openInfo(title,html){document.getElementById('infoTitle').textContent=title;document.getElementById('infoBody').innerHTML=html;document.getElementById('infoDrawer').classList.add('on');syncMask();}
+  var VERSIONS={
+    '@business/plugin-mom-wms':[['2.1.0.20260618','2026-06-18 09:14',true],['2.0.3.20260601','2026-06-01 10:20',false],['2.0.0.20260510','2026-05-10 14:02',false],['1.9.2.20260420','2026-04-20 09:30',false]],
+    '@orchisky/plugin-dictionary':[['1.3.2.20260520','2026-05-20 16:30',true],['1.3.0.20260415','2026-04-15 11:00',false],['1.2.0.20260310','2026-03-10 08:15',false]],
+    '@business/plugin-tamagawa-storage':[['2.0.0.20260225','2026-02-25 16:04',true],['1.9.0.20260120','2026-01-20 10:00',false],['1.8.1.20251210','2025-12-10 09:20',false]],
+    '@orchisky/plugin-menu-page':[['1.1.0.20260410','2026-04-10 11:02',true],['1.0.0.20260201','2026-02-01 14:30',false]]
+  };
+  function openVersionHistory(code){
+    var vs=VERSIONS[code]||[];
+    var body=vs.length?('<div class="desc" style="margin-bottom:10px">设为 active 即触发绑定该插件的服务滚动投放。</div><table><thead><tr><th>版本</th><th>发布时间</th><th>状态</th><th>操作</th></tr></thead><tbody>'+
+      vs.map(function(v){return '<tr><td class="mono">'+v[0]+'</td><td class="mono" style="color:var(--ink3)">'+v[1]+'</td><td>'+(v[2]?'<span class="tag t-ok">active</span>':'')+'</td><td>'+(v[2]?'<span style="color:var(--ink3)">当前</span>':'<a style="color:var(--pri);cursor:pointer" onclick="askConfirm(\'设为 active\',\'将切到 '+v[0]+' 并触发滚动投放。确认?\',function(){closeInfoDrawer();toast(\'已设为 active 并触发投放\')})">设为 active</a>')+'</td></tr>';}).join('')+'</tbody></table>'):'<div class="desc">暂无版本记录</div>';
+    _openInfo('版本历史 · '+code,body);
+  }
+  var AGENTS={
+    'tamagawa-test':{online:true,hb:'10s 前',hit:'87%',miss:13,pkgs:9,size:'38 MB',nodes:['wms-test-admin','wms-test-admin2']},
+    'rolltest-agent':{online:true,hb:'8s 前',hit:'92%',miss:6,pkgs:5,size:'21 MB',nodes:['rolltest-node1','rolltest-node2','rolltest-node3']},
+    'k8s-prod-a':{online:false,hb:'2 天前',hit:'—',miss:0,pkgs:12,size:'56 MB',nodes:['(实例由 NODES 派生,见 Agent 详情)']}
+  };
+  function openAgent(code){
+    var a=AGENTS[code];if(!a)return;
+    var body='<div class="stat" style="margin-bottom:14px">'+
+      '<div class="c"><div class="l">状态</div><div class="v" style="font-size:18px;color:'+(a.online?'var(--ok)':'var(--ink3)')+'">'+(a.online?'在线':'离线')+'</div></div>'+
+      '<div class="c"><div class="l">缓存命中率</div><div class="v" style="font-size:18px">'+a.hit+'</div></div>'+
+      '<div class="c"><div class="l">缓存包 / 占用</div><div class="v" style="font-size:18px">'+a.pkgs+' · '+a.size+'</div></div></div>'+
+      '<table style="margin-bottom:14px"><tr><td style="color:var(--ink3);width:120px">最后心跳</td><td>'+a.hb+'</td></tr><tr><td style="color:var(--ink3)">回源次数</td><td>'+a.miss+'</td></tr><tr><td style="color:var(--ink3)">pull-token</td><td><span class="tag t-ok">已配置</span></td></tr></table>';
+    // 该 agent 的实例:从 NODES(发现态)派生,比静态 nodes 列表更真实
+    var keys=Object.keys(NODES).filter(function(k){return NODES[k].ns===code;});
+    body+='<h3 style="font-size:14px;margin:4px 0 8px">该 agent 的实例 <span class="tag t-blue">'+keys.length+'</span></h3>';
+    body+=keys.length?('<table><tbody>'+keys.map(function(k){var n=NODES[k];return '<tr><td class="mono" style="cursor:pointer" onclick="closeInfoDrawer();openNode(\''+k+'\')"><a style="color:var(--pri)">'+k+'</a></td><td>'+(n.stale?'<span class="tag t-off">stale</span>':(n.running?'<span class="tag t-ok">在跑</span>':'<span class="tag t-warn">已停</span>'))+'</td></tr>';}).join('')+'</tbody></table>'):'<div class="desc">'+(a.online?'暂无发现实例':'agent 离线,等待恢复后重新发现')+'</div>';
+    _openInfo('Agent · '+code,body);
+  }
+  var SERVICES={
+    'wms-test-admin':{ns:'tamagawa-test',alias:'WMS 管理端',recon:'版本漂移',reconCls:'t-warn',
+      plugins:[['@business/plugin-mom-wms','2.1.0'],['@orchisky/plugin-dictionary','1.3.2'],['@business/plugin-tamagawa-storage','2.0.0'],['@orchisky/plugin-menu-page','1.1.0'],['@orchisky/plugin-login-setting','1.0.4']],
+      inst:[['wms-test-admin','2.1.0',true],['wms-test-admin2','2.0.3',false]]},
+    'rolltest':{ns:'rolltest-agent',alias:'滚动测试',recon:'正常',reconCls:'t-ok',
+      plugins:[['@orchisky/plugin-menu-page','1.1.0'],['@orchisky/plugin-dictionary','1.3.2']],
+      inst:[['rolltest-node1','1.1.0',true],['rolltest-node2','1.1.0',true]]},
+    'wms-prod':{ns:'k8s-prod-a',alias:'WMS 生产',recon:'纳管未起',reconCls:'t-err',
+      plugins:[['@business/plugin-mom-wms','2.1.0'],['@orchisky/plugin-dictionary','1.3.2']],inst:[]}
+  };
+  // 未纳管(inbox)服务:数据驱动,「忽略」即移除行 + 角标 -1(M15)
+  var INBOX=[
+    {ns:'tamagawa-test',svc:'wms-test-portal',running:'1 在跑',since:'2026-06-18 08:50'},
+    {ns:'rolltest-agent',svc:'rolltest-pda',running:'1 在跑',since:'2026-06-17 19:21'}
+  ];
+  function renderInbox(){
+    var tb=document.getElementById('svcInboxBody'); if(tb){
+      tb.innerHTML=INBOX.length?INBOX.map(function(x){return '<tr data-ns="'+x.ns+'"><td>'+x.ns+'</td><td><span class="tag t-blue">'+x.svc+'</span> <span class="tag t-warn">未纳管</span></td><td>'+x.running+'</td><td class="mono">'+x.since+'</td>'+
+        '<td class="acts"><a onclick="openAdopt(\''+x.ns+'\',\''+x.svc+'\')">一键纳管</a><a onclick="ignoreInbox(\''+x.svc+'\')">忽略</a></td></tr>';}).join(''):'<tr><td colspan="5" style="color:var(--ink3);padding:18px;text-align:center">无未纳管服务 —— 都已纳管</td></tr>';
+    }
+    var mc=document.getElementById('tabManagedCount'); if(mc)mc.textContent=_nsServices().length;
+    var ic=document.getElementById('tabInboxCount'); if(ic)ic.textContent=INBOX.filter(function(x){return CURRENT_NS==='all'||x.ns===CURRENT_NS;}).length;
+  }
+  // 服务页统计卡:按 ns + 实时数据算(M15 忽略后联动、G4 ns 联动)
+  function renderServicesPage(){
+    var svc=_nsServices();
+    var unadopted=INBOX.filter(function(x){return CURRENT_NS==='all'||x.ns===CURRENT_NS;}).length;
+    var notStarted=svc.filter(function(s){return (SERVICES[s].inst||[]).length===0;}).length;
+    var drift=svc.filter(function(s){return _driftedInsts(s).length>0||((SERVICES[s].inst||[]).some(function(i){return NODES[i[0]]&&_nodeImgDrift(i[0]);}));}).length;
+    var st=document.getElementById('svcStat'); if(st){
+      st.innerHTML=
+        '<div class="c"><div class="l">在跑未纳管</div><div class="v" style="color:var(--warn)">'+unadopted+'</div></div>'+
+        '<div class="c"><div class="l">纳管未起</div><div class="v" style="color:var(--err)">'+notStarted+'</div></div>'+
+        '<div class="c"><div class="l">漂移(版本/镜像)</div><div class="v" style="color:var(--warn)">'+drift+'</div></div>'+
+        '<div class="c"><div class="l">已纳管</div><div class="v">'+svc.length+'</div></div>';
+    }
+    renderInbox();
+  }
+  function ignoreInbox(svc){
+    askConfirm('忽略未纳管服务','将忽略 '+svc+'(从待纳管列表移除;下次发现仍会重新出现)。确认?',function(){
+      INBOX=INBOX.filter(function(x){return x.svc!==svc;});
+      renderServicesPage();   // 重渲染服务页统计卡 + 未纳管列表(角标 -1)
+      filterPage(document.getElementById('globalSearch')?document.getElementById('globalSearch').value:'');
+      toast('已忽略 '+svc);
+    });
+  }
+  function openService(svc){
+    var s=SERVICES[svc];if(!s)return;
+    var ac=_imgAppliedCount(svc);
+    var imgTag=ac.total?'<span class="tag '+(ac.applied===ac.total?'t-ok':'t-warn')+'">'+ac.applied+'/'+ac.total+' 实例已应用</span>':'<span class="tag t-off">无在跑实例</span>';
+    var basic='<table style="margin-bottom:14px"><tr><td style="color:var(--ink3);width:120px">命名空间</td><td>'+s.ns+'</td></tr><tr><td style="color:var(--ink3)">服务名</td><td class="mono">'+svc+'</td></tr><tr><td style="color:var(--ink3)">别名</td><td>'+s.alias+'</td></tr>'+
+      '<tr><td style="color:var(--ink3)">对账(版本)</td><td><span class="tag '+s.reconCls+'">'+s.recon+'</span></td></tr>'+
+      '<tr><td style="color:var(--ink3)">对账(镜像)</td><td title="'+escapeHtml(s.image||'')+'">'+imgTag+'</td></tr></table>';
+    var pl='<h3 style="font-size:14px;margin:4px 0 8px">绑定插件（active）</h3><table><tbody>'+s.plugins.map(function(p){return '<tr><td class="mono">'+p[0]+'</td><td><span class="tag t-blue">'+p[1]+'</span></td><td><a style="color:var(--pri);cursor:pointer" onclick="openVersionHistory(\''+p[0]+'\')">历史</a></td></tr>';}).join('')+'</tbody></table>';
+    var inst=s.inst.length?('<h3 style="font-size:14px;margin:16px 0 8px">实例（实际版本 / 镜像）</h3><table><tbody>'+s.inst.map(function(i){var id=NODES[i[0]]&&_nodeImgDrift(i[0]);return '<tr><td class="mono" style="cursor:pointer" onclick="closeInfoDrawer();openNode(\''+i[0]+'\')"><a style="color:var(--pri)">'+i[0]+'</a></td><td>'+(i[2]?'<span class="tag t-ok">'+i[1]+'</span>':'<span class="tag t-warn">'+i[1]+' 漂移</span>')+(id?' <span class="tag t-warn">镜像漂移</span>':'')+'</td></tr>';}).join('')+'</tbody></table>'):'<div class="desc" style="margin-top:14px">暂无在跑实例（纳管未起）。</div>';
+    var ops='<div style="display:flex;gap:8px;margin-top:16px;flex-wrap:wrap"><button class="btn pri" onclick="closeInfoDrawer();openDeploy(\''+svc+'\')">发布</button><button class="btn" onclick="closeInfoDrawer();openServiceConfig(\''+svc+'\')">配置</button><button class="btn" onclick="closeInfoDrawer();openServiceImage(\''+svc+'\')">镜像</button></div>';
+    _openInfo('服务 · '+svc,basic+pl+inst+ops);
+  }
+  var PLUGIN_LATEST={
+    '@business/plugin-mom-wms':'2.1.0','@orchisky/plugin-dictionary':'1.3.2','@business/plugin-tamagawa-storage':'2.0.0',
+    '@orchisky/plugin-menu-page':'1.1.0','@orchisky/plugin-login-setting':'1.0.4','@orchisky/plugin-block-table':'1.2.1',
+    '@business/plugin-qms-inspect':'1.0.0','@orchisky/plugin-notice-manage':'1.4.0','@orchisky/plugin-high-performance-table':'2.3.0','@orchisky/plugin-pda-acl':'1.0.6'
+  };
+  var ALL_PLUGINS=Object.keys(PLUGIN_LATEST);
+  var _bindSvc=null;
+  function openBind(svc){
+    _bindSvc=svc;
+    document.getElementById('bindSvc').textContent=svc;
+    var bound=(SERVICES[svc]?SERVICES[svc].plugins:[]).map(function(p){return p[0];});
+    var avail=ALL_PLUGINS.filter(function(p){return bound.indexOf(p)<0;});
+    var sel=document.getElementById('bindSelect'),ok=document.getElementById('bindOkBtn');
+    if(avail.length){sel.innerHTML=avail.map(function(p){return '<option value="'+p+'">'+p+'  ('+PLUGIN_LATEST[p]+')</option>';}).join('');sel.disabled=false;ok.disabled=false;document.getElementById('bindHint').textContent='已绑定 '+bound.length+' 个,可绑 '+avail.length+' 个(已绑的不在列表)。';}
+    else{sel.innerHTML='<option>该服务已绑定全部可用插件</option>';sel.disabled=true;ok.disabled=true;document.getElementById('bindHint').textContent='该服务已绑定全部可用插件,无可绑项。';}
+    document.getElementById('bindModal').classList.add('on');syncMask();
+  }
+  function closeBind(){document.getElementById('bindModal').classList.remove('on');syncMask();}
+  function doBind(){
+    var svc=_bindSvc;if(!svc||!SERVICES[svc])return;
+    var p=document.getElementById('bindSelect').value||'';
+    if(!p||p.indexOf('@')<0)return;
+    if(SERVICES[svc].plugins.some(function(x){return x[0]===p;})){toast('该插件已绑定,不可重复');return;}
+    var ver=PLUGIN_LATEST[p]||'1.0.0';
+    SERVICES[svc].plugins.push([p,ver]);
+    closeBind();
+    openServiceConfig(svc);
+    toast('已暂存绑定 '+p+'（去「发布」生效）');
+  }
+  var _spSvc='wms-test-admin';
+  function openServiceConfig(svc){ _spSvc=svc; go('serviceplugins'); renderServicePlugins(svc); }
+  function renderServicePlugins(svc){
+    var cur=svc||_spSvc||'wms-test-admin'; _spSvc=cur;
+    var lab=document.getElementById('spSvcLabel'); if(lab)lab.textContent=cur;
+    var s=SERVICES[cur],tb=document.getElementById('spBody');if(!tb)return;
+    tb.innerHTML=(s&&s.plugins.length)?s.plugins.map(function(p){return '<tr><td class="mono">'+p[0]+'</td><td><span class="tag t-blue">'+p[1]+'</span></td><td class="acts"><a onclick="openVersionHistory(\''+p[0]+'\')">版本历史</a><a onclick="openChangeVersion(\''+cur+'\',\''+p[0]+'\')">改版本</a><a class="danger" onclick="unbindPlugin(\''+cur+'\',\''+p[0]+'\')">解绑</a></td></tr>';}).join(''):'<tr><td colspan="3" style="color:var(--ink3);padding:16px">该服务暂未绑定插件 —— 点右上「+ 绑定插件」。</td></tr>';
+  }
+  function unbindPlugin(svc,code){
+    askConfirm('解绑插件','将从 '+svc+' 解绑 '+code+'(下次重启不再分发)。确认?',function(){
+      if(SERVICES[svc])SERVICES[svc].plugins=SERVICES[svc].plugins.filter(function(p){return p[0]!==code;});
+      renderServicePlugins(svc);toast('已暂存解绑 '+code+'（去「发布」生效）');
+    });
+  }
+  function openChangeVersion(svc,code){
+    var vs=VERSIONS[code]||[];
+    var cp=(SERVICES[svc]||{plugins:[]}).plugins.filter(function(x){return x[0]===code;})[0];
+    var curv=cp?cp[1]:'';
+    var body='<div class="desc" style="margin-bottom:10px">为服务 <b>'+svc+'</b> 选择 <code>'+code+'</code> 的版本(选用即设为 active 并触发多实例滚动投放)。</div>'+
+      (vs.length?('<table><thead><tr><th>版本</th><th>发布时间</th><th>状态</th><th>操作</th></tr></thead><tbody>'+
+      vs.map(function(v){var isCur=v[0].indexOf(curv)===0&&curv; return '<tr><td class="mono">'+v[0]+'</td><td class="mono" style="color:var(--ink3)">'+v[1]+'</td><td>'+(isCur?'<span class="tag t-ok">当前</span>':'')+'</td><td>'+(isCur?'<span style="color:var(--ink3)">使用中</span>':'<a style="color:var(--pri);cursor:pointer" onclick="pickVersion(\''+svc+'\',\''+code+'\',\''+v[0]+'\')">选用并发布</a>')+'</td></tr>';}).join('')+'</tbody></table>'):'<div class="desc">暂无版本记录</div>');
+    _openInfo('改版本 · '+code,body);
+  }
+  function pickVersion(svc,code,ver){
+    askConfirm('切换版本','将服务 '+svc+' 的 '+code+' 切到 '+ver+',并触发多实例滚动投放。确认?',function(){
+      var p=(SERVICES[svc]||{plugins:[]}).plugins.filter(function(x){return x[0]===code;})[0];
+      if(p)p[1]=ver.split('.').slice(0,3).join('.');
+      closeInfoDrawer();renderServicePlugins(svc);toast('已暂存版本 '+ver+'（去「发布」生效）');
+    });
+  }
+  var SERVICE_IMAGES={
+    'wms-test-admin':[['oci.bignof.com/nocobase-pro:release.1.7.x_v2-1.7.20-rc.20260527091211','2026-05-27 09:12',true],['oci.bignof.com/nocobase-pro:release.1.7.x_v2-1.7.20-rc.20260512143000','2026-05-12 14:30',false],['oci.bignof.com/nocobase-pro:release.1.7.x-1.7.19-rc.20260420103000','2026-04-20 10:30',false]],
+    'rolltest':[['oci.bignof.com/nocobase-pro:release.1.7.x_v2-1.7.20-rc.20260621104239','2026-06-21 10:42',true],['oci.bignof.com/nocobase-pro:release.1.7.x_v2-1.7.20-rc.20260615142000','2026-06-15 14:20',false]],
+    'wms-prod':[['oci.bignof.com/nocobase-pro:release.1.7.x-1.7.19-rc.20260301080000','2026-03-01 08:00',true]]
+  };
+  var _siSvc='wms-test-admin';
+  function openServiceImage(svc){ _siSvc=svc; go('serviceimage'); renderServiceImage(svc); }
+  function renderServiceImage(svc){
+    var cur=svc||_siSvc; _siSvc=cur;
+    var lab=document.getElementById('siSvcLabel'); if(lab)lab.textContent=cur;
+    var imgs=SERVICE_IMAGES[cur]||[];
+    var s=SERVICES[cur]||{}; var c=document.getElementById('siCurrent');
+    if(c){ var ac=_imgAppliedCount(cur);
+      var appliedTag=ac.total?(' <span class="tag '+(ac.applied===ac.total?'t-ok':'t-warn')+'" title="实例实际运行 tag 与服务意图镜像一致的数量">'+ac.applied+'/'+ac.total+' 实例已应用</span>'):'';
+      c.innerHTML=escapeHtml((s.image)||'(未知)')+((s.image&&s.image!==s.deployedImage)?' <span class="tag t-warn">待发布</span>':' <span class="tag t-ok">已部署</span>')+appliedTag; }
+    var tb=document.getElementById('siBody'); if(!tb)return;
+    // L9:镜像地址含引号/尖括号也安全 —— 文本侧 escapeHtml,操作侧用 data-idx + 事件委托,不把自由文本拼进 onclick
+    tb.innerHTML=imgs.length?imgs.map(function(i,idx){return '<tr><td class="mono">'+escapeHtml(i[0])+'</td><td class="mono" style="color:var(--ink3)">'+escapeHtml(i[1])+'</td><td>'+(i[2]?'<span class="tag t-ok">当前</span>':'')+'</td><td>'+(i[2]?'<span style="color:var(--ink3)">使用中</span>':'<a class="rollback-img" data-idx="'+idx+'" style="color:var(--err);cursor:pointer">回滚到此</a>')+'</td></tr>';}).join(''):'<tr><td colspan="4" style="color:var(--ink3);padding:16px">暂无历史镜像</td></tr>';
+  }
+  // 事件委托:历史镜像「回滚到此」(L9)
+  (function(){var tb=document.getElementById('siBody');if(tb)tb.addEventListener('click',function(e){var a=e.target.closest('a.rollback-img');if(a)rollbackImage(_siSvc,+a.getAttribute('data-idx'));});})();
+  function setCurrentImage(svc,img){ var a=SERVICE_IMAGES[svc]||(SERVICE_IMAGES[svc]=[]); a.forEach(function(i){i[2]=false;}); var ex=a.filter(function(i){return i[0]===img;})[0]; if(ex){ex[2]=true;}else{a.unshift([img,'刚刚',true]);} if(SERVICES[svc])SERVICES[svc].image=img; }
+  function publishImage(){
+    var svc=_siSvc,img=(document.getElementById('siNewImage').value||'').trim();
+    if(!img){toast('请填写镜像地址');return;}
+    setCurrentImage(svc,img); document.getElementById('siNewImage').value=''; renderServiceImage(svc); toast('已暂存镜像（去「发布」生效）');
+  }
+  function rollbackImage(svc,idx){
+    var a=SERVICE_IMAGES[svc]||[]; var img=(typeof idx==='number')?(a[idx]&&a[idx][0]):idx; if(!img)return;
+    setCurrentImage(svc,img); renderServiceImage(svc); toast('已暂存回滚到该镜像（去「发布」生效）');
+  }
+  var FETCH_RECORDS=[
+    {ns:'tamagawa-test',svc:'wms-test-admin',inst:'wms-test-admin',last:'2026-06-18 09:15:22',plugins:[['@business/plugin-mom-wms','2.1.0','命中'],['@orchisky/plugin-dictionary','1.3.2','回源'],['@business/plugin-tamagawa-storage','2.0.0','命中'],['@orchisky/plugin-menu-page','1.1.0','命中'],['@orchisky/plugin-login-setting','1.0.4','命中']]},
+    {ns:'tamagawa-test',svc:'wms-test-admin',inst:'wms-test-admin2',last:'2026-06-18 09:10:03',plugins:[['@business/plugin-mom-wms','2.0.3','命中'],['@orchisky/plugin-dictionary','1.3.2','命中']]},
+    {ns:'rolltest-agent',svc:'rolltest',inst:'rolltest-node1',last:'2026-06-12 14:22:51',plugins:[['@orchisky/plugin-menu-page','1.1.0','回源'],['@orchisky/plugin-dictionary','1.3.2','回源']]},
+    {ns:'rolltest-agent',svc:'rolltest',inst:'rolltest-node2',last:'2026-06-12 14:23:05',plugins:[['@orchisky/plugin-menu-page','1.1.0','命中'],['@orchisky/plugin-dictionary','1.3.2','命中']]}
+  ];
+  function renderFetch(){
+    var tb=document.getElementById('fetchBody'); if(!tb)return;
+    tb.innerHTML=FETCH_RECORDS.map(function(f,i){return '<tr data-ns="'+f.ns+'"><td>'+f.ns+'</td><td><span class="tag t-blue">'+f.svc+'</span></td><td class="mono">'+f.inst+'</td><td class="mono" style="color:var(--ink3)">'+f.last+'</td><td>'+f.plugins.length+'</td><td class="acts"><a onclick="openFetchDetail('+i+')">详情</a></td></tr>';}).join('');
+  }
+  function openFetchDetail(i){
+    var f=FETCH_RECORDS[i]; if(!f)return;
+    var body='<table style="margin-bottom:6px"><tr><td style="color:var(--ink3);width:90px">命名空间</td><td>'+f.ns+'</td></tr><tr><td style="color:var(--ink3)">服务</td><td class="mono">'+f.svc+'</td></tr><tr><td style="color:var(--ink3)">实例</td><td class="mono">'+f.inst+'</td></tr><tr><td style="color:var(--ink3)">最近拉取</td><td class="mono">'+f.last+'</td></tr></table>'+
+      '<h3 style="font-size:14px;margin:10px 0 8px">拉取的插件</h3><table><thead><tr><th>插件</th><th>版本</th><th>来源</th></tr></thead><tbody>'+
+      f.plugins.map(function(p){return '<tr><td class="mono">'+p[0]+'</td><td><span class="tag t-blue">'+p[1]+'</span></td><td>'+(p[2]==='命中'?'<span class="tag t-ok">缓存命中</span>':'<span class="tag t-blue">回源平台</span>')+'</td></tr>';}).join('')+'</tbody></table>';
+    _openInfo('拉包详情 · '+f.inst,body);
+  }
+  function servicesOfNs(ns){return Object.keys(SERVICES).filter(function(s){return SERVICES[s].ns===ns;});}
+  // 插件上传(M15):选择文件→暂存→上传后插入「最近上传」一行
+  var UPLOADS=[
+    ['@orchisky/plugin-block-table','1.2.1.20260615','2026-06-15 14:20'],
+    ['@business/plugin-mom-wms','2.1.0.20260618','2026-06-18 09:14'],
+    ['@orchisky/plugin-notice-manage','1.4.0.20260608','2026-06-08 16:45']
+  ];
+  var _UP_POOL=[['@orchisky/plugin-dictionary','1.3.3'],['@business/plugin-qms-inspect','1.0.1'],['@orchisky/plugin-high-performance-table','2.3.1'],['@orchisky/plugin-pda-acl','1.0.7'],['@orchisky/plugin-login-setting','1.0.5']];
+  var _pendingUpload=null;
+  function renderUploads(){
+    var tb=document.getElementById('uploadBody'); if(!tb)return;
+    tb.innerHTML=UPLOADS.map(function(u){return '<tr><td class="mono">'+u[0]+'</td><td><span class="tag t-blue">'+u[1]+'</span></td><td class="mono">'+u[2]+'</td><td class="acts"><a onclick="openUpub(\''+u[0]+'\')">发布</a></td></tr>';}).join('');
+  }
+  function pickUploadFile(){
+    // 原型:模拟从文件选择器选到一个 .tgz,解析出包名@版本
+    var pk=_UP_POOL[Math.floor(Math.random()*_UP_POOL.length)];
+    var ver=pk[1]+'.'+_nowStamp().slice(0,8);
+    _pendingUpload=[pk[0],ver];
+    var t=document.getElementById('upDropText'); if(t)t.innerHTML='已选择:<b>'+escapeHtml(pk[0].split('/').pop())+'-'+ver+'.tgz</b>(点「上传」入仓)';
+  }
+  function doUpload(){
+    if(!_pendingUpload){toast('请先选择 .tgz 文件');return;}
+    var btn=document.getElementById('upBtn'); if(btn){btn.disabled=true;btn.textContent='上传中…';}
+    setTimeout(function(){
+      UPLOADS.unshift([_pendingUpload[0],_pendingUpload[1],_nowStr()]);
+      renderUploads();
+      if(btn){btn.disabled=false;btn.textContent='上传';}
+      var t=document.getElementById('upDropText'); if(t)t.textContent='点击或拖拽 .tgz 到此上传';
+      toast('上传完成 → 已入插件仓('+_pendingUpload[0]+'@'+_pendingUpload[1]+')');
+      _pendingUpload=null;
+    },700);
+  }
+  function _nowStamp(){ var d=new Date(); function p(n){return (n<10?'0':'')+n;} return ''+d.getFullYear()+p(d.getMonth()+1)+p(d.getDate())+p(d.getHours())+p(d.getMinutes()); }
+  function _nowStr(){ var d=new Date(); function p(n){return (n<10?'0':'')+n;} return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes()); }
+  var _upubPlugin=null;
+  function openUpub(plugin){
+    _upubPlugin=plugin;document.getElementById('upubPlugin').textContent=plugin;
+    document.getElementById('upubNs').innerHTML=Object.keys(AGENTS).map(function(n){return '<option value="'+n+'">'+n+'</option>';}).join('');
+    upubFillSvc();
+    document.getElementById('upubModal').classList.add('on');syncMask();
+  }
+  function upubFillSvc(){
+    var ns=document.getElementById('upubNs').value,svs=servicesOfNs(ns);
+    document.getElementById('upubSvc').innerHTML=svs.length?svs.map(function(s){return '<option value="'+s+'">'+s+'</option>';}).join(''):'<option value="">(该命名空间暂无服务,先去纳管)</option>';
+  }
+  function closeUpub(){document.getElementById('upubModal').classList.remove('on');syncMask();}
+  function doUpub(){
+    var svc=document.getElementById('upubSvc').value,p=_upubPlugin;
+    if(!svc){toast('该命名空间暂无服务,先去纳管');return;}
+    var ver=PLUGIN_LATEST[p]||'1.0.0';
+    if(SERVICES[svc]&&!SERVICES[svc].plugins.some(function(x){return x[0]===p;}))SERVICES[svc].plugins.push([p,ver]);
+    closeUpub();toast('已发布 '+p+'@'+ver+' → '+svc+'(已绑定并触发投放)');
+  }
+  function closePublish(){document.getElementById('publishModal').classList.remove('on');syncMask()}
+  var tt;
+  function toast(msg){var t=document.getElementById('toast');t.textContent='✓ '+msg;t.classList.add('on');clearTimeout(tt);tt=setTimeout(function(){t.classList.remove('on')},2600)}
+  // 纯演示按钮:进行中→完成两态(刷新/重新发现等,M15)
+  function busyBtn(btn,label,busyLabel,doneMsg,after){
+    if(!btn||btn.disabled)return; btn.disabled=true; var old=btn.textContent; btn.textContent=busyLabel;
+    setTimeout(function(){ btn.disabled=false; btn.textContent=label||old; if(after)after(); toast(doneMsg); },600);
+  }
+  function _genTok(pre){ return pre+'_'+Math.random().toString(36).slice(2,10)+Math.random().toString(36).slice(2,10); }
+  function rotateToken(scope){
+    var tok=_genTok(scope==='agentKey'?'ak':'pt');
+    var t=document.getElementById('toast');
+    t.innerHTML='🔑 新 '+(scope==='agentKey'?'agentKey':'pull-token')+'（show-once，注入 agent 配置）：<br><span class="codepill">'+tok+'</span>';
+    t.classList.add('on');clearTimeout(tt);tt=setTimeout(function(){t.classList.remove('on')},5000);
+  }
+  // 新建命名空间(M15/L13):弹表单 → 创建后 show-once 返回 agentKey + pull-token
+  function openNewNs(){
+    document.getElementById('newNsStep1').style.display='';
+    document.getElementById('newNsStep2').style.display='none';
+    document.getElementById('newNsCode').value='';document.getElementById('newNsName').value='';
+    document.getElementById('newNsModal').classList.add('on');syncMask();
+  }
+  function closeNewNs(){document.getElementById('newNsModal').classList.remove('on');syncMask();}
+  function createNs(){
+    var code=(document.getElementById('newNsCode').value||'').trim();
+    if(!code){toast('请填写命名空间 code');return;}
+    if(AGENTS[code]){toast('该命名空间已存在');return;}
+    var name=(document.getElementById('newNsName').value||'').trim()||code;
+    // 假数据:新增一个离线 agent(等 agent 上线后自动发现实例)
+    AGENTS[code]={online:false,hb:'未上线',hit:'—',miss:0,pkgs:0,size:'0 MB',nodes:['(等待 agent 首次上报)'],name:name};
+    initNsSwitch();
+    // 命名空间表格也插一行(静态表,直接 append)
+    var tb=document.querySelector('#namespaces tbody');
+    if(tb){var tr=document.createElement('tr');tr.setAttribute('data-ns',code);
+      tr.innerHTML='<td class="mono" style="cursor:pointer" onclick="openAgent(\''+code+'\')"><a style="color:var(--pri)">'+escapeHtml(code)+'</a></td><td>'+escapeHtml(name)+'</td><td><span class="tag t-off">离线</span></td><td>0</td><td><span class="tag t-ok">已配置</span></td><td class="acts"><a onclick="rotateToken(\'pull-token\')">轮换 pull-token</a><a onclick="rotateToken(\'agentKey\')">轮换 agentKey</a></td>';
+      tb.appendChild(tr);}
+    document.getElementById('newNsCodeShow').textContent=code;
+    document.getElementById('newNsAgentKey').textContent=_genTok('ak');
+    document.getElementById('newNsPullToken').textContent=_genTok('pt');
+    document.getElementById('newNsStep1').style.display='none';
+    document.getElementById('newNsStep2').style.display='';
+  }
+  // 初始化(放最末:依赖上方 SERVICES 等已定义/赋值)
+  initServiceState();
+  initNsSwitch();
+  renderServicePlugins('wms-test-admin');
+  renderNodes();
+  renderFetch();
+  renderServicesPage();
+  renderUploads();
+</script>
+</body>
+</html>

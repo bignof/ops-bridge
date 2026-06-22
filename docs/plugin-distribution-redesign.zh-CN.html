@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>插件分发改造方案 · worker 无凭据 · agent 本机缓存 · 拓扑自动发现</title>
+<style>
+  :root{
+    --dist:#16a34a; --dist-bg:#ecfdf5;
+    --disc:#2563eb; --disc-bg:#eff6ff;
+    --ctrl:#ea580c; --ctrl-bg:#fff7ed;
+    --ink:#0f172a; --muted:#64748b; --line:#e2e8f0; --bg:#f8fafc;
+    --card:#fff; --accent:#4f46e5; --code-bg:#0f172a; --code-ink:#e2e8f0;
+    --ok:#16a34a; --no:#dc2626; --warn:#d97706;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",Roboto,Helvetica,Arial,sans-serif;
+    line-height:1.7;font-size:15px}
+  .wrap{max-width:1060px;margin:0 auto;padding:0 24px 80px}
+  header.hero{background:linear-gradient(135deg,#4f46e5,#7c3aed 60%,#2563eb);color:#fff;
+    padding:48px 24px 40px;margin-bottom:8px}
+  header.hero .inner{max-width:1060px;margin:0 auto;padding:0 8px}
+  header.hero h1{margin:0 0 10px;font-size:30px;letter-spacing:.5px}
+  header.hero p{margin:0;opacity:.92;font-size:15px;max-width:760px}
+  .pills{margin-top:18px;display:flex;gap:8px;flex-wrap:wrap}
+  .pills span{background:rgba(255,255,255,.16);border:1px solid rgba(255,255,255,.28);
+    padding:4px 12px;border-radius:999px;font-size:13px}
+  h2{font-size:21px;margin:40px 0 14px;padding-bottom:8px;border-bottom:2px solid var(--line);
+    display:flex;align-items:center;gap:10px}
+  h2 .n{background:var(--accent);color:#fff;width:28px;height:28px;border-radius:8px;
+    display:inline-flex;align-items:center;justify-content:center;font-size:14px;flex:0 0 auto}
+  h3{font-size:16px;margin:22px 0 8px;color:#1e293b}
+  p,li{color:#1f2937}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px 22px;
+    margin:14px 0;box-shadow:0 1px 2px rgba(15,23,42,.04)}
+  code{background:#f1f5f9;color:#be123c;padding:1px 6px;border-radius:5px;font-size:13px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  pre{background:var(--code-bg);color:var(--code-ink);padding:16px 18px;border-radius:12px;
+    overflow:auto;font-size:13px;line-height:1.55;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  pre code{background:none;color:inherit;padding:0}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14px;background:#fff;
+    border-radius:10px;overflow:hidden;border:1px solid var(--line)}
+  th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{background:#f1f5f9;font-weight:600;color:#334155}
+  tr:last-child td{border-bottom:none}
+  tbody tr:nth-child(even){background:#fafbfc}
+  .badge{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap}
+  .b-ok{background:#dcfce7;color:#166534} .b-no{background:#fee2e2;color:#991b1b} .b-warn{background:#fef3c7;color:#92400e}
+  ul{padding-left:22px} li{margin:4px 0}
+  .lead{color:var(--muted);font-size:14px;margin:-4px 0 8px}
+
+  /* 架构图 */
+  .topo{display:flex;flex-direction:column;gap:0;align-items:stretch}
+  .plane{border:2px dashed var(--line);border-radius:16px;padding:16px 18px 18px;background:#fff;position:relative}
+  .plane-label{position:absolute;top:-12px;left:18px;background:#fff;padding:0 10px;font-size:12px;
+    color:var(--muted);font-weight:600;letter-spacing:.5px}
+  .boxrow{display:flex;gap:14px;flex-wrap:wrap}
+  .box{flex:1;min-width:160px;border:1.5px solid var(--line);border-radius:12px;padding:12px 14px;
+    background:#fff;text-align:center;font-weight:600}
+  .box small{display:block;font-weight:400;color:var(--muted);font-size:12px;margin-top:3px}
+  .box.platform{border-color:#c7d2fe;background:#eef2ff}
+  .box.hub{border-color:#bfdbfe;background:#eff6ff}
+  .box.agent{border-color:#bbf7d0;background:#f0fdf4;text-align:left}
+  .box.worker{border-color:#e2e8f0;background:#f8fafc;min-width:130px}
+  .caps{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+  .caps span{font-weight:500;font-size:12px;background:#fff;border:1px solid #bbf7d0;color:#166534;
+    padding:3px 9px;border-radius:7px}
+  .connector{display:flex;justify-content:center;align-items:center;gap:8px;color:var(--muted);
+    font-size:12px;padding:6px 0}
+  .connector .v{font-size:20px;line-height:1;color:#94a3b8}
+
+  /* 三条链 */
+  .chains{display:flex;flex-direction:column;gap:10px;margin-top:6px}
+  .chain{display:flex;align-items:center;gap:10px;flex-wrap:wrap;border-radius:10px;padding:10px 14px;
+    font-size:13.5px;border:1px solid var(--line)}
+  .chain .tag{font-weight:700;color:#fff;padding:2px 10px;border-radius:6px;font-size:12px;flex:0 0 auto}
+  .chain.dist{background:var(--dist-bg)} .chain.dist .tag{background:var(--dist)}
+  .chain.disc{background:var(--disc-bg)} .chain.disc .tag{background:var(--disc)}
+  .chain.ctrl{background:var(--ctrl-bg)} .chain.ctrl .tag{background:var(--ctrl)}
+  .chain b{color:#0f172a}
+
+  .note{border-left:4px solid var(--accent);background:#f5f3ff;padding:10px 16px;border-radius:0 10px 10px 0;margin:12px 0}
+  .note.warn{border-color:var(--warn);background:#fffbeb}
+  .note.good{border-color:var(--ok);background:#f0fdf4}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:760px){.grid2{grid-template-columns:1fr}}
+  .roadmap{display:flex;flex-direction:column;gap:0}
+  .step{display:flex;gap:14px;padding:14px 0;border-bottom:1px dashed var(--line)}
+  .step:last-child{border-bottom:none}
+  .step .ph{flex:0 0 52px;height:52px;border-radius:12px;background:var(--accent);color:#fff;
+    display:flex;align-items:center;justify-content:center;font-weight:700;font-size:15px}
+  .step .body{flex:1}
+  .step .body .t{font-weight:600;margin-bottom:2px}
+  .step .body .v{font-size:13px;color:var(--muted)}
+  footer{color:var(--muted);font-size:13px;text-align:center;margin-top:48px;padding-top:20px;border-top:1px solid var(--line)}
+  a.toc-top{position:fixed;right:20px;bottom:20px;background:var(--accent);color:#fff;text-decoration:none;
+    width:44px;height:44px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+    box-shadow:0 4px 14px rgba(79,70,229,.4);font-size:18px}
+</style>
+</head>
+<body>
+<header class="hero">
+  <div class="inner">
+    <h1>插件分发改造方案</h1>
+    <p>worker 零凭据 → 本机 agent →（持 token）平台；agent 兼做<b>每主机插件缓存</b>与<b>拓扑自动发现</b>，平台只维护「服务→插件→版本」。方案 A（agent 直连 platform）· 包走 HTTP 不走 WS。</p>
+    <div class="pills">
+      <span>service-agent / service-hub / service-platform</span>
+      <span>cnp · docker/nocobase/sync-plugins.js</span>
+      <span>完整方案（非最小改造）</span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <h2><span class="n">0</span>设计原则</h2>
+  <div class="card">
+    <ol>
+      <li><b>worker 零凭据</b>：worker 只跟本机 agent 说话，不持任何 token / URL 密钥。</li>
+      <li><b>agent 一台一个，持本 namespace 的 pull-token</b>（<code>namespace.code = agentId</code> 已是 1:1）。</li>
+      <li><b>分发链与控制链解耦</b>，只在「发版投放」处汇合：发布新版本 → 控制链滚动重启 → 各实例经分发链重拉。</li>
+      <li><b>最大化复用现有契约</b>：平台 <code>/api/distribution/*</code> 的 <code>[{pluginName, version, url}]</code> 正是为现有 <code>sync-plugins.js</code> 定的，字段不改名。</li>
+      <li><b>不发明新坑</b>：插件包（.tgz）只走 HTTP，不过 agent↔hub 的 JSON/WS 通道。</li>
+    </ol>
+  </div>
+
+  <h2><span class="n">1</span>目标架构</h2>
+
+  <div class="card">
+    <div class="topo">
+      <div class="plane">
+        <div class="plane-label">控制面（all-in-one console 或分离部署）</div>
+        <div class="boxrow">
+          <div class="box platform">platform<small>BFF · /api/distribution · 服务/插件/版本台账</small></div>
+          <div class="box hub">hub<small>agent broker · 命令下发 · 节点心跳</small></div>
+        </div>
+      </div>
+
+      <div class="connector"><span class="v">↑↓</span> 分发(HTTPS,pull-token) · 发现上报(WS) · 命令下发(WS) <span class="v">↑↓</span></div>
+
+      <div class="plane">
+        <div class="plane-label">每台服务器（一台一个 agent）</div>
+        <div class="box agent">agent
+          <div class="caps">
+            <span>① 插件缓存 + 回源平台</span>
+            <span>② worker-facing HTTP：/plugins /download（无 token）</span>
+            <span>③ nacos + docker 发现 → 周期上报</span>
+            <span>④ docker compose 执行（受控制链）</span>
+          </div>
+        </div>
+        <div class="connector"><span class="v">↑</span> 本机 HTTP，无 token</div>
+        <div class="boxrow">
+          <div class="box worker">worker A<small>wms-test-admin · sync-plugins</small></div>
+          <div class="box worker">worker B<small>wms-test-admin2（同服务多容器）</small></div>
+        </div>
+      </div>
+    </div>
+
+    <h3>三条链</h3>
+    <div class="chains">
+      <div class="chain dist"><span class="tag">分发</span> <b>worker</b> →（本机 HTTP，无 token）→ <b>agent</b> →（TLS，pull-token）→ <b>platform</b> <code>/api/distribution/*</code></div>
+      <div class="chain disc"><span class="tag">发现</span> <b>agent</b> →（nacos + docker labels）→ <b>hub</b> → <b>platform</b> 节点表（自动建 + 心跳老化）</div>
+      <div class="chain ctrl"><span class="tag">控制</span> <b>platform</b> → <b>hub</b> →（WS）→ <b>agent</b> → <b>docker</b>（发版滚动投放）</div>
+    </div>
+
+    <h3>组件职责</h3>
+    <table>
+      <thead><tr><th>组件</th><th>职责</th><th>持有的凭据</th></tr></thead>
+      <tbody>
+        <tr><td>worker</td><td>启动时向本机 agent 要插件清单 + 下载包 + 安装</td><td><span class="badge b-ok">无</span></td></tr>
+        <tr><td>agent（一台一个）</td><td>① 本机插件缓存 + 回源 ② worker-facing HTTP ③ 拓扑发现上报 ④ 执行 docker 命令</td><td>本 namespace 的 <b>pull-token</b>（分发）+ <b>agentKey</b>（连 hub）</td></tr>
+        <tr><td>platform</td><td>维护「服务→插件→版本」、提供 <code>/api/distribution/*</code>、节点台账 UI、发布</td><td>—</td></tr>
+        <tr><td>hub</td><td>agent broker：命令下发 + 接收发现上报 + 节点心跳台账</td><td>platform 给的 admin token</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2><span class="n">2</span>分发链详设（worker ↔ agent ↔ platform）</h2>
+
+  <div class="card">
+    <h3>2.1 worker → agent 契约（新 · 本机 · 无 token）</h3>
+    <p class="lead">扩展现有 <code>core/health_server.py</code> 的 <code>ThreadingHTTPServer</code>，或新起 <code>PLUGIN_SERVE_PORT</code>。</p>
+    <pre><code>GET http://&lt;agent-host&gt;:&lt;port&gt;/plugins?service=&lt;serviceCode&gt;
+  → 200 [{ "pluginName":"...", "version":"...", "url":"http://&lt;agent-host&gt;:&lt;port&gt;/download/&lt;attachmentId&gt;" }]
+  （worker 无 namespace 概念——即便传了 agent 也忽略其值、恒用本 ns,故无法越 ns;url 指向 agent 自己,worker 无需 token）
+
+GET http://&lt;agent-host&gt;:&lt;port&gt;/download/&lt;attachmentId&gt;
+  → 200 流式 .tgz（命中本机缓存直接给；未命中由 agent 回源平台后再给）</code></pre>
+    <div class="note good"><b>关键兼容：</b><code>pluginName/version/url</code> 三字段与平台端点字面一致 → <code>sync-plugins.js</code> 的解析与安装逻辑零改动。</div>
+
+    <h3>2.2 agent → platform 回源（持 pull-token）</h3>
+    <pre><code>拉清单: GET {PLATFORM_URL}/api/distribution/plugins?namespace=&lt;本ns&gt;&service=&lt;svc&gt;
+        Authorization: Bearer &lt;agent pull-token&gt;
+改写:   把每条 url 改成指向「自己」/download/&lt;attachmentId&gt; 再回给 worker
+下包:   /download/&lt;id&gt; 未命中缓存 → GET {PLATFORM_URL}/api/distribution/download/&lt;id&gt;
+        Authorization: Bearer &lt;pull-token&gt; → 落缓存 → 回 worker</code></pre>
+    <p>平台侧 <b>完全复用现有端点</b>（<code>distribution.py</code>）：<code>query_plugins</code>（token 属 namespace 校验 + 写 fetch_record）、<code>download</code>（IDOR 归属链 + 流式 .tgz）。</p>
+
+    <div class="grid2">
+      <div>
+        <h3>2.3 缓存（agent 的红利）</h3>
+        <ul>
+          <li><b>内容寻址</b>：键 = <code>attachmentId</code>，命中即用。</li>
+          <li><b>一台只回源一次</b>：同主机多容器同服务（admin/2admin）共享缓存。</li>
+          <li>容量上限 + LRU；<code>PLUGIN_CACHE_DIR</code> 落盘，挂卷可跨重建保留。</li>
+          <li>可选 sha256 校验（distribution 响应加字段，向后兼容）。</li>
+          <li>并发同包 per-key 锁（借 <code>handlers._get_project_lock</code> 同款）。</li>
+        </ul>
+      </div>
+      <div>
+        <h3>2.4 鉴权边界</h3>
+        <ul>
+          <li>worker→agent 无 token：边界 = agent 的 namespace（1:1，天然成立）。</li>
+          <li>同主机信任域；P2 可加「源 IP→容器→受管 compose 工程」校验。</li>
+          <li>agent→platform：pull-token namespace 隔离 + download IDOR（已实现）。</li>
+        </ul>
+        <h3>2.5 审计</h3>
+        <ul>
+          <li>agent 回源透传调用方维度 → 平台 <code>fetch_record</code> 记「哪个容器/服务拉了哪版本」。</li>
+          <li>agent 本地也记一份（平台不可达时仍有审计）。</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <h2><span class="n">3</span>发现链：agent 自动上报拓扑（干掉手配）</h2>
+  <div class="card">
+    <p class="lead">已有积木：<code>nacos_client</code> + <code>instance_match</code> + <code>docker_cli</code>。</p>
+    <pre><code>每 N 秒:
+  nacos 查本 namespace/group 实例 → instance_match 过滤"本机" → 得 containerId
+    → docker inspect 取 container_name / com.docker.compose.project
+       / com.docker.compose.project.working_dir(=dir) / image
+  ∪ docker 直接列本机受管 compose 工程（覆盖"已停、nacos 看不见"的节点）
+  → [{nacosService, composeProject, containerName, dir, image, host, running, healthy}]
+  → 经 WS 上报 hub</code></pre>
+    <div class="note warn"><b>nacos 只见在跑的</b> → 用 <b>docker（含 stopped 工程）为主</b>、nacos 补 serviceName/health，这样"已停服务"也能被管理（可被 start）。<br>⚠️ <b>诚实标注</b>：这是发现链<b>基石</b>，但现 <code>docker_cli</code> 只有 <code>docker ps -q</code>（仅 running），该采集器<b>零实现</b>——"已停也可管"是 <b>P3 待建</b>，非已有积木，排期勿按"已有"估。</div>
+    <ul>
+      <li>hub 落「发现节点台账」+ <b>心跳 TTL 老化</b>（复刻 cnp <code>o_handler_registry</code> 的 heartbeatAt + 定时清理）。</li>
+      <li><b>节点（物理）与服务（逻辑）分表</b>：<code>Service</code>=插件分发单位（人工只配它装哪些插件/版本），key=(namespace, <code>service_code</code>)；<code>service_code</code>（分发）与 <code>nacos_service_name</code>（发现/滚动 link）是<b>两个独立列</b>，默认同值但可分别编辑、非恒等。<code>DiscoveredNode</code>=(agentId, composeProject, dir, image, host, heartbeatAt) <b>全自动 upsert</b>，<b>dir/镜像/容器以此为权威</b>，供控制链寻址。</li>
+      <li><b>admin/2admin 自动落位</b>：两个 compose 工程 → 两行节点（dir 各异）；插件按 nacosService（同）→ 同插件集。两套粒度各就各位，不再像手配 node1/2/3 那样别扭。</li>
+    </ul>
+    <div class="note warn">🔺 <b>本文推翻 node-control v3 §3 的「Service 表权威源」模型</b>（2026-06-21）：v3 把 <code>Service.dir</code>/<code>default_image</code> 作为 compose 寻址权威、手填台账；本文改为 <b>dir/镜像由 DiscoveredNode（agent 自动发现）权威驱动控制链</b>——"干掉手配"。安全闸<b>不新增部署强约束</b>（取舍：agent 内网、部署省事优先）：沿用 agent 现有 <code>validate_managed_dir</code>（realpath 须在 <code>MANAGED_PROJECTS_ROOT</code> 下）兜底即可；<code>Service.dir</code>/<code>default_image</code> 退化为可选展示/迁移期回退，不再作寻址来源。</div>
+  </div>
+
+  <div class="card">
+    <h3>3.4 服务纳管模型（意图 vs 现实）—— 服务不纯自动建</h3>
+    <ul>
+      <li><b>物理节点（DiscoveredNode）= 纯自动</b>：dir / 镜像 / 容器全来自 agent 发现，无手配。</li>
+      <li><b>逻辑服务（Service，插件策略落点）= 不纯自动建</b>。纯自动建有三硬伤：① 首启鸡生蛋（没配插件 → 拉空）；② 停了不能删（策略要留）→ 垃圾累积；③ 任意注册即建 → 管控弱。改走 <b>自动发现名字 + 一键纳管 + 人工配插件</b>。</li>
+      <li><b>纳管</b>：发现的 <code>nacosService</code> ∉ Service 表 → 进「已发现未纳管」收件箱；点「纳管」→ 平台预填（namespace + nacosServiceName，零敲）→ 建 Service → 配插件。<b>保留手动预建</b>给首次上线（敲一次 nacos 名绕开鸡生蛋）。Service 行<b>持久</b>，停了不自动删（策略要留）。</li>
+      <li><b>对账视图</b>（意图 Service ⋈ 现实 DiscoveredNode，by nacosServiceName）：running-but-unmanaged（在跑未纳管）· managed-but-down（纳管未起）· version-drift（版本漂移）。</li>
+      <li><b>link key（两列，不强制相等）</b>：发现节点经 <code>nacos_service_name</code> link 到逻辑服务；分发链用 <code>service_code</code>（<code>distribution.py</code> 按它查清单）。二者是 <code>db_models.py</code> 上两个独立 nullable 列：创建表单默认把 <code>service_code</code> 预填成与 <code>nacos_service_name</code> 相同，但仍可分别编辑。<b>删除"serviceCode = nacosServiceName 恒等"说法</b>——<code>nacos_service_name</code> 现 P1 可空，恒等会让分发链拿到空 key。</li>
+    </ul>
+    <div class="note good"><b>结论：</b>节点纯自动；服务这层「自动发现名字 + 一键纳管 + 人工配插件」，保留手动预建。<b>不纯自动建服务</b>（避免鸡生蛋 / 垃圾 / 管控弱）。</div>
+  </div>
+
+  <h2><span class="n">4</span>控制链 / 投放（复用 node-control，不重造）</h2>
+  <div class="card">
+    <ul>
+      <li>发布新版本（改 <code>service_plugin_version</code> 的 active）→ <b>触发受影响 service 滚动重启</b>（platform → hub rolling，逐实例 drain+restart）→ 各实例启动 → worker 经本机 agent 重拉（agent 已预热缓存，秒级）。</li>
+      <li><b>版本一致性</b>：平台 active 版本是单一真相；滚动逐实例，期间新起实例都拉同一目标版本。</li>
+      <li><b>灰度</b>（增强）：只滚一部分实例 / 按 DiscoveredNode 子集。</li>
+      <li><b>预热</b>：platform 通知 agent「新版本将至」→ agent 提前回源缓存 → 滚动时 worker 零等待。</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>4.1 ⚠️ 跨 agent（多节点）滚动的盲点 —— 必须 hub 协调</h3>
+    <p><b>场景</b>：两台服务器各一个 agent、共用一个 nacos，各跑一个同名服务 <code>tamagawa-wms</code>（该 nacos 服务 2 个实例，分属两台）。</p>
+    <div class="note warn"><b>当前实现的真实表现</b>（守卫在 <b>hub 编排器</b> <code>rolling.py:_run_rolling</code>，<b>不在 agent</b>）：rolling 命令<b>定向单 agent</b>、<b>不广播</b>；agent 的 <code>handle_list_instances</code> 逐实例只回 <code>matched: true/false</code>（<b>从不失败</b>），是 hub <code>_run_rolling</code> 见到<b>非本机（unmatched）</b>实例就<b>整体 abort</b>（测试 <code>test_run_rolling_unmatched_aborts</code> 直接驱动 hub）。所以给 agent A 发 rolling → hub 拿到含 B 的 unmatched 实例 → <b>整体 abort，滚不动</b>。</div>
+    <p><b>结论</b>：当前 rolling 只支持「<b>同一台机多容器</b>」（admin/2admin），<b>不支持「一个服务跨多台机」</b>——而后者正是真正的多节点生产形态。「两个 agent 同时重启 → 有中断」是另一种 naive 修法（去守卫各滚各的 / 广播并行）的后果。</p>
+    <p><b>正确做法：hub 跨 agent 协调的顺序滚动</b></p>
+    <ul>
+      <li>hub 取该 nacos 服务全部实例，按 host→agent 分组（靠<b>自动发现</b>的「实例→agent」映射）。</li>
+      <li><b>串行</b>滚：agent A 的实例（drain→重启→等 ready）→ agent B → …，全程维持集群健康 <b>≥1（或 ≥quorum）</b>，<b>绝不同时重启</b>。</li>
+      <li>「≥2 健康」门从「单机内」升级为「<b>集群级</b>」不变式；失败即停。</li>
+    </ul>
+    <div class="note good"><b>要改两处（均在 hub，非 agent）</b>：① hub <code>_run_rolling</code> 把「有 unmatched 就 abort」→「<b>过滤掉 unmatched、只滚本机 matched</b>」（agent 无需改，它已逐实例回 matched 标志）；② hub 加<b>跨 agent 顺序协调器</b>（已能定向单 agent，补一层 for-each-agent 串行 + 集群健康门）。<b>依赖自动发现</b>（hub 须知每个实例在哪个 agent），与「agent 上报拓扑」配套。</div>
+  </div>
+
+  <div class="card">
+    <h3>4.2 服务的两个管理面 + 平台信息架构（与原型对齐）</h3>
+    <p>服务（逻辑）挂<b>两个独立管理、独立版本</b>的维度，各有独立投放方式：</p>
+    <table>
+      <thead><tr><th>管理面</th><th>管什么</th><th>操作（服务二级页·编辑=暂存）</th><th>发布机制（diff 自动选）</th></tr></thead>
+      <tbody>
+        <tr><td><b>插件配置</b></td><td>该服务装哪些插件 + 各插件 active 版本</td><td>绑定 / 解绑、改版本（选版本）</td><td>滚动重启 → worker 经 agent 重拉插件</td></tr>
+        <tr><td><b>镜像配置</b></td><td>该服务的基础镜像（nocobase-pro tag）</td><td>发布新镜像、历史、<b>回滚</b></td><td>pull-redeploy 逐节点</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li><b>编辑 = 暂存意图，发布 = 应用 diff（desired-state apply）</b>：两个面只改 Service（逻辑层）的「意图」（暂存、标『待发布』）；<b>一个「发布」</b>按 diff <b>自动选机制</b>——<b>仅插件变 → 滚动 restart；含镜像变 → pull-redeploy</b>（逐节点 pull/down/up，新容器启动顺带重拉插件，故插件变更自动包含）。<b>不设两个并列发布</b>（镜像发布 ⊃ 插件发布）。发布弹窗展示「变更摘要 + 机制」。</li>
+      <li><b>创建服务</b>只填 <code>命名空间 + 服务编码（= nacos 服务名）</code>；<b>目录 / 镜像不在创建表单</b>——目录纯节点级（自动发现），镜像走「镜像配置」管理面。</li>
+      <li><b>镜像有历史 + 回滚</b>：每次发布镜像入历史，可一键回滚到旧 tag（pull-redeploy）。</li>
+    </ul>
+    <p><b>信息架构（侧栏）</b>：配置（命名空间 / 服务 / 插件）· 发布（插件上传〔列表带「发布」=选 ns+服务〕/ 获取记录〔按 命名空间+服务+实例 聚合,插件@版本进详情〕；原「插件发布」独立页已删，发布统一走服务的「发布」）· 运维（节点 / 操作审计）。<b>服务的「配置」「镜像」是服务二级页</b>（从服务行进入，服务<b>只读锁定</b>，不在侧栏）；服务列表分 <b>已纳管 / 未纳管</b> 标签页（§3.4）；<b>「实例」页</b>（原「节点」，即 DiscoveredNode 的 UI 名）全自动发现（§3）。术语统一：命名空间 / 服务名（UI 去 (agent)/(nacos) 标注；底层 service_code 与 nacos_service_name 仍是两列、默认同值，见 §3.4）。<b>实例运维动作简化为「启动 / 停止 / 更新」</b>：<code>更新</code> = 把该实例拉到<b>服务期望态</b>（按 diff 自动选 restart / pull-redeploy），取代分立的「重启 / 重部署」。</p>
+  </div>
+
+  <div class="card">
+    <h3>4.3 实例实时日志（agent 流式支持 —— 新）</h3>
+    <p class="lead">实例页要能看<b>实时日志</b>（<code>docker logs -f</code>）。这是控制链上一个<b>新的"流式"能力</b>，与现有「一次性命令→结果」不同，<b>要 agent 专门支持</b>。</p>
+    <pre><code>浏览器 ⇄ platform(SSE) ⇄ hub(WS) ⇄ agent → docker logs --tail 500 -f &lt;container&gt;</code></pre>
+    <ul>
+      <li><b>为什么"要 agent 支持"</b>：现 agent↔hub 是<b>一次性命令→结果</b>；实时日志是<b>长连流式</b>（持续吐行直到停）。新增 <code>docker_cli.stream_logs(container, tail, follow)</code>（<code>subprocess</code> 跑 <code>docker logs -f</code> 逐行 yield）+ <b>流式命令通道</b>三类消息带 <code>streamId</code>：<code>log-stream-start / log-chunk / log-stream-stop</code>。</li>
+      <li><b>hub</b> 转发 <code>log-chunk</code> 给订阅的 platform；<b>platform</b> 开 <b>SSE</b> 端点 <code>/api/instances/{id}/logs/stream</code>（admin 鉴权）经 hub 拉 agent 流推给浏览器。</li>
+      <li><b>生命周期/防爆</b>：默认 <code>--tail 500 -f</code>；<b>仅实时不落库</b>；关面板/断连/无活动超时 → 逐级 stop → <b>agent kill <code>docker logs</code> 进程，不留孤儿</b>；行速率截流 + 前端只留最近 ~500 行。</li>
+      <li><b>权限</b>（按 §5 取舍，内网从简）：走 admin-token→hub→agent 既有受信链；agent 只对<b>本机受管容器</b>开 logs；仅平台有权角色可看，不暴露 worker/public。</li>
+      <li><b>数据模型</b>：无新增持久表（纯流式）；归 <b>P3</b>，现状 <b>❌ 待建</b>（流式通道是新能力，全链路要建）。</li>
+    </ul>
+  </div>
+
+  <h2><span class="n">5</span>安全模型</h2>
+  <div class="card">
+    <table>
+      <thead><tr><th>链</th><th>凭据</th><th>边界</th></tr></thead>
+      <tbody>
+        <tr><td>worker → agent</td><td><span class="badge b-ok">无</span></td><td>同主机信任 + agent namespace 隔离（P2 可加容器来源校验）</td></tr>
+        <tr><td>agent → platform 分发</td><td>本 namespace <b>pull-token</b>（可轮换 show-once）</td><td>token 属 namespace 校验 + download IDOR 归属链（已实现）</td></tr>
+        <tr><td>agent ↔ hub 控制</td><td><b>agentKey</b>（WS）</td><td>hub 校验</td></tr>
+        <tr><td>platform → hub</td><td>admin token</td><td>hub <code>_require_admin_token</code></td></tr>
+        <tr><td>优雅停机</td><td><code>K8S_SHUTDOWN_TOKEN</code></td><td>cnp opt-in 闸（已合 1.7.x_v2）</td></tr>
+      </tbody>
+    </table>
+    <div class="note warn"><b>去掉两个老坑：</b>① 不再有「root 管理员 JWT（exp≈3026 年≈永不过期）散落在每个 worker」，凭据只在 agent、可轮换。② 传输层修掉 <code>rejectUnauthorized:false</code>/<code>-k</code>：worker→agent 本机明文 HTTP 即可（不出主机）；<b>agent→platform 走正经 TLS</b>（有效证书或 CA 入信任库），不跳过校验。</div>
+    <div class="note">🔻 <b>安全取舍（2026-06-21 定，优先级低于部署省事）</b>：ultracode 评审两条"网络暴露/投毒"高危（H1 agent 入站默认绑 <code>0.0.0.0</code>；H2 包全链路无 sha256）<b>有意降级、不提到 P0/P1</b>——前提是 <b>agent 内网、不暴露外网</b>，且<b>部署简单是最高优先级</b>（不为安全给部署加 sha256 / 强绑 127.0.0.1 / 镜像 allowlist 必填 等摩擦）。零成本默认仍<b>建议</b>（worker-facing 监听写 127.0.0.1、<code>validate_managed_dir</code> 兜底保留），但不作硬门、不阻塞上线。若该端口将来需跨网段暴露，再回头提级。全文见 <code>review-ultracode-2026-06-21.zh-CN.md</code>。</div>
+  </div>
+
+  <h2><span class="n">6</span>健壮性（失败与启动）</h2>
+  <div class="card">
+    <ul>
+      <li><b>worker 启动依赖本机 agent</b>：agent 未起/无缓存且回源失败 → worker <b>回退上次已装插件</b>（last-good，<span class="badge b-ok">现有 sync-plugins.js 已具备</span>），绝不白屏。</li>
+      <li>启动顺序：agent 常驻 <code>restart:always</code>；worker 重启时 agent 已在。同 compose 可 <code>depends_on</code>。</li>
+      <li>agent 回源失败（平台挂/网络）→ 用缓存（可能旧版）兜底，标 <code>stale</code>；恢复后下次刷新。</li>
+      <li>缓存损坏/校验失败 → 丢弃重拉；并发同包 per-key 锁。</li>
+    </ul>
+  </div>
+
+  <h2><span class="n">7</span>可观测</h2>
+  <div class="card">
+    <ul>
+      <li><b>agent /health 扩展</b>：缓存命中率 / 回源次数 / 本机服务清单 / pull-token 有效性 / 上次上报 / 是否在用 last-good。</li>
+      <li><b>platform</b>：fetch_records（<b>回源粒度</b>，caller 取 agent 反查值；per-container 看 agent 本地日志，M2/M9）、DiscoveredNode 台账（在线/心跳/stale）、发布运行记录、发布→投放关联视图。</li>
+      <li><b>hub</b>：命令审计（已有）。</li>
+      <li><b>实例实时日志</b>（§4.3）：实例页一键看 <code>docker logs -f</code> 实时 tail（浏览器 SSE ⇄ hub ⇄ agent 流式），仅实时不落库；离线/stale 实例不可用。</li>
+    </ul>
+  </div>
+
+  <h2><span class="n">8</span>数据模型变更</h2>
+  <div class="card">
+    <div class="grid2">
+      <div>
+        <h3>platform</h3>
+        <ul>
+          <li>新增 <code>DiscoveredNode</code>（agentId, composeProject, containerName, dir, image, host, nacosService, running, healthy, heartbeatAt）—— 自动 upsert + 心跳老化。</li>
+          <li><code>Service</code> 退化为纯逻辑层（分发单位），不再扛 dir。</li>
+          <li><code>fetch_record</code> 加 <code>caller</code>（containerName/host）。</li>
+          <li>distribution 响应可选加 <code>sha256</code>（缓存校验，向后兼容）。</li>
+          <li><b>插件维度</b>：<code>service_plugins</code>（绑定）+ 每绑定 active 版本（<code>service_plugin_version</code>）→ 绑定 / 解绑 / 改版本。</li>
+          <li><b>镜像维度（新）</b>：<code>ServiceImage</code>(service_id, image, isCurrent, createdAt) 历史表 → 镜像「当前 / 历史 / 回滚」；回滚 = 置历史 tag 为 current + pull-redeploy。镜像仍是节点级（发现上报真实 tag），这里存「该服务<b>应用</b>哪个镜像」的意图 + 历史。</li>
+        </ul>
+      </div>
+      <div>
+        <h3>hub / agent</h3>
+        <ul>
+          <li><b>hub</b>：加「发现上报」接收 + 落库 + 心跳清理；加<b>流式日志转发</b>（<code>log-chunk</code> agent→platform，§4.3）。</li>
+          <li><b>agent</b>：新增 <code>plugin_cache</code> 模块 + worker-facing HTTP 路由 + 周期发现上报 + <b>流式命令通道（<code>docker logs -f</code> 实时日志，§4.3）</b> + 配置项 <code>PLATFORM_URL</code> / <code>PULL_TOKEN</code> / <code>PLUGIN_CACHE_DIR</code> / <code>PLUGIN_SERVE_PORT</code>。</li>
+          <li><b>platform</b>：加实例日志 <b>SSE 端点</b>（<code>/api/instances/{id}/logs/stream</code>，admin 鉴权，§4.3）。</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <h2><span class="n">9</span>worker 侧：基本改配置，不重写</h2>
+  <div class="card">
+    <p class="lead">现有客户端 cnp <code>docker/nocobase/sync-plugins.js</code>（容器启动 init，NocoBase 起来前跑）已足够灵活。</p>
+    <div class="note good"><b>已具备（无需新建）：</b><code>adminUrl</code>+<code>apiPath</code> 均可配 · token 可选（不配则不带 Authorization）· 下载用 manifest 的 <code>url</code> · 版本比对优先用响应 <code>version</code> 字段（attachmentId 型 URL 也 OK）· <b>last-good 兜底已存在</b>（fetch 失败含连不上 → 用本地）· 安装链成熟。</div>
+    <h3>方案 A 下 worker 改动 = 改 <code>sync-plugins.config.json</code></h3>
+    <pre><code>{
+  "adminUrl": "http://&lt;本机 agent host&gt;:&lt;PLUGIN_SERVE_PORT&gt;",
+  "apiPath":  "/plugins",
+  "namespace": "&lt;ns&gt;",          // 必填：现 mode2 以 namespace 非空为触发前提(L3)；agent 忽略其值、恒用本 ns
+  "service":  "wms-test-admin"
+  // 去掉 adminToken —— 本机 agent 无需 token
+}</code></pre>
+    <p><b>agent 端硬约束</b>（对齐现有客户端，保证 worker 仅改配置）：<code>/plugins?service=</code> 返回纯数组 <code>[{pluginName,version,url}]</code> 字段不改名，<code>url</code> 指向 agent 自己。</p>
+    <div class="note warn">⚠️ <b>namespace 不是"可选可不传"(评审 L3 + G2)</b>：现 mode2 进入条件含 <code>&& NAMESPACE</code>，namespace 空会<b>整段跳过同步</b>(连 last-good 都不走)。二选一：<b>(推荐·零代码改)</b> 配置保留 namespace 字段(agent 忽略其值)；或要彻底去 ns 则<b>必须改 mode2 gate</b>(去 <code>&& NAMESPACE</code>)——属必改非微调。</div>
+    <div class="note warn">📌 <b>跨仓 + 契约固化(评审 G1)</b>：<code>sync-plugins.js</code> 在 cnp、本设计在 services-monorepo(两仓)；§9 的"已具备"都是对 cnp 当前实现的断言,漂移则 P2 真机静默失败。<b>P0 把 worker↔agent 契约固化成 contract test</b>(重定向/version 优先/tokenless/last-good/空清单不清空),cnp 脚本 pin commit + 负责人,改契约两仓同 PR。</div>
+  </div>
+
+  <h2><span class="n">10</span>落地分期（完整路线）</h2>
+  <div class="card">
+    <div class="roadmap">
+      <div class="step"><div class="ph">P0</div><div class="body"><div class="t">契约定稿 + 设计冻结</div><div class="v">worker↔agent(零 ns)、发现上报、数据模型、<b>失败即停回滚语义(G5)</b>契约定稿 + <b>worker↔agent contract test(G1)</b>。验收：评审通过 + contract test 绿。</div></div></div>
+      <div class="step"><div class="ph">P1</div><div class="body"><div class="t">agent 插件缓存 + worker-facing 端点（主战场）</div><div class="v"><code>plugin_cache</code> + <code>/plugins</code>/<code>/download</code> + 回源平台（持 token）+ 配置项。验收：worker 经 agent 拉到插件，缓存命中/回源各一次。</div></div></div>
+      <div class="step"><div class="ph">P2</div><div class="body"><div class="t">worker 改配置</div><div class="v">改 <code>sync-plugins.config.json</code>（adminUrl→本机 agent、apiPath、去 token、<b>保留 namespace 字段</b>);彻底去 ns 则改 mode2 gate(L3 必改)。验收：真 worker 从本机 agent 装插件;agent 挂走 last-good 不白屏;<b>agent 返回空清单 → 不清空既有插件 + warning(M4)</b>。</div></div></div>
+      <div class="step"><div class="ph">P3</div><div class="body"><div class="t">拓扑自动发现</div><div class="v">agent 周期 nacos+docker 上报 → hub 落库 + 心跳 → platform 节点表 + UI；Service auto-upsert。验收：UI 自动出现 admin/2admin 两节点，dir 自动填，无需手配。</div></div></div>
+      <div class="step"><div class="ph">P4</div><div class="body"><div class="t">投放联动(依赖 §4.1 协调器·同批)</div><div class="v">platform 发布 → hub <b>跨 agent 顺序投放</b>(restart/pull-redeploy 共用协调器 + 集群健康门 + 失败即停回滚) → worker 重拉;agent 预热。验收：跨机顺序滚两实例都跑新版零中断;<b>注入失败 → 失败即停 + 收敛(G5)</b>。〔现 publish/rollback 只改 DB active、不触发控制链 M1〕</div></div></div>
+      <div class="step"><div class="ph">P5</div><div class="body"><div class="t">加固与迁移</div><div class="v">fetch_record caller 维度、灰度发布、缓存 sha256、可观测面板、老节点迁移（root-JWT→pull-token、adminUrl→agent、修 TLS）。</div></div></div>
+    </div>
+  </div>
+
+  <h2><span class="n">11</span>风险与权衡</h2>
+  <div class="card">
+    <ul>
+      <li><b>agent 进 worker 启动关键路径</b> → last-good 缓存 + 启动顺序兜住；agent <code>restart:always</code> 常驻。</li>
+      <li><b>同主机 tokenless 信任</b> → 接受（同信任域）；P2 可加容器来源校验。</li>
+      <li><b>包不过 WS</b> → 已定：列表走任意通道，包一律 HTTP。</li>
+      <li><b>nacos 只见在跑的</b> → docker（含 stopped）为主、nacos 补。</li>
+    </ul>
+  </div>
+
+  <h2><span class="n">12</span>现状对照（已有 / 待建）</h2>
+  <div class="card">
+    <table>
+      <thead><tr><th>能力</th><th>现状</th></tr></thead>
+      <tbody>
+        <tr><td>平台分发端点 <code>/api/distribution/{plugins,download}</code> + pull-token + IDOR</td><td><span class="badge b-ok">✅ 已有</span> <code>distribution.py</code></td></tr>
+        <tr><td>插件/版本/服务-插件/发布/拉取审计 数据模型</td><td><span class="badge b-ok">✅ 已有</span></td></tr>
+        <tr><td>agent 入站 HTTP server</td><td><span class="badge b-ok">✅ 已有骨架</span> <code>health_server.py</code> 可扩展</td></tr>
+        <tr><td>agent nacos 发现 + 本机匹配 + docker <b>running</b> 调用</td><td><span class="badge b-ok">✅ 已有</span> nacos_client / instance_match / docker_cli（<code>docker_cli</code> 仅 <code>docker ps -q</code> 列 running）</td></tr>
+        <tr><td><b>agent 采集「含 stopped 容器/工程」</b>（发现链基石）</td><td><span class="badge b-no">❌ 待建</span> P3；需 <code>docker ps -a</code>/<code>compose ls -a</code>，现<b>零实现</b></td></tr>
+        <tr><td>控制链 node-control · <b>单机多容器</b> 滚动/dispatch</td><td><span class="badge b-ok">✅ 已有</span></td></tr>
+        <tr><td><b>跨 agent（多节点）顺序滚动协调</b>（§4.1）</td><td><span class="badge b-no">❌ 待建</span> P4；现 hub <code>_run_rolling</code> 见 unmatched 即 abort，跨机滚不动</td></tr>
+        <tr><td>worker 客户端 <code>sync-plugins.js</code></td><td><span class="badge b-warn">⚠️ 在 cnp(跨仓 G1)</span> P2 主要改配置;但 namespace 非可省(L3)、空清单/单失败会静默少装(M4)需补验收 + contract test 固化跨仓契约</td></tr>
+        <tr><td>agent 插件缓存 + worker-facing <code>/plugins</code>,<code>/download</code></td><td><span class="badge b-no">❌ 待建</span> P1</td></tr>
+        <tr><td>agent 拓扑自动发现上报 + hub 落库心跳 + platform 节点表</td><td><span class="badge b-no">❌ 待建</span> P3</td></tr>
+        <tr><td>发布→滚动投放联动 + 预热</td><td><span class="badge b-no">❌ 待建</span> P4(依赖跨 agent 协调器;现 publish/rollback 只改 DB active、不触发控制链 M1)</td></tr>
+        <tr><td>服务「插件配置」管理面（绑定/解绑/改版本）</td><td><span class="badge b-warn">⚠️ 后端模型多在，缺二级页 UI</span></td></tr>
+        <tr><td>服务「镜像配置」管理面（当前/历史/回滚 → pull-redeploy）</td><td><span class="badge b-no">❌ 待建</span> 原型已设计；pull-redeploy 在 agent 侧，缺平台镜像台账 + 回滚 UI</td></tr>
+        <tr><td><b>实例实时日志</b>（§4.3：agent <code>docker logs -f</code> 流式 → hub 转发 → platform SSE → UI）</td><td><span class="badge b-no">❌ 待建</span> P3;agent 现是"一次性命令"模型,<b>流式通道是新能力</b>,全链路要建</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <footer>
+    插件分发改造方案 · 方案 A（agent 直连 platform，包走 HTTP）· 生成自 docs/plugin-distribution-redesign.zh-CN.md
+  </footer>
+</div>
+
+<a class="toc-top" href="#" title="回到顶部">↑</a>
+</body>
+</html>
