@@ -12,7 +12,7 @@ class Base(DeclarativeBase):
 
 
 class Database:
-    # 合并后 12 张表(console 8 + 并入的 hub 4);模型见 app/db_models.py 与 app/hub/db_models.py。
+    # 合并后 13 张表(console 8 + 并入的 hub 4 + 发现 1);模型见 app/db_models.py 与 app/hub/db_models.py。
     _managed_tables = {
         # console
         "namespace",
@@ -28,6 +28,8 @@ class Database:
         "commands",
         "command_events",
         "rolling_tasks",
+        # agent 发现上报(P3-4)
+        "discovered_nodes",
     }
 
     def __init__(self, database_url: str) -> None:

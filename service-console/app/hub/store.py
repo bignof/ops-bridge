@@ -3,21 +3,25 @@ from collections import deque
 import hashlib
 import hmac
 import json
+import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
 from fastapi import WebSocket
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.db import Database
-from app.hub.db_models import AgentModel, CommandEventModel, CommandModel, RollingTaskModel
+from app.hub.db_models import AgentModel, CommandEventModel, CommandModel, DiscoveredNodeModel, RollingTaskModel
 
 
 CHINA_TZ = timezone(timedelta(hours=8))
 LOG_STREAM_REPLAY_LIMIT = 2000
+
+logger = logging.getLogger(__name__)
+
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -219,6 +223,13 @@ class HubState:
 
     async def touch_agent(self, agent_id: str, event_type: str) -> None:
         await asyncio.to_thread(self._touch_agent_sync, agent_id, event_type)
+
+    async def record_discovery(self, agent_id: str, nodes: list, warnings: list) -> None:
+        """落地某 agent 一轮发现上报:命中行 upsert 为 active,本轮缺席的同 agent 行标 stale(不删,M8)。
+
+        warnings(落位冲突)只记日志、不入库。
+        """
+        await asyncio.to_thread(self._record_discovery_sync, agent_id, nodes, warnings)
 
     async def get_connection(self, agent_id: str) -> WebSocket | None:
         async with self._lock:
@@ -695,6 +706,60 @@ class HubState:
             elif event_type == "pong":
                 record.last_pong_at = now
             session.commit()
+
+    def _record_discovery_sync(self, agent_id: str, nodes: list, warnings: list) -> None:
+        now = utc_now()
+        seen_names: set[str] = set()
+        with self.database.session_factory() as session:
+            for node in nodes:
+                container_name = node.get("containerName")
+                if not container_name:
+                    # 节点名缺失则无法定位/去重,跳过(defensive,不建无主行)。
+                    logger.debug("发现上报:agent %s 有一条节点缺 containerName,已跳过: %s", agent_id, node)
+                    continue
+                seen_names.add(container_name)
+                record = session.scalar(
+                    select(DiscoveredNodeModel).where(
+                        DiscoveredNodeModel.agent_id == agent_id,
+                        DiscoveredNodeModel.container_name == container_name,
+                    )
+                )
+                if record is None:
+                    record = DiscoveredNodeModel(
+                        agent_id=agent_id,
+                        container_name=container_name,
+                        first_seen_at=now,
+                        created_at=now,
+                    )
+                    session.add(record)
+
+                record.container_id = node.get("containerId")
+                record.compose_project = node.get("composeProject")
+                record.compose_service = node.get("composeService")
+                record.dir = node.get("dir")
+                record.image = node.get("image")
+                record.running = bool(node.get("running"))
+                record.nacos_service = node.get("nacosService")
+                record.healthy = node.get("healthy")
+                record.status = "active"
+                record.heartbeat_at = now
+                record.updated_at = now
+
+            # 本轮缺席的同 agent 行标 stale(不删行,M8:行承载 dir/工程定位信息)。
+            # seen_names 为空(本轮无有效节点)时该 agent 全部行均缺席;显式建 where 避免 notin_([]) 的告警。
+            stale_where = [DiscoveredNodeModel.agent_id == agent_id]
+            if seen_names:
+                stale_where.append(DiscoveredNodeModel.container_name.notin_(seen_names))
+            session.execute(
+                update(DiscoveredNodeModel)
+                .where(*stale_where)
+                .values(status="stale", updated_at=now)
+            )
+            session.commit()
+
+        if warnings:
+            # 落位冲突只记日志、不入库(消费方据节点行另行判断,告警链路非本任务)。
+            logger.warning("发现上报:agent %s 携带 %d 条落位冲突警告: %s", agent_id, len(warnings), warnings)
 
     def _store_command_sync(
         self,

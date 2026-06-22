@@ -343,6 +343,15 @@ async def _handle_agent_message(agent_id: str, payload: dict[str, Any]) -> None:
             )
         return
 
+    if msg_type == "discovery-report":
+        # P3-4:agent 周期发现上报 → 落 discovered_nodes(touch_agent 已在函数开头调过,不重复)。
+        await main_module.hub_state.record_discovery(
+            agent_id,
+            payload.get("nodes") or [],
+            payload.get("warnings") or [],
+        )
+        return
+
     if msg_type == "pong":
         return
 

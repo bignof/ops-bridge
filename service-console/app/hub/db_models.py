@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -74,3 +74,28 @@ class RollingTaskModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class DiscoveredNodeModel(Base):
+    # agent 周期发现上报(P3-3/P3-4)落地表:一行 = 某 agent 名下的一个容器节点。
+    # 行承载 dir/工程定位信息,失联/缺席只标 status=stale 不删(评审 M8),仅显式下线才删(本任务不做删)。
+    __tablename__ = "discovered_nodes"
+    __table_args__ = (UniqueConstraint("agent_id", "container_name", name="uq_dn_agent_container"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    agent_id: Mapped[str] = mapped_column(String(255), index=True)
+    container_name: Mapped[str] = mapped_column(String(255))
+    container_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    compose_project: Mapped[str | None] = mapped_column(String(255), index=True, nullable=True)
+    compose_service: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    dir: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    image: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    running: Mapped[bool] = mapped_column(Boolean, default=False)
+    nacos_service: Mapped[str | None] = mapped_column(String(255), index=True, nullable=True)
+    healthy: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # active|stale:本轮上报命中=active,该 agent 名下本轮缺席的行=stale(不删行)。
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
