@@ -8,10 +8,11 @@
 约束 / 不变式:
 - **响应全 camelCase**(评审 H2):`response_model=NodeListOut`,经 `*Out` 序列化,不手搓 dict。
 - **纵深防御**:`Depends(require_session)`;`/api/` 前缀下 default-deny 中间件已先挡无/坏 JWT。
-- **HUB_ADMIN_TOKEN 服务端注入**:hub 调用全经 `hub_client`(其 `_headers()` 注入 X-Admin-Token),
-  绝不下发浏览器。
-- **单 agent 卡死/超时不拖垮整页**(核心):`list_instances` 短超时 + `asyncio.gather(...,
-  return_exceptions=True)` 收集异常 → 该行 `degraded=True、healthyCount=None`,其余行照常、整页 200。
+- **S5 进程内直调**:hub 调用全经 `hub_client`(已重写为进程内 async 适配器,直调 `app/hub/`
+  路由 handler / hub_state,不再走 httpx + admin-token HTTP 跳)。这些函数现为 `async def`,调用点 `await`。
+- **单 agent 卡死/超时不拖垮整页**(核心):每行 `list_instances` 用 `asyncio.wait_for(coro, timeout)`
+  硬短超时 + `asyncio.gather(..., return_exceptions=True)` 收集异常/超时 → 该行 `degraded=True、
+  healthyCount=None`,其余行照常、整页 200。进程内 await 无 socket 超时,wait_for 是唯一硬超时闸。
 - **降级矩阵**:
   - online 且有 nacosServiceName → fan-out:成功(dict 且 status==success)→ healthyCount=健康数、
     degraded=False;异常 / status!=success → healthyCount=None、degraded=True。
@@ -21,6 +22,7 @@
 
 打桩说明:hub 调用经**模块引用** `hub_client.list_agents(...)` / `hub_client.list_instances(...)`,
 故测试 `monkeypatch.setattr(nodes.hub_client, "list_agents", ...)` 能生效(同 namespaces 的 H7 打桩)。
+S5 后 `hub_client.*` 是 async,**替身须为 async**(返回 coroutine),否则 `await` 会 TypeError。
 """
 
 from __future__ import annotations
@@ -61,6 +63,12 @@ _AUDIT_FIELD_MAX = 1000
 # 两条优雅路径(stop / redeploy)共用同一常量,保证 drain 行为对称(评审 T10 Important)。
 _GRACEFUL_SHUTDOWN_TIMEOUT_SEC = 60
 
+# 节点列表 per-(agent×service) 健康实例 fan-out 的**硬短超时**(秒)。S5 进程内化后,
+# 单 agent WS `call_agent` 不应答不再有 httpx socket 超时兜底,必须由本常量 + `asyncio.wait_for`
+# 在 BFF 这层截断,否则单 agent 卡死会吊死整页 fan-out(核心不变式)。取 5s:足够正常 WS 往返,
+# 又远小于会让节点页明显卡顿的阈值;与跨进程时代 hub_client.list_instances 的旧默认 5.0 对齐。
+_FANOUT_TIMEOUT_SEC = 5.0
+
 # SELECT 列:Service 本行字段 + LEFT JOIN 回 namespace.code(label=namespace_code → camel namespaceCode）。
 _LIST_COLUMNS = (
     Service.id,
@@ -73,14 +81,16 @@ _LIST_COLUMNS = (
 )
 
 
-def _load_agents_map() -> dict[str, dict[str, Any]]:
+async def _load_agents_map() -> dict[str, dict[str, Any]]:
     """一次性拉 hub 在线态,转成 `{agentId: snapshot}`。
 
-    `list_agents` 失败(配置缺失 / hub 不可达 / 非 2xx / 响应异常)→ **退化为空 map**,
+    `list_agents` 失败(配置缺失 / hub 逻辑失败 / 响应异常)→ **退化为空 map**,
     所有行据此按「离线/未知」处理,**绝不让整页 500**(核心不变式)。
+
+    S5:`hub_client.list_agents` 改进程内 async,这里相应 `await`(失败退化为空 map 的不变式不变)。
     """
     try:
-        agents = hub_client.list_agents()
+        agents = await hub_client.list_agents()
     except Exception as exc:  # noqa: BLE001 —— hub 任意失败都不得拖垮整页,统一退化为空 map
         # 退化不崩页,但留一条脱敏告警(仅异常类型名,绝不记 token/完整消息),便于运维区分
         # 「hub 全程不可达」与「确实全部离线」。
@@ -122,7 +132,7 @@ async def list_nodes(
     )
 
     # ② hub 在线态(一次性);失败退化为空 map → 全部行按离线处理。
-    agents_map = _load_agents_map()
+    agents_map = await _load_agents_map()
 
     # 标注每行在线态,并挑出「online 且有 nacosServiceName」的行做并发 fan-out。
     online_flags: list[bool] = []
@@ -134,16 +144,22 @@ async def list_nodes(
         if online and row.get("nacos_service_name"):
             fanout_idx.append(i)
 
-    # ③ 并发 fan-out:to_thread 把 sync httpx 包成可并发协程,return_exceptions 收集每行异常
-    #    (单 agent/服务超时只落到对应结果,不冒泡;短 timeout 由 hub_client.list_instances 默认值保证)。
+    # ③ 并发 fan-out(S5:list_instances 改进程内 async)。每行用 `asyncio.wait_for(coro, timeout)`
+    #    包一层**硬短超时** + `gather(return_exceptions=True)` 收集每行异常/超时:单 agent 的 WS
+    #    `call_agent` 卡死 → 该行 wait_for 抛 TimeoutError(被 return_exceptions 收成异常对象)→
+    #    `_healthy_count` 回 None → 该行 degraded,其余行 + 整页 200 不受影响(本任务核心不变式)。
+    #    ⚠️ 必须 wait_for:进程内 await hub_state 不再有 httpx socket 超时,单 agent WS 不应答会
+    #    无限挂起 gather → 吊死整页;wait_for 是这层唯一的硬超时闸。
     fanout_results: list[Any] = []
     if fanout_idx:
         fanout_results = await asyncio.gather(
             *[
-                asyncio.to_thread(
-                    hub_client.list_instances,
-                    agents_map[rows[i]["namespace_code"]]["agentId"],
-                    rows[i]["nacos_service_name"],
+                asyncio.wait_for(
+                    hub_client.list_instances(
+                        agents_map[rows[i]["namespace_code"]]["agentId"],
+                        rows[i]["nacos_service_name"],
+                    ),
+                    timeout=_FANOUT_TIMEOUT_SEC,
                 )
                 for i in fanout_idx
             ],
@@ -192,7 +208,8 @@ async def list_nodes(
 # 寻址权威源 = 平台 Service 表:agentId(=namespace.code)+ serviceCode 反查得
 # dir / nacosServiceName / defaultImage。**BFF 绝不接受客户端传路径或任意 image**——
 # 这些一律由台账派生(防越权操作非授权目录 / 拉非白名单镜像)。requested_by 由 hub 据
-# admin token 服务端派生:BFF **绝不传 X-Requested-By**(hub_client._headers 只注入 token)。
+# admin token 服务端派生:BFF **绝不自报 requested_by**(S5 进程内化后,hub_client.dispatch_command
+# 固定传 requested_by_hint=None,handler 内 _derive_requested_by 据 token 得 platform-admin)。
 
 
 def _resolve_service(agent_id: str, service_code: str) -> Service:
@@ -242,7 +259,7 @@ def _compose_default_project(dir_: str | None) -> str | None:
     return kept[start:] or None
 
 
-def _derive_health_base_url(agent_id: str, nacos_service_name: str | None, dir_: str | None) -> str:
+async def _derive_health_base_url(agent_id: str, nacos_service_name: str | None, dir_: str | None) -> str:
     """优雅 stop / redeploy 的 healthBaseUrl 派生(只选**本机** matched 健康实例)。
 
     `nacos_service_name` 缺失 → 400(优雅操作需配置 nacosServiceName);经 hub
@@ -264,7 +281,7 @@ def _derive_health_base_url(agent_id: str, nacos_service_name: str | None, dir_:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "优雅操作需配置 nacosServiceName")
     # 把 dir 推得的 compose 默认工程名作为 expected 传下去:matched 由此同时校验「本机 + 同 compose 工程」。
     expected_project = _compose_default_project(dir_)
-    r = hub_client.list_instances(agent_id, nacos_service_name, expected_compose_project=expected_project)
+    r = await hub_client.list_instances(agent_id, nacos_service_name, expected_compose_project=expected_project)
     # 评审 #3:只选 healthy **且** matched(本机)的实例;别节点(matched=False)的 healthy 实例一律排除。
     local_healthy = [
         i
@@ -304,13 +321,13 @@ async def dispatch_node_action(
     effective_mode = mode or "graceful"  # restart 缺省 graceful;start 下不参与决策
 
     # ③ action → hub 端点路由 + payload 组装。纯校验阶段(400/409/404)抛 HTTPException;
-    #    真正的 hub 网络调用集中到下方 try 块,统一 HubError/httpx → 502 脱敏。
+    #    真正的 hub 调用(S5 后为进程内 await)集中到下方 try 块,非 HTTPException 失败统一 → 502 脱敏。
     try:
         if action == "restart" and effective_mode == "graceful":
             # 优雅 restart 复用 hub 零中断滚动重启(逐实例 drain);必须有 nacosServiceName。
             if not nacos:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, "优雅 restart 需配置 nacosServiceName")
-            resp = hub_client.rolling_restart(agent_id, nacos, force=False)
+            resp = await hub_client.rolling_restart(agent_id, nacos, force=False)
             return NodeActionOut(kind="rolling", task_id=resp["taskId"])
 
         # 其余路径走 dispatch:先把 payload 备齐(graceful stop/redeploy 需先派生 healthBaseUrl)。
@@ -322,7 +339,7 @@ async def dispatch_node_action(
         elif action == "stop" and effective_mode == "force":
             payload.update(action="stop", mode="force", serviceName=nacos, allowLastInstance=body.allow_last_instance)
         elif action == "stop":  # graceful stop
-            health_base_url = _derive_health_base_url(agent_id, nacos, dir_)
+            health_base_url = await _derive_health_base_url(agent_id, nacos, dir_)
             payload.update(action="stop", mode="graceful", healthBaseUrl=health_base_url, shutdownTimeoutSec=_GRACEFUL_SHUTDOWN_TIMEOUT_SEC, serviceName=nacos)
         elif action == "redeploy" and effective_mode == "force":
             if not default_image:
@@ -331,10 +348,10 @@ async def dispatch_node_action(
         else:  # redeploy graceful
             if not default_image:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, "重部署需配置 defaultImage")
-            health_base_url = _derive_health_base_url(agent_id, nacos, dir_)
+            health_base_url = await _derive_health_base_url(agent_id, nacos, dir_)
             payload.update(action="pull-redeploy", mode="graceful", image=default_image, healthBaseUrl=health_base_url, shutdownTimeoutSec=_GRACEFUL_SHUTDOWN_TIMEOUT_SEC)
 
-        resp = hub_client.dispatch_command(agent_id, payload)
+        resp = await hub_client.dispatch_command(agent_id, payload)
         # dispatch 成功:返回 hub 生成的 requestId(该命令进 /api/node-operations 审计列表)。
         # 取值放 try 内:hub 响应畸形(缺 command.requestId)同样收敛成脱敏 502,不逃逸成裸 500。
         return NodeActionOut(
@@ -343,10 +360,14 @@ async def dispatch_node_action(
             accepted=resp.get("accepted", True),
         )
     except HTTPException:
-        raise  # 业务校验(400/409/404)原样上抛,不被 502 吞掉
+        # 原样上抛,不被 502 吞掉。涵盖两类:① BFF 自身的业务校验(400/409/404,如台账缺失、
+        #   优雅 drain 无本机实例);② S5 进程内化后 hub handler 直接抛的 HTTPException(agent
+        #   不存在 404 / 离线 409 / force-stop 护栏 400)—— 跨进程时代这些被 httpx 包成网络错落进
+        #   下方 502,进程内后语义更准(直接透出 hub 的精确状态码),刻意保留。
+        raise
     except Exception as exc:  # noqa: BLE001
-        # hub 调用失败(HubError / httpx 连接超时 / 畸形响应 / 任意异常)→ 502 脱敏:仅记异常
-        # 类型名,绝不把内部消息(可能含 hub URL / token 上下文)回显给前端。
+        # hub 调用其余失败(HubError / 畸形响应 / 任意非 HTTPException 异常)→ 502 脱敏:仅记异常
+        # 类型名,绝不把内部消息回显给前端。
         logger.warning("节点操作下发失败 agent=%s service=%s action=%s: %s", agent_id, service_code, action, type(exc).__name__)
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "下发命令失败") from exc
 
@@ -370,8 +391,8 @@ async def list_node_operations(
     page_size: int = Query(default=20, ge=1, le=200, alias="pageSize", title="每页条数"),
 ) -> NodeOperationsListOut:
     try:
-        resp = hub_client.list_commands(page, page_size)
-    except Exception as exc:  # noqa: BLE001 —— hub 任意失败(HubError/httpx/畸形)统一脱敏 502
+        resp = await hub_client.list_commands(page, page_size)
+    except Exception as exc:  # noqa: BLE001 —— hub 任意失败(HubError/畸形)统一脱敏 502
         logger.warning("拉取操作审计失败 page=%s pageSize=%s: %s", page, page_size, type(exc).__name__)
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "拉取操作审计失败") from exc
 

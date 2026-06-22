@@ -1,516 +1,289 @@
-"""hub_client 单测(Task 4)。
+"""hub_client 单测(S5:进程内适配器)。
 
-平台用 admin token 调 service-hub 的命名空间(provision/rotate agent)端点:
-- `provision_agent` → POST `{hub}/api/agents`,body `{agentId}`,header `X-Admin-Token`,读返回 `agentKey`。
-- `rotate_agent_key` → POST `{hub}/api/agents/{id}/credentials/rotate`,读返回 `agentKey`。
+历史:hub_client 原是「平台用 admin token 经 httpx 调外部 service-hub」的 HTTP 客户端,本文件原先
+monkeypatch `hc.httpx.post/get` 断言 URL/header/body。S5 把 hub 并入同进程后,hub_client 重写为
+**进程内适配器**——直调 `app/hub/` 的路由 handler / `_build_command_list_response`,不再走 httpx。
+故本文件整体重写为**进程内端到端**验证:经 conftest `client` fixture(它把 `hub_state` 指向隔离临时
+库、设 `admin_token` 测试值、跑 lifespan 初始化),真跑适配器 → hub_state,断言返回形状与失败归一化。
 
-测试纪律(评审 H8,权威范式 = `service-hub/tests/test_api.py:36`):`settings` 是
-`@dataclass(frozen=True)`,**禁** `monkeypatch.setattr(<frozen 实例>, attr, val, raising=False)`
-(底层仍 `FrozenInstanceError`)。本文件统一用 `monkeypatch.setattr(hc, "settings", SimpleNamespace(...))`
-整体替换模块级引用(`hub_client.py` 是 `from app.config import settings`,可行,且无需 teardown)。
+异步驱动:本仓库未装 pytest-asyncio,故测试函数保持 **sync**,用 `asyncio.run(...)` 驱动被测的
+async 适配器函数(`TestClient` 的 anyio portal 跑在后台线程,不占用主线程事件循环,主线程 asyncio.run
+安全)。`client` fixture 仅用于环境装配(隔离库 + hub_state 接线 + admin_token),无需真发 HTTP。
 
-httpx 不真发请求:monkeypatch `hc.httpx.post` 为 fake,断言 URL/header/body/返回解析。
-绑定约束:`X-Admin-Token` 仅服务端持有,断言其透传;敏感串(token / agentKey)不入日志。
+覆盖要点:
+- provision/rotate:真实签发 agentKey(非空 str);provision 同 id 二次 → hub 409 → 归一化 HubError;
+  缺 key / handler 失败统一 HubError(契约供 namespaces 502 映射复用)。
+- list_agents:返回 camelCase dict 列表(agentId/online/lastSeenAt),供节点页消费。
+- list_instances / dispatch:离线 agent → handler 抛 HTTPException(由 nodes fan-out / dispatch 兜底)。
+- rolling_restart:返回 {taskId}(后台任务异步跑,本函数同步返回句柄)。
+- list_commands:page/pageSize → limit/offset 换算正确;返回 camelCase 信封。
 """
 
 from __future__ import annotations
 
-import types
+import asyncio
 
 import pytest
+from fastapi import HTTPException
 
 import app.hub_client as hc
 
 
-class _Resp:
-    """最小 httpx.Response 替身:只实现 hub_client 用到的 raise_for_status / json。
-
-    `data` 可为任意对象(dict / list / 标量);`json_raises` 置真时 `json()` 抛 ValueError
-    (模拟 200 但 body 非 JSON,如反代返 HTML 错误页 → httpx 内部 JSONDecodeError ⊂ ValueError)。
-    """
-
-    def __init__(self, data, *, status_ok: bool = True, json_raises: bool = False) -> None:
-        self._d = data
-        self._status_ok = status_ok
-        self._json_raises = json_raises
-
-    def raise_for_status(self) -> None:
-        if not self._status_ok:
-            raise hc.httpx.HTTPStatusError("boom", request=None, response=None)  # type: ignore[arg-type]
-
-    def json(self):
-        if self._json_raises:
-            raise ValueError("Expecting value: line 1 column 1 (char 0)")
-        return self._d
+def _run(coro):
+    """主线程驱动 async 适配器(无 pytest-asyncio;TestClient portal 在后台线程,主线程无运行中 loop)。"""
+    return asyncio.run(coro)
 
 
-def _fake_settings(*, url: str = "http://hub:8080", token: str = "T") -> types.SimpleNamespace:
-    return types.SimpleNamespace(service_hub_url=url, hub_admin_token=token)
+# ── provision_agent ───────────────────────────────────────────────────────────────
 
 
-def test_provision_agent(monkeypatch) -> None:
-    calls: dict = {}
-
-    def fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002 (对齐 httpx.post 签名)
-        calls["url"] = url
-        calls["headers"] = headers
-        calls["json"] = json
-        calls["timeout"] = timeout
-        return _Resp({"agentKey": "k-123"})
-
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(hc.httpx, "post", fake_post)
-
-    assert hc.provision_agent("ns1") == "k-123"
-    assert calls["url"].endswith("/api/agents")
-    assert calls["url"] == "http://hub:8080/api/agents"
-    assert calls["headers"]["X-Admin-Token"] == "T"
-    assert calls["headers"]["Content-Type"] == "application/json"
-    assert calls["json"] == {"agentId": "ns1"}
-    assert calls["timeout"] == 15
+def test_provision_agent_issues_key(client) -> None:
+    # 进程内 provision 真落 hub agents 表,返回非空 agentKey(show-once 密钥)。
+    key = _run(hc.provision_agent("ns-prov-1"))
+    assert isinstance(key, str) and key  # 真实签发的密钥非空
 
 
-def test_rotate_agent_key(monkeypatch) -> None:
-    calls: dict = {}
-
-    def fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002
-        calls["url"] = url
-        calls["headers"] = headers
-        calls["json"] = json
-        return _Resp({"agentKey": "k-rot"})
-
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(hc.httpx, "post", fake_post)
-
-    assert hc.rotate_agent_key("ns2") == "k-rot"
-    assert calls["url"] == "http://hub:8080/api/agents/ns2/credentials/rotate"
-    assert calls["headers"]["X-Admin-Token"] == "T"
-
-
-def test_provision_agent_missing_hub_url_raises(monkeypatch) -> None:
-    called = {"hit": False}
-
-    def fake_post(*a, **k):
-        called["hit"] = True
-        return _Resp({"agentKey": "should-not-happen"})
-
-    monkeypatch.setattr(hc, "settings", _fake_settings(url=""))
-    monkeypatch.setattr(hc.httpx, "post", fake_post)
-
+def test_provision_agent_duplicate_raises_hub_error(client) -> None:
+    # 同 agentId 二次 provision → hub handler 抛 409(already exists)→ 适配器归一化为 HubError。
+    _run(hc.provision_agent("ns-dup"))
     with pytest.raises(hc.HubError):
-        hc.provision_agent("ns1")
-    assert called["hit"] is False  # 未配置 hub 时不应发起请求
+        _run(hc.provision_agent("ns-dup"))
 
 
-def test_rotate_agent_key_missing_hub_url_raises(monkeypatch) -> None:
-    called = {"hit": False}
+def test_provision_agent_wraps_handler_failure_as_hub_error(client, monkeypatch) -> None:
+    # handler 任意失败(此处模拟返回缺 agent_key 的响应)→ 适配器归一化 HubError(供 namespaces 502 映射)。
+    class _NoKey:
+        agent_key = ""  # 缺 key
 
-    def fake_post(*a, **k):
-        called["hit"] = True
-        return _Resp({"agentKey": "x"})
+    async def fake_handler(*a, **k):
+        return _NoKey()
 
-    monkeypatch.setattr(hc, "settings", _fake_settings(url=""))
-    monkeypatch.setattr(hc.httpx, "post", fake_post)
+    import app.hub.routers.agents as agents_mod
 
+    monkeypatch.setattr(agents_mod, "provision_agent", fake_handler)
     with pytest.raises(hc.HubError):
-        hc.rotate_agent_key("ns2")
-    assert called["hit"] is False
+        _run(hc.provision_agent("ns-nokey"))
 
 
-def test_provision_agent_no_key_in_response_raises(monkeypatch) -> None:
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(hc.httpx, "post", lambda *a, **k: _Resp({}))
+# ── rotate_agent_key ──────────────────────────────────────────────────────────────
 
+
+def test_rotate_agent_key_returns_new_key(client) -> None:
+    # 先 provision 再 rotate:返回新 agentKey(非空 str)。
+    first = _run(hc.provision_agent("ns-rot"))
+    rotated = _run(hc.rotate_agent_key("ns-rot"))
+    assert isinstance(rotated, str) and rotated
+    assert rotated != first  # 轮换后是新密钥
+
+
+def test_rotate_agent_key_wraps_failure_as_hub_error(client, monkeypatch) -> None:
+    async def boom(*a, **k):
+        raise RuntimeError("hub 内部炸了")
+
+    import app.hub.routers.agents as agents_mod
+
+    monkeypatch.setattr(agents_mod, "rotate_agent_credentials", boom)
     with pytest.raises(hc.HubError):
-        hc.provision_agent("ns1")
+        _run(hc.rotate_agent_key("ns-rot-fail"))
 
 
-def test_rotate_agent_key_no_key_in_response_raises(monkeypatch) -> None:
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(hc.httpx, "post", lambda *a, **k: _Resp({}))
+# ── list_agents ───────────────────────────────────────────────────────────────────
 
-    with pytest.raises(hc.HubError):
-        hc.rotate_agent_key("ns2")
 
+def test_list_agents_returns_camel_dicts(client) -> None:
+    # provision 两个 agent 后,list_agents 返回 camelCase dict 列表(节点页据 agentId/online/lastSeenAt 消费)。
+    _run(hc.provision_agent("ns-a1"))
+    _run(hc.provision_agent("ns-a2"))
+    agents = _run(hc.list_agents())
+    ids = [a["agentId"] for a in agents]
+    assert "ns-a1" in ids and "ns-a2" in ids
+    # 形状:每项含节点页读取的 camelCase 字段;离线(未连 WS)→ online False。
+    a1 = next(a for a in agents if a["agentId"] == "ns-a1")
+    assert a1["online"] is False  # 仅 provision、未连 WS → 离线
+    assert "lastSeenAt" in a1  # camelCase 序列化(snake 不应出现)
+    assert "agent_id" not in a1
 
-# --- R3(复审):hub 200 但 body 非 dict / 非 JSON → 归一化为 HubError(不逃出窄 except) ---
-#    raise_for_status() 通过(200)后 `r.json().get("agentKey")`:body 非 JSON → JSONDecodeError
-#    (ValueError);body 是 JSON 数组/标量 → `.get` 抛 AttributeError。二者都不是 HubError/
-#    httpx.HTTPError,会逃出路由层窄 except → 裸 500 + 孤儿 namespace。修复后统一抛 HubError。
-#
-#    变异验证:去掉 hub_client 的 json 解析归一化(直接 r.json().get(...)),非 dict 分支会抛
-#    AttributeError、非 JSON 分支会抛 ValueError(均非 HubError)→ 下列用例转红。
 
+def test_list_agents_empty(client) -> None:
+    # 无 agent → 空列表(不报错)。
+    assert _run(hc.list_agents()) == []
 
-@pytest.mark.parametrize("body", [[1, 2, 3], "agentKey", 5, 3.14, True, None, []])
-def test_provision_agent_non_dict_body_raises_hub_error(monkeypatch, body) -> None:
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(hc.httpx, "post", lambda *a, **k: _Resp(body))
-    with pytest.raises(hc.HubError):
-        hc.provision_agent("ns1")
 
+# ── list_instances ────────────────────────────────────────────────────────────────
 
-@pytest.mark.parametrize("body", [[1, 2, 3], "agentKey", 5, None])
-def test_rotate_agent_key_non_dict_body_raises_hub_error(monkeypatch, body) -> None:
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(hc.httpx, "post", lambda *a, **k: _Resp(body))
-    with pytest.raises(hc.HubError):
-        hc.rotate_agent_key("ns2")
 
+def test_list_instances_offline_agent_raises_http_exception(client) -> None:
+    # 仅 provision(未连 WS)的 agent 离线 → handler 抛 HTTPException(409 offline);
+    # 节点页 fan-out 的 gather(return_exceptions=True) 据此把该行标 degraded(本任务核心不变式的底层)。
+    _run(hc.provision_agent("ns-li-off"))
+    with pytest.raises(HTTPException) as ei:
+        _run(hc.list_instances("ns-li-off", "some-svc"))
+    assert ei.value.status_code == 409  # Agent is offline
 
-def test_provision_agent_non_json_body_raises_hub_error(monkeypatch) -> None:
-    # 200 但 body 非 JSON(反代 HTML 错误页等)→ json() 抛 ValueError → 归一化 HubError。
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(hc.httpx, "post", lambda *a, **k: _Resp(None, json_raises=True))
-    with pytest.raises(hc.HubError):
-        hc.provision_agent("ns1")
 
+def test_list_instances_unknown_agent_raises_http_exception(client) -> None:
+    # 完全不存在的 agent → handler 抛 HTTPException(404)。
+    with pytest.raises(HTTPException) as ei:
+        _run(hc.list_instances("no-such-agent", "svc"))
+    assert ei.value.status_code == 404
 
-def test_rotate_agent_key_non_json_body_raises_hub_error(monkeypatch) -> None:
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(hc.httpx, "post", lambda *a, **k: _Resp(None, json_raises=True))
-    with pytest.raises(hc.HubError):
-        hc.rotate_agent_key("ns2")
 
+def test_list_instances_passes_expected_compose_project(client, monkeypatch) -> None:
+    # expected_compose_project 透传:断言进到 handler 的 ListInstancesRequest.expectedComposeProject 正确。
+    captured = {}
 
-# --- R7(复审):rotate 的 quote() 第二道闸须有测试(删 quote 全绿=测试缝) ---
-#    rotate_agent_key 把 agent_id 拼进 hub URL 路径段,必须 quote(safe='') 编码,否则含
-#    `/` `..` 的 code 改变请求路径(存储型路径注入第二道闸,与 NamespaceIn 白名单纵深互补)。
-#
-#    变异验证:删掉 `quote(agent_id, safe='')`(直接拼 agent_id),URL 路径段会出现裸 `/` 与
-#    `..` → 下列断言转红。
+    async def fake_handler(request, agent_id, admin_token):
+        captured["expected"] = request.expectedComposeProject
+        captured["agent_id"] = agent_id
+        captured["service"] = request.serviceName
+        from app.hub.models import ListInstancesResponse
 
+        return ListInstancesResponse(status="success", instances=[])
 
-# --- Task 9b:list_agents / list_instances(节点页消费)单测 ---
-#    list_agents → GET {hub}/api/agents,透传 X-Admin-Token,返回 hub 的 AgentSnapshot 列表。
-#    list_instances → POST {hub}/api/agents/{quote(id)}/list-instances,body {serviceName},短超时。
+    import app.hub.routers.commands as commands_mod
 
+    monkeypatch.setattr(commands_mod, "list_agent_instances", fake_handler)
+    out = _run(hc.list_instances("a1", "svc-x", expected_compose_project="proj-1"))
+    assert out == {"status": "success", "instances": []}  # model_dump(by_alias) 形状
+    assert captured["expected"] == "proj-1"
+    assert captured["agent_id"] == "a1"
+    assert captured["service"] == "svc-x"
 
-def test_list_agents(monkeypatch) -> None:
-    calls: dict = {}
 
-    def fake_get(url, headers=None, timeout=None):
-        calls["url"] = url
-        calls["headers"] = headers
-        calls["timeout"] = timeout
-        return _Resp([{"agentId": "a1", "online": True}, {"agentId": "a2", "online": False}])
+def test_list_instances_empty_expected_compose_project_becomes_none(client, monkeypatch) -> None:
+    # 空串 expected → 进 handler 时归一化为 None(不误触 agent 工程漂移守卫)。
+    captured = {}
 
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(hc.httpx, "get", fake_get)
+    async def fake_handler(request, agent_id, admin_token):
+        captured["expected"] = request.expectedComposeProject
+        from app.hub.models import ListInstancesResponse
 
-    agents = hc.list_agents()
-    assert [a["agentId"] for a in agents] == ["a1", "a2"]
-    assert calls["url"] == "http://hub:8080/api/agents"
-    assert calls["headers"]["X-Admin-Token"] == "T"
-    assert calls["timeout"] == 15  # 列表用通用 _HUB_TIMEOUT
+        return ListInstancesResponse(status="success", instances=[])
 
+    import app.hub.routers.commands as commands_mod
 
-def test_list_agents_missing_hub_url_raises(monkeypatch) -> None:
-    called = {"hit": False}
+    monkeypatch.setattr(commands_mod, "list_agent_instances", fake_handler)
+    _run(hc.list_instances("a1", "svc", expected_compose_project=""))
+    assert captured["expected"] is None
 
-    def fake_get(*a, **k):
-        called["hit"] = True
-        return _Resp([])
 
-    monkeypatch.setattr(hc, "settings", _fake_settings(url=""))
-    monkeypatch.setattr(hc.httpx, "get", fake_get)
+# ── dispatch_command ──────────────────────────────────────────────────────────────
 
-    with pytest.raises(hc.HubError):
-        hc.list_agents()
-    assert called["hit"] is False  # 未配置 hub 时不应发起请求
 
+def test_dispatch_command_offline_agent_raises_http_exception(client) -> None:
+    # provision(离线)agent dispatch → handler 在 online 检查处抛 409;BFF dispatch 的 except 兜底脱敏。
+    _run(hc.provision_agent("ns-disp-off"))
+    with pytest.raises(HTTPException) as ei:
+        _run(hc.dispatch_command("ns-disp-off", {"action": "start", "dir": "/opt/x"}))
+    assert ei.value.status_code == 409  # Agent is offline
 
-def test_list_agents_propagates_http_error(monkeypatch) -> None:
-    # 非 2xx → raise_for_status 抛 HTTPStatusError(向上抛,路由层退化为空 map,不在此吞)。
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(hc.httpx, "get", lambda *a, **k: _Resp([], status_ok=False))
-    with pytest.raises(hc.httpx.HTTPStatusError):
-        hc.list_agents()
 
+def test_dispatch_command_derives_requested_by_platform_admin(client, monkeypatch) -> None:
+    # 安全(要求3):requested_by 进程内服务端派生为 platform-admin,且 BFF 不自报(requested_by_hint=None)。
+    captured = {}
 
-def test_list_instances(monkeypatch) -> None:
-    calls: dict = {}
+    async def fake_handler(request, agent_id, admin_token, requested_by_hint, request_source):
+        captured["requested_by_hint"] = requested_by_hint
+        captured["admin_token"] = admin_token
+        from app.hub.models import CommandDispatchResponse, CommandSnapshot
 
-    def fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002
-        calls["url"] = url
-        calls["headers"] = headers
-        calls["json"] = json
-        calls["timeout"] = timeout
-        return _Resp({"status": "success", "instances": [{"healthy": True}]})
+        # 用派生身份回填一条命令快照,验证适配器把 hub 的派生身份原样透出。
+        from app.hub.api_support import _derive_requested_by
 
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(hc.httpx, "post", fake_post)
+        snap = CommandSnapshot(
+            request_id="r1", agent_id=agent_id, status="queued", action=request.action, dir=request.dir,
+            requested_by=_derive_requested_by(admin_token), payload={}, created_at="2026-06-21T00:00:00Z",
+            updated_at="2026-06-21T00:00:00Z",
+        )
+        return CommandDispatchResponse(accepted=True, command=snap)
 
-    out = hc.list_instances("a1", "svc-nacos")
-    assert out["status"] == "success"
-    assert calls["url"] == "http://hub:8080/api/agents/a1/list-instances"
-    assert calls["headers"]["X-Admin-Token"] == "T"
-    assert calls["json"] == {"serviceName": "svc-nacos"}  # 未传 expected → body 不带该字段(旧行为)
-    assert calls["timeout"] == 5.0  # 短超时(默认),保证节点页响应
+    import app.hub.routers.commands as commands_mod
 
+    monkeypatch.setattr(commands_mod, "dispatch_command", fake_handler)
+    out = _run(hc.dispatch_command("a1", {"action": "start", "dir": "/opt/x"}))
+    # BFF 绝不自报 requested_by:hint 必为 None(不可伪造,由 hub 据 token 派生)。
+    assert captured["requested_by_hint"] is None
+    # 适配器把进程内 admin_token 传给 handler(满足 _require_admin_token);hub 据它派生 platform-admin。
+    assert captured["admin_token"] == "test-admin-token"
+    assert out["command"]["requestedBy"] == "platform-admin"
+    assert out["accepted"] is True
+    assert out["command"]["requestId"] == "r1"  # camelCase 透出
 
-def test_list_instances_passes_expected_compose_project(monkeypatch) -> None:
-    # 评审 #11:传 expected_compose_project(非空)→ body 带 expectedComposeProject(触发 agent 工程漂移守卫)。
-    calls: dict = {}
 
-    def fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002
-        calls["json"] = json
-        return _Resp({"status": "success", "instances": []})
+# ── rolling_restart ───────────────────────────────────────────────────────────────
 
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(hc.httpx, "post", fake_post)
 
-    hc.list_instances("a1", "svc-nacos", expected_compose_project="my_proj")
-    assert calls["json"] == {"serviceName": "svc-nacos", "expectedComposeProject": "my_proj"}
+def test_rolling_restart_returns_task_id(client) -> None:
+    # rolling_restart 同步返回 {taskId}(后台 _run_rolling 异步跑,会因 agent 离线而失败,但句柄已返回)。
+    _run(hc.provision_agent("ns-roll"))
+    out = _run(hc.rolling_restart("ns-roll", "roll-svc", force=False))
+    assert "taskId" in out and out["taskId"]
 
 
-def test_list_instances_empty_expected_compose_project_omitted(monkeypatch) -> None:
-    # 评审 #11:expected 为空串/None → 不带该字段(避免空值污染 body / 误触守卫)。
-    calls: dict = {}
+def test_rolling_restart_conflict_raises_http_exception(client, monkeypatch) -> None:
+    # 同 (agent,service) 已有滚动在进行 → RollingConflict → handler 409。用桩制造冲突,验证异常透出。
+    import app.main as main_module
+    from app.hub.store import RollingConflict
 
-    def fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002
-        calls["json"] = json
-        return _Resp({"status": "success", "instances": []})
+    async def boom(*a, **k):
+        raise RollingConflict("ns-rc:rc-svc 已有滚动在进行")
 
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(hc.httpx, "post", fake_post)
+    monkeypatch.setattr(main_module.hub_state, "create_rolling_task", boom)
+    with pytest.raises(HTTPException) as ei:
+        _run(hc.rolling_restart("ns-rc", "rc-svc"))
+    assert ei.value.status_code == 409
 
-    hc.list_instances("a1", "svc-nacos", expected_compose_project="")
-    assert calls["json"] == {"serviceName": "svc-nacos"}  # 空串不带
-    hc.list_instances("a1", "svc-nacos", expected_compose_project=None)
-    assert calls["json"] == {"serviceName": "svc-nacos"}  # None 不带
 
+# ── list_commands ─────────────────────────────────────────────────────────────────
 
-def test_list_instances_custom_timeout(monkeypatch) -> None:
-    calls: dict = {}
 
-    def fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002
-        calls["timeout"] = timeout
-        return _Resp({"status": "success", "instances": []})
-
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(hc.httpx, "post", fake_post)
-
-    hc.list_instances("a1", "svc", timeout=2.5)
-    assert calls["timeout"] == 2.5
-
-
-def test_list_instances_missing_hub_url_raises(monkeypatch) -> None:
-    called = {"hit": False}
-
-    def fake_post(*a, **k):
-        called["hit"] = True
-        return _Resp({"status": "success"})
-
-    monkeypatch.setattr(hc, "settings", _fake_settings(url=""))
-    monkeypatch.setattr(hc.httpx, "post", fake_post)
-
-    with pytest.raises(hc.HubError):
-        hc.list_instances("a1", "svc")
-    assert called["hit"] is False
-
-
-def test_list_instances_propagates_http_error(monkeypatch) -> None:
-    # hub 返非 2xx(如 agent 离线 409 / 未应答 502)→ HTTPStatusError 向上抛,路由层标该行 degraded。
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(hc.httpx, "post", lambda *a, **k: _Resp({}, status_ok=False))
-    with pytest.raises(hc.httpx.HTTPStatusError):
-        hc.list_instances("a1", "svc")
-
-
-def test_list_instances_quotes_agent_id_in_url(monkeypatch) -> None:
-    # 纵深防御第二道闸:agent_id 拼进路径段必须 quote(safe='')(同 rotate 的路径注入护栏)。
-    # 变异验证:删掉 quote(直接拼 agent_id),路径段残留裸 / 与 .. → 下列断言转红。
-    calls: dict = {}
-
-    def fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002
-        calls["url"] = url
-        return _Resp({"status": "success", "instances": []})
-
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(hc.httpx, "post", fake_post)
-
-    hc.list_instances("a/b/../c", "svc")
-    url = calls["url"]
-    assert "/api/agents/" in url and "/list-instances" in url, url
-    seg = url.split("/api/agents/", 1)[1].rsplit("/list-instances", 1)[0]
-    assert "/" not in seg, f"agent_id 未编码进 URL 路径段(残留裸 /,可路径注入): {seg!r}"
-    assert "%2F" in seg.upper()  # `/` → %2F(证明编码确实发生)
-
-
-def test_rotate_agent_key_quotes_agent_id_in_url(monkeypatch) -> None:
-    calls: dict = {}
-
-    def fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002
-        calls["url"] = url
-        return _Resp({"agentKey": "k"})
-
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(hc.httpx, "post", fake_post)
-
-    hc.rotate_agent_key("a/b/../c")
-    url = calls["url"]
-    # 取出 `/api/agents/<seg>/credentials/rotate` 中的 <seg>(agent_id 编码后路径段)。
-    assert "/api/agents/" in url and "/credentials/rotate" in url, url
-    seg = url.split("/api/agents/", 1)[1].rsplit("/credentials/rotate", 1)[0]
-    # 核心安全不变式:agent_id 内的 `/` 必须被编码成 %2F,使整串退化为**单个**路径段——
-    # 不含裸 `/`,也就不存在真正的 `..` 穿越段(`..` 字面残留但被编码 `/` 夹住,无法改变路径)。
-    assert "/" not in seg, f"agent_id 未编码进 URL 路径段(残留裸 /,可路径注入): {seg!r}"
-    assert "/../" not in url.split("/api/agents/", 1)[1], "残留真正的 /../ 穿越段"
-    assert "%2F" in seg.upper()  # `/` → %2F(证明编码确实发生)
-
-
-# --- Task 10b:dispatch_command / rolling_restart / list_commands(节点操作下发 + 审计)单测 ---
-#    dispatch_command → POST {hub}/api/agents/{quote(id)}/commands,body=payload,默认 15s。
-#    rolling_restart  → POST {hub}/api/rolling-restart,body {agentId, serviceName, force}。
-#    list_commands    → GET {hub}/api/commands,params {limit=pageSize, offset=(page-1)*pageSize}。
-
-
-def test_dispatch_command(monkeypatch) -> None:
-    calls: dict = {}
-
-    def fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002
-        calls["url"] = url
-        calls["headers"] = headers
-        calls["json"] = json
-        calls["timeout"] = timeout
-        return _Resp({"accepted": True, "command": {"requestId": "r1"}})
-
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(hc.httpx, "post", fake_post)
-
-    payload = {"action": "start", "dir": "/opt/x"}
-    out = hc.dispatch_command("a1", payload)
-    assert out["command"]["requestId"] == "r1"
-    assert calls["url"] == "http://hub:8080/api/agents/a1/commands"
-    assert calls["headers"]["X-Admin-Token"] == "T"
-    # 安全:绝不发 X-Requested-By(requested_by 由 hub 据 admin token 派生)。
-    assert "X-Requested-By" not in calls["headers"]
-    assert calls["json"] == payload  # payload 原样直传
-    assert calls["timeout"] == 15.0
-
-
-def test_dispatch_command_quotes_agent_id_in_url(monkeypatch) -> None:
-    # 纵深防御第二道闸:agent_id 拼进路径段必须 quote(safe='')(同 rotate/list_instances)。
-    calls: dict = {}
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(
-        hc.httpx, "post", lambda url, **k: (calls.__setitem__("url", url), _Resp({"accepted": True, "command": {}}))[1]
-    )
-    hc.dispatch_command("a/b/../c", {"action": "start", "dir": "/x"})
-    url = calls["url"]
-    seg = url.split("/api/agents/", 1)[1].rsplit("/commands", 1)[0]
-    assert "/" not in seg, f"agent_id 未编码进路径段(可路径注入): {seg!r}"
-    assert "%2F" in seg.upper()
-
-
-def test_dispatch_command_missing_hub_url_raises(monkeypatch) -> None:
-    called = {"hit": False}
-    monkeypatch.setattr(hc, "settings", _fake_settings(url=""))
-    monkeypatch.setattr(hc.httpx, "post", lambda *a, **k: called.__setitem__("hit", True))
-    with pytest.raises(hc.HubError):
-        hc.dispatch_command("a1", {"action": "start", "dir": "/x"})
-    assert called["hit"] is False  # 未配置 hub 不发起请求
-
-
-def test_dispatch_command_propagates_http_error(monkeypatch) -> None:
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(hc.httpx, "post", lambda *a, **k: _Resp({}, status_ok=False))
-    with pytest.raises(hc.httpx.HTTPStatusError):
-        hc.dispatch_command("a1", {"action": "start", "dir": "/x"})
-
-
-def test_rolling_restart(monkeypatch) -> None:
-    calls: dict = {}
-
-    def fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002
-        calls["url"] = url
-        calls["headers"] = headers
-        calls["json"] = json
-        calls["timeout"] = timeout
-        return _Resp({"taskId": "t1"})
-
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(hc.httpx, "post", fake_post)
-
-    out = hc.rolling_restart("a1", "svc-nacos", force=True)
-    assert out["taskId"] == "t1"
-    assert calls["url"] == "http://hub:8080/api/rolling-restart"
-    assert calls["headers"]["X-Admin-Token"] == "T"
-    assert calls["json"] == {"agentId": "a1", "serviceName": "svc-nacos", "force": True}
-    assert calls["timeout"] == 15.0
-
-
-def test_rolling_restart_default_force_false(monkeypatch) -> None:
-    calls: dict = {}
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(
-        hc.httpx, "post", lambda url, json=None, **k: (calls.__setitem__("json", json), _Resp({"taskId": "t"}))[1]
-    )
-    hc.rolling_restart("a1", "svc")
-    assert calls["json"]["force"] is False
-
-
-def test_rolling_restart_missing_hub_url_raises(monkeypatch) -> None:
-    called = {"hit": False}
-    monkeypatch.setattr(hc, "settings", _fake_settings(url=""))
-    monkeypatch.setattr(hc.httpx, "post", lambda *a, **k: called.__setitem__("hit", True))
-    with pytest.raises(hc.HubError):
-        hc.rolling_restart("a1", "svc")
-    assert called["hit"] is False
-
-
-def test_rolling_restart_propagates_http_error(monkeypatch) -> None:
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(hc.httpx, "post", lambda *a, **k: _Resp({}, status_ok=False))
-    with pytest.raises(hc.httpx.HTTPStatusError):
-        hc.rolling_restart("a1", "svc")
-
-
-def test_list_commands_paging_to_limit_offset(monkeypatch) -> None:
-    # 转换层:page/pageSize → hub limit/offset(limit=pageSize, offset=(page-1)*pageSize)。
-    calls: dict = {}
-
-    def fake_get(url, headers=None, params=None, timeout=None):
-        calls["url"] = url
-        calls["headers"] = headers
-        calls["params"] = params
-        calls["timeout"] = timeout
-        return _Resp({"items": [], "total": 0, "limit": 10, "offset": 20})
-
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(hc.httpx, "get", fake_get)
-
-    out = hc.list_commands(page=3, page_size=10)
+def test_list_commands_empty_envelope(client) -> None:
+    # 无命令 → camelCase 信封,total=0,items=[]。
+    out = _run(hc.list_commands(page=1, page_size=20))
     assert out["total"] == 0
-    assert calls["url"] == "http://hub:8080/api/commands"
-    assert calls["headers"]["X-Admin-Token"] == "T"
-    assert calls["params"] == {"limit": 10, "offset": 20}  # (3-1)*10
-    assert calls["timeout"] == 15.0
+    assert out["items"] == []
+    # camelCase 信封字段齐(hasMore/sortBy/order),snake 不应出现。
+    assert "hasMore" in out and "sortBy" in out and "order" in out
+    assert "has_more" not in out and "sort_by" not in out
 
 
-def test_list_commands_clamps_page_floor(monkeypatch) -> None:
+def test_list_commands_paging_to_limit_offset(client, monkeypatch) -> None:
+    # page/pageSize → hub limit/offset(limit=pageSize, offset=(page-1)*pageSize)。打桩底层实现断言换算。
+    captured = {}
+
+    async def fake_build(**kwargs):
+        captured.update(kwargs)
+        from app.hub.models import CommandListResponse
+
+        return CommandListResponse(
+            items=[], total=0, limit=kwargs["limit"], offset=kwargs["offset"], has_more=False,
+            sort_by="createdAt", order="desc",
+        )
+
+    import app.hub.api_support as api_support_mod
+
+    monkeypatch.setattr(api_support_mod, "_build_command_list_response", fake_build)
+    _run(hc.list_commands(page=3, page_size=10))
+    assert captured["limit"] == 10
+    assert captured["offset"] == 20  # (3-1)*10
+
+
+def test_list_commands_clamps_page_floor(client, monkeypatch) -> None:
     # page/pageSize < 1 被夹到 1(offset 不为负)。
-    calls: dict = {}
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(
-        hc.httpx, "get", lambda url, params=None, **k: (calls.__setitem__("params", params), _Resp({"items": [], "total": 0}))[1]
-    )
-    hc.list_commands(page=0, page_size=0)
-    assert calls["params"] == {"limit": 1, "offset": 0}
+    captured = {}
 
+    async def fake_build(**kwargs):
+        captured.update(kwargs)
+        from app.hub.models import CommandListResponse
 
-def test_list_commands_missing_hub_url_raises(monkeypatch) -> None:
-    called = {"hit": False}
-    monkeypatch.setattr(hc, "settings", _fake_settings(url=""))
-    monkeypatch.setattr(hc.httpx, "get", lambda *a, **k: called.__setitem__("hit", True))
-    with pytest.raises(hc.HubError):
-        hc.list_commands(page=1, page_size=20)
-    assert called["hit"] is False
+        return CommandListResponse(
+            items=[], total=0, limit=kwargs["limit"], offset=kwargs["offset"], has_more=False,
+            sort_by="createdAt", order="desc",
+        )
 
+    import app.hub.api_support as api_support_mod
 
-def test_list_commands_propagates_http_error(monkeypatch) -> None:
-    monkeypatch.setattr(hc, "settings", _fake_settings())
-    monkeypatch.setattr(hc.httpx, "get", lambda *a, **k: _Resp({}, status_ok=False))
-    with pytest.raises(hc.httpx.HTTPStatusError):
-        hc.list_commands(page=1, page_size=20)
+    monkeypatch.setattr(api_support_mod, "_build_command_list_response", fake_build)
+    _run(hc.list_commands(page=0, page_size=0))
+    assert captured["limit"] == 1
+    assert captured["offset"] == 0

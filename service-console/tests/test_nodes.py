@@ -1,11 +1,11 @@
 """节点聚合端点 /api/nodes 端到端测试(Task 9b)。
 
-经 conftest 的 `client` fixture(临时文件库 + swap 单例 + 置空 service_hub_url)。
-节点页**权威源 = 平台 Service 表**(每行 = (agent×service)),叠加 hub 实时在线态
-(`list_agents`)与健康实例数(`list_instances`)。核心不变式:
+经 conftest 的 `client` fixture(临时文件库 + swap 单例 + admin_token 测试值)。节点页**权威源
+= 平台 Service 表**(每行 = (agent×service)),叠加 hub 实时在线态(`list_agents`)与健康实例数
+(`list_instances`)。核心不变式:
 
-- **单 agent 卡死/超时不拖垮整页**:`list_instances` 短超时 + `gather(return_exceptions=True)`
-  + 该行 `degraded=True、healthyCount=None`,其它行照常、整体 **200**。
+- **单 agent 卡死/超时不拖垮整页**:`list_instances` 用 `asyncio.wait_for` 硬短超时 +
+  `gather(return_exceptions=True)` + 该行 `degraded=True、healthyCount=None`,其它行照常、整体 **200**。
 - **离线 agent**(不在 `list_agents` 返回里)→ `online=False`、不发 `list_instances`、
   `healthyCount=None`、`degraded=False`。
 - **无 nacosServiceName 的行** → 不发 `list_instances`、`healthyCount=None`、`degraded=False`。
@@ -14,17 +14,63 @@
 
 打桩纪律:路由经**模块引用** `hub_client.list_agents(...)` / `hub_client.list_instances(...)`
 调用,故 `monkeypatch.setattr(nodes.hub_client, "list_agents", ...)`(在路由模块所引的
-`hub_client` 上替换)即生效——同 `test_namespace_rotate.py` 的 H7 打桩范式。
+`hub_client` 上替换)即生效。**S5:`hub_client.*` 已改进程内 async,替身一律须为 async**
+(返回 coroutine);本文件统一用 `_aval(...)` / `_araise(...)` / `_acapture(...)` 等异步替身工厂,
+不再用同步 lambda(否则 `await` 同步替身会 TypeError)。
 """
 
 from __future__ import annotations
 
-import httpx
+import asyncio
+
 import app.hub_client as hc
 import app.routers.nodes as nodes
 from app import store
 from app.db_models import Namespace, Service
 from fastapi.testclient import TestClient
+
+
+# ── 异步替身工厂(S5):hub_client.* 已是 async,所有打桩须返回 coroutine ──
+
+
+def _aval(value):
+    """async 替身:被 await 时返回固定 value(忽略入参)。"""
+
+    async def _stub(*a, **k):
+        return value
+
+    return _stub
+
+
+def _araise(exc: Exception):
+    """async 替身:被 await 时抛 exc。"""
+
+    async def _stub(*a, **k):
+        raise exc
+
+    return _stub
+
+
+def _afn(sync_fn):
+    """把一个同步函数包成 async 替身:被 await 时以原入参调 sync_fn 并返回其结果。
+
+    供需要按入参分支返回(如按 serviceName 选不同实例集)或记录入参的桩复用,既保留原同步逻辑
+    的可读性,又满足 `await` 契约。
+    """
+
+    async def _stub(*a, **k):
+        return sync_fn(*a, **k)
+
+    return _stub
+
+
+def _amust_not_call(message: str):
+    """async 替身:一旦被调用即抛 AssertionError(断言某 hub 调用不应发生)。"""
+
+    async def _stub(*a, **k):
+        raise AssertionError(message)
+
+    return _stub
 
 
 def _h(client: TestClient) -> dict[str, str]:
@@ -91,11 +137,11 @@ def test_nodes_basic_rows_and_fields(client: TestClient, monkeypatch) -> None:
     _mk_svc(ns, "svc-a", nacos="svc-a-nacos")
     _mk_svc(ns, "svc-b", nacos="svc-b-nacos")
 
-    monkeypatch.setattr(nodes.hub_client, "list_agents", lambda: [_agent("agent-x")])
+    monkeypatch.setattr(nodes.hub_client, "list_agents", _aval([_agent("agent-x")]))
     # 两个 service 各回不同健康实例数。
     counts = {"svc-a-nacos": _instances(True, True, False), "svc-b-nacos": _instances(True)}
     monkeypatch.setattr(
-        nodes.hub_client, "list_instances", lambda agent_id, service_name, **kw: counts[service_name]
+        nodes.hub_client, "list_instances", _afn(lambda agent_id, service_name, **kw: counts[service_name])
     )
 
     body = client.get("/api/nodes", headers=h).json()
@@ -130,11 +176,11 @@ def test_nodes_degraded_when_one_agent_times_out(client: TestClient, monkeypatch
     _mk_svc(ns, "svc-slow", nacos="slow-nacos")
     _mk_svc(ns, "svc-ok", nacos="ok-nacos")
 
-    monkeypatch.setattr(nodes.hub_client, "list_agents", lambda: [_agent("agent-deg")])
+    monkeypatch.setattr(nodes.hub_client, "list_agents", _aval([_agent("agent-deg")]))
 
-    def fake_list_instances(agent_id, service_name, **kw):
+    async def fake_list_instances(agent_id, service_name, **kw):
         if service_name == "slow-nacos":
-            raise httpx.TimeoutException("simulated timeout")  # 单 agent/服务卡死
+            raise asyncio.TimeoutError("simulated timeout")  # 单 agent/服务卡死(进程内为 asyncio 超时)
         return _instances(True, True)
 
     monkeypatch.setattr(nodes.hub_client, "list_instances", fake_list_instances)
@@ -150,18 +196,43 @@ def test_nodes_degraded_when_one_agent_times_out(client: TestClient, monkeypatch
     assert ok["healthyCount"] == 2
 
 
+def test_nodes_degraded_when_one_agent_hangs_past_wait_for(client: TestClient, monkeypatch) -> None:
+    # S5 核心回归:进程内 await 无 socket 超时,单 agent 的 list_instances **永久挂起** 时,
+    # 必须由 BFF fan-out 的 `asyncio.wait_for(coro, timeout)` 截断 → 该行 degraded,其余行 + 整页 200。
+    # 用一个会睡远超 wait_for 阈值的桩模拟「WS call_agent 卡死」;把 _FANOUT_TIMEOUT_SEC 调到极小以免拖慢测试。
+    monkeypatch.setattr(nodes, "_FANOUT_TIMEOUT_SEC", 0.05)
+    h = _h(client)
+    ns = _mk_ns("agent-hang")
+    _mk_svc(ns, "svc-hang", nacos="hang-nacos")
+    _mk_svc(ns, "svc-fast", nacos="fast-nacos")
+
+    monkeypatch.setattr(nodes.hub_client, "list_agents", _aval([_agent("agent-hang")]))
+
+    async def fake_list_instances(agent_id, service_name, **kw):
+        if service_name == "hang-nacos":
+            await asyncio.sleep(5)  # 远超 wait_for 的 0.05s:模拟单 agent WS 永久卡死
+            return _instances(True)  # 不会走到(wait_for 先超时)
+        return _instances(True, True)
+
+    monkeypatch.setattr(nodes.hub_client, "list_instances", fake_list_instances)
+
+    resp = client.get("/api/nodes", headers=h)
+    assert resp.status_code == 200  # wait_for 截断卡死行,不吊死整页
+    rows = {r["serviceCode"]: r for r in resp.json()["rows"]}
+    assert rows["svc-hang"]["degraded"] is True  # 卡死行被 wait_for 超时标 degraded
+    assert rows["svc-hang"]["healthyCount"] is None
+    assert rows["svc-fast"]["degraded"] is False  # 其余行不受影响
+    assert rows["svc-fast"]["healthyCount"] == 2
+
+
 def test_nodes_degraded_on_generic_exception(client: TestClient, monkeypatch) -> None:
     # 任意 Exception(非超时,如 HubError / HTTP 错)同样 → 该行 degraded、healthyCount=null、整体 200。
     h = _h(client)
     ns = _mk_ns("agent-err")
     _mk_svc(ns, "svc-boom", nacos="boom-nacos")
 
-    monkeypatch.setattr(nodes.hub_client, "list_agents", lambda: [_agent("agent-err")])
-
-    def boom(agent_id, service_name, **kw):
-        raise hc.HubError("hub 不可用")
-
-    monkeypatch.setattr(nodes.hub_client, "list_instances", boom)
+    monkeypatch.setattr(nodes.hub_client, "list_agents", _aval([_agent("agent-err")]))
+    monkeypatch.setattr(nodes.hub_client, "list_instances", _araise(hc.HubError("hub 不可用")))
 
     resp = client.get("/api/nodes", headers=h)
     assert resp.status_code == 200
@@ -177,21 +248,13 @@ def test_nodes_offline_agent_not_fanned_out(client: TestClient, monkeypatch) -> 
     _mk_svc(ns, "svc-off", nacos="off-nacos")
 
     # list_agents 返回该 agent 但 online=False(也覆盖「在 map 里但离线」)。
-    monkeypatch.setattr(nodes.hub_client, "list_agents", lambda: [_agent("agent-off", online=False)])
-
-    called = {"hit": False}
-
-    def must_not_call(*a, **k):
-        called["hit"] = True
-        return _instances(True)
-
-    monkeypatch.setattr(nodes.hub_client, "list_instances", must_not_call)
+    monkeypatch.setattr(nodes.hub_client, "list_agents", _aval([_agent("agent-off", online=False)]))
+    monkeypatch.setattr(nodes.hub_client, "list_instances", _amust_not_call("离线行不应发 fan-out"))
 
     row = client.get("/api/nodes", headers=h).json()["rows"][0]
     assert row["online"] is False
     assert row["healthyCount"] is None
     assert row["degraded"] is False
-    assert called["hit"] is False  # 离线行不发 fan-out
 
 
 def test_nodes_agent_absent_from_map_is_offline(client: TestClient, monkeypatch) -> None:
@@ -200,17 +263,13 @@ def test_nodes_agent_absent_from_map_is_offline(client: TestClient, monkeypatch)
     ns = _mk_ns("agent-ghost")
     _mk_svc(ns, "svc-ghost", nacos="ghost-nacos")
 
-    monkeypatch.setattr(nodes.hub_client, "list_agents", lambda: [])  # 空在线表
-    called = {"hit": False}
-    monkeypatch.setattr(
-        nodes.hub_client, "list_instances", lambda *a, **k: called.__setitem__("hit", True)
-    )
+    monkeypatch.setattr(nodes.hub_client, "list_agents", _aval([]))  # 空在线表
+    monkeypatch.setattr(nodes.hub_client, "list_instances", _amust_not_call("不在 map 的行不应 fan-out"))
 
     row = client.get("/api/nodes", headers=h).json()["rows"][0]
     assert row["online"] is False
     assert row["healthyCount"] is None
     assert row["degraded"] is False
-    assert called["hit"] is False
 
 
 def test_nodes_no_nacos_name_skips_fanout(client: TestClient, monkeypatch) -> None:
@@ -219,18 +278,14 @@ def test_nodes_no_nacos_name_skips_fanout(client: TestClient, monkeypatch) -> No
     ns = _mk_ns("agent-nonacos")
     _mk_svc(ns, "svc-nonacos", nacos=None)
 
-    monkeypatch.setattr(nodes.hub_client, "list_agents", lambda: [_agent("agent-nonacos")])
-    called = {"hit": False}
-    monkeypatch.setattr(
-        nodes.hub_client, "list_instances", lambda *a, **k: called.__setitem__("hit", True)
-    )
+    monkeypatch.setattr(nodes.hub_client, "list_agents", _aval([_agent("agent-nonacos")]))
+    monkeypatch.setattr(nodes.hub_client, "list_instances", _amust_not_call("无 nacos 名不应 fan-out"))
 
     row = client.get("/api/nodes", headers=h).json()["rows"][0]
     assert row["online"] is True
     assert row["nacosServiceName"] is None
     assert row["healthyCount"] is None
     assert row["degraded"] is False
-    assert called["hit"] is False  # 无 nacos 名不发 fan-out
 
 
 def test_nodes_list_agents_failure_all_offline(client: TestClient, monkeypatch) -> None:
@@ -240,14 +295,8 @@ def test_nodes_list_agents_failure_all_offline(client: TestClient, monkeypatch) 
     _mk_svc(ns, "svc-1", nacos="n1")
     _mk_svc(ns, "svc-2", nacos="n2")
 
-    def boom():
-        raise hc.HubError("hub 整体不可用")
-
-    monkeypatch.setattr(nodes.hub_client, "list_agents", boom)
-    called = {"hit": False}
-    monkeypatch.setattr(
-        nodes.hub_client, "list_instances", lambda *a, **k: called.__setitem__("hit", True)
-    )
+    monkeypatch.setattr(nodes.hub_client, "list_agents", _araise(hc.HubError("hub 整体不可用")))
+    monkeypatch.setattr(nodes.hub_client, "list_instances", _amust_not_call("全离线时不应 fan-out"))
 
     resp = client.get("/api/nodes", headers=h)
     assert resp.status_code == 200  # list_agents 失败不崩整页
@@ -255,7 +304,6 @@ def test_nodes_list_agents_failure_all_offline(client: TestClient, monkeypatch) 
     assert len(rows) == 2
     assert all(r["online"] is False for r in rows)
     assert all(r["healthyCount"] is None and r["degraded"] is False for r in rows)
-    assert called["hit"] is False  # 全离线,无 fan-out
 
 
 def test_nodes_status_non_success_is_degraded(client: TestClient, monkeypatch) -> None:
@@ -264,12 +312,8 @@ def test_nodes_status_non_success_is_degraded(client: TestClient, monkeypatch) -
     ns = _mk_ns("agent-bad")
     _mk_svc(ns, "svc-bad", nacos="bad-nacos")
 
-    monkeypatch.setattr(nodes.hub_client, "list_agents", lambda: [_agent("agent-bad")])
-    monkeypatch.setattr(
-        nodes.hub_client,
-        "list_instances",
-        lambda *a, **k: {"status": "error", "instances": []},
-    )
+    monkeypatch.setattr(nodes.hub_client, "list_agents", _aval([_agent("agent-bad")]))
+    monkeypatch.setattr(nodes.hub_client, "list_instances", _aval({"status": "error", "instances": []}))
 
     row = client.get("/api/nodes", headers=h).json()["rows"][0]
     assert row["degraded"] is True
@@ -283,8 +327,8 @@ def test_nodes_pagination(client: TestClient, monkeypatch) -> None:
     _mk_svc(ns, "svc-p1", nacos="p1")
     _mk_svc(ns, "svc-p2", nacos="p2")
 
-    monkeypatch.setattr(nodes.hub_client, "list_agents", lambda: [_agent("agent-pg")])
-    monkeypatch.setattr(nodes.hub_client, "list_instances", lambda *a, **k: _instances(True))
+    monkeypatch.setattr(nodes.hub_client, "list_agents", _aval([_agent("agent-pg")]))
+    monkeypatch.setattr(nodes.hub_client, "list_instances", _aval(_instances(True)))
 
     body = client.get("/api/nodes?page=1&pageSize=1", headers=h).json()
     assert body["count"] == 2
@@ -304,8 +348,8 @@ def test_nodes_requires_auth(client: TestClient) -> None:
 #
 # 寻址权威源 = 平台 Service 表(dir / nacosServiceName / defaultImage),BFF 不接受客户端
 # 传路径/任意 image。优雅 restart 走 hub /api/rolling-restart;其余 dispatch。
-# requested_by 由 hub 服务端派生 —— BFF **绝不传 X-Requested-By**,只带 admin token
-# (由 hub_client._headers() 注入)。打桩纪律同上:patch nodes.hub_client.* 模块引用。
+# requested_by 由 hub 服务端派生 —— BFF **绝不自报 requested_by**(S5 后进程内 dispatch
+# 固定传 requested_by_hint=None)。打桩纪律同上:patch nodes.hub_client.* 模块引用,替身须 async。
 
 
 def _dispatch_ok(request_id: str = "req-123", accepted: bool = True) -> dict:
@@ -314,9 +358,9 @@ def _dispatch_ok(request_id: str = "req-123", accepted: bool = True) -> dict:
 
 
 def _capture_dispatch(store_box: dict):
-    """返回一个 dispatch_command 替身,把 (agent_id, payload) 记到 store_box 并回成功。"""
+    """返回一个 async dispatch_command 替身,把 (agent_id, payload) 记到 store_box 并回成功。"""
 
-    def _fake(agent_id, payload, **kw):
+    async def _fake(agent_id, payload, **kw):
         store_box["agent_id"] = agent_id
         store_box["payload"] = payload
         return _dispatch_ok()
@@ -333,7 +377,7 @@ def test_op_restart_graceful_uses_rolling(client: TestClient, monkeypatch) -> No
 
     box = {}
 
-    def fake_rolling(agent_id, service_name, force=False, **kw):
+    async def fake_rolling(agent_id, service_name, force=False, **kw):
         box["agent_id"] = agent_id
         box["service_name"] = service_name
         box["force"] = force
@@ -341,9 +385,7 @@ def test_op_restart_graceful_uses_rolling(client: TestClient, monkeypatch) -> No
 
     monkeypatch.setattr(nodes.hub_client, "rolling_restart", fake_rolling)
     # dispatch 不应被调用
-    monkeypatch.setattr(
-        nodes.hub_client, "dispatch_command", lambda *a, **k: (_ for _ in ()).throw(AssertionError("不应调 dispatch"))
-    )
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _amust_not_call("不应调 dispatch"))
 
     resp = client.post("/api/nodes/agent-r/svc-roll/restart", json={"mode": "graceful"}, headers=h)
     assert resp.status_code == 200
@@ -365,9 +407,12 @@ def test_op_restart_default_mode_is_graceful(client: TestClient, monkeypatch) ->
     _mk_svc(ns, "svc-rd", nacos="rd-nacos")
 
     box = {}
-    monkeypatch.setattr(
-        nodes.hub_client, "rolling_restart", lambda a, s, force=False, **k: (box.update(force=force) or {"taskId": "t-rd"})
-    )
+
+    async def fake_rolling(a, s, force=False, **k):
+        box["force"] = force
+        return {"taskId": "t-rd"}
+
+    monkeypatch.setattr(nodes.hub_client, "rolling_restart", fake_rolling)
     resp = client.post("/api/nodes/agent-rd/svc-rd/restart", json={}, headers=h)
     assert resp.status_code == 200
     assert resp.json()["kind"] == "rolling"
@@ -381,7 +426,7 @@ def test_op_restart_graceful_no_nacos_400(client: TestClient, monkeypatch) -> No
     ns = _mk_ns("agent-rn")
     _mk_svc(ns, "svc-rn", nacos=None)
 
-    monkeypatch.setattr(nodes.hub_client, "rolling_restart", lambda *a, **k: {"taskId": "x"})
+    monkeypatch.setattr(nodes.hub_client, "rolling_restart", _aval({"taskId": "x"}))
     resp = client.post("/api/nodes/agent-rn/svc-rn/restart", json={"mode": "graceful"}, headers=h)
     assert resp.status_code == 400
 
@@ -394,9 +439,7 @@ def test_op_restart_force_dispatches_force_restart(client: TestClient, monkeypat
 
     box = {}
     monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch(box))
-    monkeypatch.setattr(
-        nodes.hub_client, "rolling_restart", lambda *a, **k: (_ for _ in ()).throw(AssertionError("force 不应走 rolling"))
-    )
+    monkeypatch.setattr(nodes.hub_client, "rolling_restart", _amust_not_call("force 不应走 rolling"))
 
     resp = client.post("/api/nodes/agent-rf/svc-rf/restart", json={"mode": "force"}, headers=h)
     assert resp.status_code == 200
@@ -459,13 +502,15 @@ def test_op_stop_graceful_derives_health_base_url(client: TestClient, monkeypatc
     monkeypatch.setattr(
         nodes.hub_client,
         "list_instances",
-        lambda agent_id, service_name, **kw: {
-            "status": "success",
-            "instances": [
-                {"address": "10.0.0.0", "healthy": False, "matched": True},
-                {"address": "10.0.0.1", "healthy": True, "matched": True},
-            ],
-        },
+        _aval(
+            {
+                "status": "success",
+                "instances": [
+                    {"address": "10.0.0.0", "healthy": False, "matched": True},
+                    {"address": "10.0.0.1", "healthy": True, "matched": True},
+                ],
+            }
+        ),
     )
     resp = client.post("/api/nodes/agent-sg/svc-sg/stop", json={"mode": "graceful"}, headers=h)
     assert resp.status_code == 200
@@ -492,13 +537,15 @@ def test_op_stop_graceful_picks_matched_not_index_zero(client: TestClient, monke
     monkeypatch.setattr(
         nodes.hub_client,
         "list_instances",
-        lambda agent_id, service_name, **kw: {
-            "status": "success",
-            "instances": [
-                {"address": "10.9.9.9", "healthy": True, "matched": False},  # 别节点,不可 drain
-                {"address": "10.0.0.5", "healthy": True, "matched": True},  # 本机
-            ],
-        },
+        _aval(
+            {
+                "status": "success",
+                "instances": [
+                    {"address": "10.9.9.9", "healthy": True, "matched": False},  # 别节点,不可 drain
+                    {"address": "10.0.0.5", "healthy": True, "matched": True},  # 本机
+                ],
+            }
+        ),
     )
     resp = client.post("/api/nodes/agent-mx/svc-mx/stop", json={"mode": "graceful"}, headers=h)
     assert resp.status_code == 200
@@ -515,14 +562,9 @@ def test_op_stop_graceful_only_unmatched_409(client: TestClient, monkeypatch) ->
     monkeypatch.setattr(
         nodes.hub_client,
         "list_instances",
-        lambda *a, **k: {
-            "status": "success",
-            "instances": [{"address": "10.9.9.9", "healthy": True, "matched": False}],  # 仅别节点
-        },
+        _aval({"status": "success", "instances": [{"address": "10.9.9.9", "healthy": True, "matched": False}]}),
     )
-    monkeypatch.setattr(
-        nodes.hub_client, "dispatch_command", lambda *a, **k: (_ for _ in ()).throw(AssertionError("无本机实例不应 dispatch"))
-    )
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _amust_not_call("无本机实例不应 dispatch"))
     resp = client.post("/api/nodes/agent-um/svc-um/stop", json={"mode": "graceful"}, headers=h)
     assert resp.status_code == 409
 
@@ -541,11 +583,11 @@ def test_op_stop_graceful_passes_expected_compose_project(client: TestClient, mo
 
     captured = {}
 
-    def fake_list_instances(agent_id, service_name, expected_compose_project=None, **kw):
+    def sync_list_instances(agent_id, service_name, expected_compose_project=None, **kw):
         captured["expected"] = expected_compose_project
         return {"status": "success", "instances": [{"address": "10.0.0.3", "healthy": True, "matched": True}]}
 
-    monkeypatch.setattr(nodes.hub_client, "list_instances", fake_list_instances)
+    monkeypatch.setattr(nodes.hub_client, "list_instances", _afn(sync_list_instances))
     monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch({}))
 
     resp = client.post("/api/nodes/agent-ecp/svc-ecp/stop", json={"mode": "graceful"}, headers=h)
@@ -562,11 +604,9 @@ def test_op_stop_graceful_no_healthy_409(client: TestClient, monkeypatch) -> Non
     monkeypatch.setattr(
         nodes.hub_client,
         "list_instances",
-        lambda *a, **k: {"status": "success", "instances": [{"address": "10.0.0.0", "healthy": False}]},
+        _aval({"status": "success", "instances": [{"address": "10.0.0.0", "healthy": False}]}),
     )
-    monkeypatch.setattr(
-        nodes.hub_client, "dispatch_command", lambda *a, **k: (_ for _ in ()).throw(AssertionError("无健康实例不应 dispatch"))
-    )
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _amust_not_call("无健康实例不应 dispatch"))
     resp = client.post("/api/nodes/agent-sg0/svc-sg0/stop", json={"mode": "graceful"}, headers=h)
     assert resp.status_code == 409
 
@@ -577,9 +617,7 @@ def test_op_stop_graceful_no_nacos_400(client: TestClient, monkeypatch) -> None:
     ns = _mk_ns("agent-sgn")
     _mk_svc(ns, "svc-sgn", nacos=None)
 
-    monkeypatch.setattr(
-        nodes.hub_client, "list_instances", lambda *a, **k: (_ for _ in ()).throw(AssertionError("无 nacos 不应查实例"))
-    )
+    monkeypatch.setattr(nodes.hub_client, "list_instances", _amust_not_call("无 nacos 不应查实例"))
     resp = client.post("/api/nodes/agent-sgn/svc-sgn/stop", json={"mode": "graceful"}, headers=h)
     assert resp.status_code == 400
 
@@ -622,7 +660,7 @@ def test_op_redeploy_graceful_derives_health_and_image(client: TestClient, monke
     monkeypatch.setattr(
         nodes.hub_client,
         "list_instances",
-        lambda *a, **k: {"status": "success", "instances": [{"address": "10.0.0.7", "healthy": True, "matched": True}]},
+        _aval({"status": "success", "instances": [{"address": "10.0.0.7", "healthy": True, "matched": True}]}),
     )
     resp = client.post("/api/nodes/agent-rdg/svc-rdg/redeploy", json={"mode": "graceful"}, headers=h)
     assert resp.status_code == 200
@@ -644,9 +682,7 @@ def test_op_redeploy_force_no_default_image_400(client: TestClient, monkeypatch)
         Service,
         {"namespace_id": ns, "service_code": "svc-rdni", "dir": "/opt/svc-rdni", "default_image": None, "nacos_service_name": "rdni-nacos"},
     )
-    monkeypatch.setattr(
-        nodes.hub_client, "dispatch_command", lambda *a, **k: (_ for _ in ()).throw(AssertionError("无 image 不应 dispatch"))
-    )
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _amust_not_call("无 image 不应 dispatch"))
     resp = client.post("/api/nodes/agent-rdni/svc-rdni/redeploy", json={"mode": "force"}, headers=h)
     assert resp.status_code == 400
 
@@ -659,9 +695,7 @@ def test_op_redeploy_graceful_no_default_image_400(client: TestClient, monkeypat
         Service,
         {"namespace_id": ns, "service_code": "svc-rdgn", "dir": "/opt/svc-rdgn", "default_image": None, "nacos_service_name": "rdgn-nacos"},
     )
-    monkeypatch.setattr(
-        nodes.hub_client, "list_instances", lambda *a, **k: (_ for _ in ()).throw(AssertionError("无 image 应先 400,不查实例"))
-    )
+    monkeypatch.setattr(nodes.hub_client, "list_instances", _amust_not_call("无 image 应先 400,不查实例"))
     resp = client.post("/api/nodes/agent-rdgn/svc-rdgn/redeploy", json={"mode": "graceful"}, headers=h)
     assert resp.status_code == 400
 
@@ -673,13 +707,8 @@ def test_op_stop_graceful_list_instances_failure_502(client: TestClient, monkeyp
     ns = _mk_ns("agent-sgf")
     _mk_svc(ns, "svc-sgf", nacos="sgf-nacos")
 
-    def boom(*a, **k):
-        raise hc.HubError("hub list-instances 内部细节-勿泄漏")
-
-    monkeypatch.setattr(nodes.hub_client, "list_instances", boom)
-    monkeypatch.setattr(
-        nodes.hub_client, "dispatch_command", lambda *a, **k: (_ for _ in ()).throw(AssertionError("派生失败不应 dispatch"))
-    )
+    monkeypatch.setattr(nodes.hub_client, "list_instances", _araise(hc.HubError("hub list-instances 内部细节-勿泄漏")))
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _amust_not_call("派生失败不应 dispatch"))
     resp = client.post("/api/nodes/agent-sgf/svc-sgf/stop", json={"mode": "graceful"}, headers=h)
     assert resp.status_code == 502
     assert "勿泄漏" not in resp.text  # 脱敏:不回显内部异常文案
@@ -691,13 +720,8 @@ def test_op_redeploy_graceful_list_instances_timeout_502(client: TestClient, mon
     ns = _mk_ns("agent-rgf")
     _mk_svc(ns, "svc-rgf", nacos="rgf-nacos")
 
-    def boom(*a, **k):
-        raise httpx.TimeoutException("connect timeout 内部细节-勿泄漏")
-
-    monkeypatch.setattr(nodes.hub_client, "list_instances", boom)
-    monkeypatch.setattr(
-        nodes.hub_client, "dispatch_command", lambda *a, **k: (_ for _ in ()).throw(AssertionError("派生失败不应 dispatch"))
-    )
+    monkeypatch.setattr(nodes.hub_client, "list_instances", _araise(asyncio.TimeoutError("connect timeout 内部细节-勿泄漏")))
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _amust_not_call("派生失败不应 dispatch"))
     resp = client.post("/api/nodes/agent-rgf/svc-rgf/redeploy", json={"mode": "graceful"}, headers=h)
     assert resp.status_code == 502
     assert "勿泄漏" not in resp.text
@@ -738,10 +762,7 @@ def test_op_dispatch_failure_maps_502(client: TestClient, monkeypatch) -> None:
     ns = _mk_ns("agent-502")
     _mk_svc(ns, "svc-502", nacos="n502")
 
-    def boom(*a, **k):
-        raise hc.HubError("内部 hub 细节-不该泄漏")
-
-    monkeypatch.setattr(nodes.hub_client, "dispatch_command", boom)
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _araise(hc.HubError("内部 hub 细节-不该泄漏")))
     resp = client.post("/api/nodes/agent-502/svc-502/start", json={}, headers=h)
     assert resp.status_code == 502
     assert "内部 hub 细节" not in resp.text  # 脱敏:不回显内部消息
@@ -753,12 +774,10 @@ def test_op_rolling_failure_maps_502(client: TestClient, monkeypatch) -> None:
     ns = _mk_ns("agent-r502")
     _mk_svc(ns, "svc-r502", nacos="nr502")
 
-    monkeypatch.setattr(
-        nodes.hub_client, "rolling_restart", lambda *a, **k: (_ for _ in ()).throw(httpx.ConnectError("connrefused-内部"))
-    )
+    monkeypatch.setattr(nodes.hub_client, "rolling_restart", _araise(hc.HubError("rolling 内部细节-勿泄漏")))
     resp = client.post("/api/nodes/agent-r502/svc-r502/restart", json={"mode": "graceful"}, headers=h)
     assert resp.status_code == 502
-    assert "connrefused-内部" not in resp.text
+    assert "勿泄漏" not in resp.text
 
 
 def test_op_requires_auth(client: TestClient) -> None:
@@ -810,12 +829,12 @@ def test_node_operations_lists_audit_envelope(client: TestClient, monkeypatch) -
 
     box = {}
 
-    def fake_list_commands(page, page_size, **kw):
+    def sync_list_commands(page, page_size, **kw):
         box["page"] = page
         box["page_size"] = page_size
         return _hub_commands(total=3, items=[_cmd_row("c1"), _cmd_row("c2")], limit=page_size, offset=0)
 
-    monkeypatch.setattr(nodes.hub_client, "list_commands", fake_list_commands)
+    monkeypatch.setattr(nodes.hub_client, "list_commands", _afn(sync_list_commands))
 
     body = client.get("/api/node-operations?page=1&pageSize=2", headers=h).json()
     assert box["page"] == 1 and box["page_size"] == 2
@@ -846,8 +865,10 @@ def test_node_operations_truncates_output(client: TestClient, monkeypatch) -> No
     monkeypatch.setattr(
         nodes.hub_client,
         "list_commands",
-        lambda page, page_size, **kw: _hub_commands(
-            total=1, items=[_cmd_row("ct", output=long_out, error=long_err)], limit=page_size, offset=0
+        _afn(
+            lambda page, page_size, **kw: _hub_commands(
+                total=1, items=[_cmd_row("ct", output=long_out, error=long_err)], limit=page_size, offset=0
+            )
         ),
     )
     row = client.get("/api/node-operations", headers=h).json()["rows"][0]
@@ -869,8 +890,10 @@ def test_node_operations_truncate_boundary(client: TestClient, monkeypatch) -> N
     monkeypatch.setattr(
         nodes.hub_client,
         "list_commands",
-        lambda page, page_size, **kw: _hub_commands(
-            total=1, items=[_cmd_row("cb", output=exact, error=over)], limit=page_size, offset=0
+        _afn(
+            lambda page, page_size, **kw: _hub_commands(
+                total=1, items=[_cmd_row("cb", output=exact, error=over)], limit=page_size, offset=0
+            )
         ),
     )
     row = client.get("/api/node-operations", headers=h).json()["rows"][0]
@@ -887,10 +910,7 @@ def test_node_operations_hub_failure_502(client: TestClient, monkeypatch) -> Non
     # hub 调用失败 → 502 脱敏。
     h = _h(client)
 
-    def boom(*a, **k):
-        raise hc.HubError("hub 列表内部错误-勿泄漏")
-
-    monkeypatch.setattr(nodes.hub_client, "list_commands", boom)
+    monkeypatch.setattr(nodes.hub_client, "list_commands", _araise(hc.HubError("hub 列表内部错误-勿泄漏")))
     resp = client.get("/api/node-operations", headers=h)
     assert resp.status_code == 502
     assert "勿泄漏" not in resp.text

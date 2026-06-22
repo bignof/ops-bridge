@@ -79,8 +79,7 @@ docker run -d --name service-platform \
 | `PLATFORM_JWT_SECRET`      | 【生产必改】JWT 签名密钥,**须 ≥32 字符,否则启动即被拒绝**          | 空串                            |
 | `PLATFORM_JWT_TTL`         | JWT 有效期(秒)                                                     | `28800`(8h)                   |
 | `PLATFORM_ENABLE_DOCS`     | 在线接口文档(`/docs` `/redoc` `/openapi.json`)开关,默认关(生产安全) | `false`                         |
-| `SERVICE_HUB_URL`          | 外部 service-hub 地址(命名空间 provision / rotate)                 | 空串                            |
-| `HUB_ADMIN_TOKEN`          | 【生产必改】调用 service-hub 的管理令牌,仅服务端持有,绝不下发浏览器 | 空串                            |
+| `ADMIN_TOKEN`              | 【生产必改】hub 控制链(`/api/agents`、`/api/commands`、agent-WS)管理令牌,仅服务端持有,绝不下发浏览器(S5:hub 已并入本进程,原 `SERVICE_HUB_URL`/`HUB_ADMIN_TOKEN` 已删除,provision/rotate 改进程内直调) | 空串                            |
 | `PLUGIN_STORAGE_DIR`       | 插件包 `.tgz` 落盘目录(生产须挂卷 / 共享存储)                      | `./data/plugins`                |
 | `PLUGIN_DOWNLOAD_BASE_URL` | 分发响应 `url` 前缀                                                  | 空串                            |
 | `PLUGIN_MAX_UPLOAD_BYTES`  | 应用层单包上传字节上限(由 `app/routers/plugin_versions.py` 直接读,非 config.py) | `209715200`(200MB)           |
@@ -99,7 +98,10 @@ docker run -d --name service-platform \
   各部署节点 / service-agent ── 用本命名空间 pull token 拉包(sync-plugins.js)
 ```
 
-- **平台 → hub**:命名空间的 provision / rotate 由本平台经 `SERVICE_HUB_URL` + `HUB_ADMIN_TOKEN` 调 service-hub 完成;hub 在签发 / 轮换时一次性返回 pull token 与 agent key(show-once,平台不留明文)。
+- **平台 → hub**:命名空间的 provision / rotate 由本平台完成。**S5:hub 已并入本进程**(`app/hub/`),
+  该调用从「经 `SERVICE_HUB_URL` + `HUB_ADMIN_TOKEN` 的跨进程 HTTP 跳」改为 **进程内直调**(`app/hub_client.py`);
+  hub 在签发 / 轮换时一次性返回 pull token 与 agent key(show-once,平台不留明文)。
+  > 注:本节示意图沿用并入前「platform/hub 两服务」拓扑,部署形态的统一描述待部署侧文档随合并整体更新。
 - **节点 → 平台**:各部署节点用其命名空间的 pull token(`Authorization: Bearer <plain>`)调本平台 `/api/distribution/*` 拉取本命名空间的已发布插件包;token 不属该命名空间一律拒绝,下载走 id 归属式校验防越权(IDOR)。
 - service-hub 自身是面向 agent 的控制服务(WebSocket 接入 + 下发 compose 指令),与本平台是两个独立服务,详见 `../service-hub/README.md`。
 

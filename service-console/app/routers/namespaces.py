@@ -7,17 +7,17 @@ DELETE 204)。约束:
 - **唯一冲突 → 409**:`store.Conflict` 捕获后抛 `HTTPException(409)`。
 - **纵深防御**:逐路由 `Depends(require_session)` 保留;`/api/` 前缀下中间件已先挡无/坏 JWT。
 - **列表回名(评审 H3)**:返回 `id/code/name`,`name` 空回退 `code`(在线/心跳 P2 实时读 hub 填,本任务留空)。
-- **create 特例(评审 H7 / show-once)**:先 `hub_client.provision_agent(code)` 取 agentKey,
+- **create 特例(评审 H7 / show-once)**:先 `await hub_client.provision_agent(code)` 取 agentKey,
   **仅一次性放进 create 响应 `agentKey` 字段、不入库**;库里无该列,后续重查不含明文。
   > 这里**经模块引用** `hub_client.provision_agent(...)` 调用(而非 `from ... import provision_agent`),
   > 故测试 `monkeypatch.setattr(hub_client, "provision_agent", ...)` 能生效(评审 H7 同款打桩)。
+  > S5:`hub_client.*` 已改进程内 async,调用点 `await`,测试替身须为 **async**(返回 coroutine)。
 """
 
 from __future__ import annotations
 
 import math
 
-import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 
 from app import hub_client, store, tokens
@@ -40,11 +40,12 @@ router = APIRouter(prefix="/api/namespaces", tags=["命名空间台账"])
 def _raise_hub_unavailable(exc: Exception) -> None:
     """把 hub 调用异常统一映射成稳定的平台错误码(评审 A13,spec L103)。
 
-    - `hub_client.HubError`(配置缺失 / hub 业务性失败,如未返回 agentKey)→ **502 Bad Gateway**。
-    - `httpx.HTTPError`(连接 / 超时 / 非 2xx 等传输层错误)→ **503 Service Unavailable**。
+    S5 进程内化后,hub 调用不再有传输层(httpx):`hub_client.provision_agent` / `rotate_agent_key`
+    把 hub 逻辑层任意失败(handler 抛 HTTPException、响应缺 agentKey 等)统一归一化为 `HubError`,
+    故主路径只剩 `HubError → 502`。仍保留一条 503 兜底分支:防御未预期的非 HubError 异常逃逸成裸 500。
 
-    detail 用**固定中文文案**,绝不回显 hub URL 或底层异常细节(`str(exc)` 可能含
-    内部地址 / token 痕迹);原始异常仅经 `raise ... from exc` 留在服务端堆栈,不出网。
+    detail 用**固定中文文案**,绝不回显底层异常细节(`str(exc)` 可能含内部痕迹);原始异常仅经
+    `raise ... from exc` 留在服务端堆栈,不出网。
     """
     if isinstance(exc, hub_client.HubError):
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "服务编排中心(service-hub)暂不可用,请稍后重试") from exc
@@ -85,10 +86,11 @@ async def create_namespace(
         raise HTTPException(status.HTTP_409_CONFLICT, "namespace code already exists")
     # 经模块引用调用,使测试 monkeypatch.setattr(hub_client, "provision_agent", ...) 生效(评审 H7)。
     # 评审 A14:provision 失败必须**补偿删除**刚建的台账行(整体原子失败),否则遗留无 agentKey
-    # 的孤儿 namespace(show-once 永久丢)。评审 A13:hub 异常统一映射 502/503,不回显内部细节。
+    # 的孤儿 namespace(show-once 永久丢)。评审 A13:hub 异常统一映射 502,不回显内部细节。
+    # S5:provision_agent 改进程内 async → await;失败统一归一化为 HubError(不再有 httpx 传输异常)。
     try:
-        agent_key = hub_client.provision_agent(record.code)
-    except (hub_client.HubError, httpx.HTTPError) as exc:
+        agent_key = await hub_client.provision_agent(record.code)
+    except hub_client.HubError as exc:
         store.delete_row(Namespace, record.id)  # 补偿:回收刚建的孤儿行
         _raise_hub_unavailable(exc)
     return NamespaceCreateOut(
@@ -147,10 +149,11 @@ async def rotate_namespace_key(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "namespace not found")
     # 经模块引用调用,使测试 monkeypatch.setattr(hub_client, "rotate_agent_key", ...) 生效(同 create 的 H7 打桩)。
     # 新 agentKey 仅放进本次响应、不入库(库无该列),守 show-once 不变式。
-    # 评审 A13:hub 异常统一映射 502/503,不回显 hub URL / 内部细节(rotate 无新建行,无需补偿)。
+    # 评审 A13:hub 异常统一映射 502,不回显内部细节(rotate 无新建行,无需补偿)。
+    # S5:rotate_agent_key 改进程内 async → await;失败统一归一化为 HubError。
     try:
-        agent_key = hub_client.rotate_agent_key(record.code)
-    except (hub_client.HubError, httpx.HTTPError) as exc:
+        agent_key = await hub_client.rotate_agent_key(record.code)
+    except hub_client.HubError as exc:
         _raise_hub_unavailable(exc)
     return NamespaceRotateKeyOut(agent_key=agent_key)
 

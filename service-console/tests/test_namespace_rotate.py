@@ -1,11 +1,11 @@
 """命名空间 rotate-key / rotate-pull-token 端到端测试(Task 7)。
 
-经 conftest 的 `client` fixture(临时文件库 + swap 单例 + 置空 service_hub_url)。两条
+经 conftest 的 `client` fixture(临时文件库 + swap 单例 + hub_state 接线 + admin_token 测试值)。两条
 轮换端点均 **show-once**——明文仅本次响应可得,平台不落地明文:
 
-- `rotate-key`:调 hub `rotate_agent_key` 取新 agentKey,**不入库**。必须打桩
-  `hub_client.rotate_agent_key`(否则 service_hub_url 未配 → HubError → 500)。
-  断言响应含 `agentKey`、库内查不到该明文。
+- `rotate-key`:调 hub `rotate_agent_key` 取新 agentKey,**不入库**。用 **async 桩**
+  `hub_client.rotate_agent_key`(S5 后 hub_client.* 是 async)隔离 hub,断言响应含 `agentKey`、
+  库内查不到该明文。
 - `rotate-pull-token`:本地 `tokens.new_pull_token()` 生成,**只把哈希写
   `namespace.pull_token_hash`**。断言响应含 `pullToken` 明文,重查行
   `pull_token_hash != 明文` 且 `verify_token(明文, hash) is True`(哈希入库、明文不入库)。
@@ -26,9 +26,18 @@ def _h(client: TestClient) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _async_return(value):
+    """造一个 async 替身:被 await 时返回 value(S5 后 hub_client.* 是 async,桩须返回 coroutine)。"""
+
+    async def _stub(*a, **k):
+        return value
+
+    return _stub
+
+
 def _new_ns(client: TestClient, monkeypatch, code: str = "ns-rot") -> int:
     """建一个 namespace 并回 id;create 需打桩 provision_agent(见 Task 6b)。"""
-    monkeypatch.setattr(hc, "provision_agent", lambda c: "prov-key")
+    monkeypatch.setattr(hc, "provision_agent", _async_return("prov-key"))
     r = client.post("/api/namespaces", json={"code": code}, headers=_h(client))
     assert r.status_code == 201
     return r.json()["id"]
@@ -68,8 +77,8 @@ def test_rotate_pull_token_replaces_previous(client: TestClient, monkeypatch) ->
 
 def test_rotate_key_returns_once_and_not_stored(client: TestClient, monkeypatch) -> None:
     nid = _new_ns(client, monkeypatch, code="ns-rk")
-    # rotate-key 必须打桩(否则 service_hub_url 未配 → HubError → 500)。
-    monkeypatch.setattr(hc, "rotate_agent_key", lambda code: "rotated-key")
+    # rotate-key 打桩隔离 hub(否则真跑进程内 rotate;此处只验 show-once 不入库语义)。
+    monkeypatch.setattr(hc, "rotate_agent_key", _async_return("rotated-key"))
     h = _h(client)
 
     r = client.post(f"/api/namespaces/{nid}/rotate-key", headers=h)
@@ -88,7 +97,7 @@ def test_rotate_key_passes_code_to_hub(client: TestClient, monkeypatch) -> None:
     nid = _new_ns(client, monkeypatch, code="agent-rot")
     seen: dict = {}
 
-    def fake_rotate(code: str) -> str:
+    async def fake_rotate(code: str) -> str:
         seen["code"] = code
         return "k2"
 
@@ -103,7 +112,7 @@ def test_rotate_key_missing_namespace_404(client: TestClient, monkeypatch) -> No
     # 用记录调用的桩(非 no-op),断言 404 分支 hub 一次都没被调(calls==[])。
     calls: list[str] = []
 
-    def stub(code: str) -> str:
+    async def stub(code: str) -> str:
         calls.append(code)
         return "k"
 

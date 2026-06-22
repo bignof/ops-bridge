@@ -14,8 +14,9 @@ class Settings:
     # 评审 A15/B3:/openapi.json /docs /redoc 不在 /api 前缀下,default-deny 中间件不覆盖,
     # 开着即匿名暴露全 API 面。默认 false(生产安全);本机调试可设 PLATFORM_ENABLE_DOCS=true。
     enable_docs: bool = os.getenv("PLATFORM_ENABLE_DOCS", "false").strip().lower() in ("1", "true", "yes", "on")
-    service_hub_url: str = os.getenv("SERVICE_HUB_URL", "")
-    hub_admin_token: str = os.getenv("HUB_ADMIN_TOKEN", "")
+    # S5:删除 service_hub_url / hub_admin_token —— hub 已并入本进程(app/hub/),platform→hub
+    # 改进程内直调(app/hub_client.py),不再经 SERVICE_HUB_URL + X-Admin-Token 的 HTTP 跳。
+    # hub 控制链对外 HTTP 入口仍由下方 admin_token(ADMIN_TOKEN)自校验。
     plugin_storage_dir: str = os.getenv("PLUGIN_STORAGE_DIR", "./data/plugins")
     plugin_download_base_url: str = os.getenv("PLUGIN_DOWNLOAD_BASE_URL", "")
     # ── 并入的 hub 配置(S3;原 service-hub/app/config.py)──
