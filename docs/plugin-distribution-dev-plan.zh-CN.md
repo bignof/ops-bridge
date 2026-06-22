@@ -84,7 +84,7 @@ P4 的 publish→自动滚动 依赖 §4.1 协调器(同批,不可早于它)
 
 | ID | 任务 | 仓库 / 模块 | 前置 | 验收 |
 | --- | --- | --- | --- | --- |
-| P3-1 | **docker「含 stopped」采集**(评审 H3,现零实现):新增 `docker ps -a`/`compose ls -a` + label 过滤;组装 `[{nacosService, composeProject, containerName, dir, image, host, running, healthy}]` | service-agent(`docker_cli.py`/发现) | P0 | 已停容器也能被发现/管理 |
+| **P3-1 ✓** | **docker「含 stopped」采集**(评审 H3):`docker_cli.list_all_containers`(`docker ps -aq`+inspect)+ `discovery.collect_local_containers`(compose label 过滤 + managed_root 限定)组装 `[{containerId, containerName, composeProject, composeService, dir, image, running}]`;nacosService/healthy/host 由 P3-3 结合 nacos 补。**已停容器**(exited 未删)即覆盖;`compose ls -a`(容器已 down 删除的零容器工程)如需再补 | service-agent `docker_cli.py` + 新 `discovery.py` | P0 | **已完成**(227 测试绿,覆盖率 97.86%) |
 | P3-2 | **instance→agent 映射 + 落位防错**(评审 M3;`instance_match.py` **改既有**——已存在含 `match_instance`/`compose_project`):匹配带 `composeProject` 上报、console 校验唯一性;「一容器多实例/一实例多容器」冲突检测告警;钉清 nacos 注册端口语义 | service-agent(`instance_match.py` 改)+ service-console | P3-1 | admin/2admin 不张冠李戴 |
 | P3-3 | **agent 周期发现上报线程**(评审 H-6,现 agent 纯被动模型无出站定时器):参 `ws_client._start_heartbeat` 模式,每 N 秒调 docker(含 stopped)+nacos+instance_match 组装清单,经当前 WS `send` 主动上报;线程与 WS 重连生命周期耦合(连上才报、断线暂停);上报 type 名与 P3-4 接收端对齐 | service-agent(`ws_client`/新发现线程) | P3-1, P3-2 | agent 连上后周期上报发现清单 |
 | P3-4 | **console 接收发现上报 + 落库 + 心跳**:**标 `stale`/`unknown` 不删行**(评审 M8),显式确认下线才删 | service-console(store + 新消息类型) | M, P3-3 | agent 失联节点保留可定位 |
