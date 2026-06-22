@@ -6,7 +6,7 @@ from dataclasses import dataclass
 class Settings:
     host: str = os.getenv("HOST", "0.0.0.0")
     port: int = int(os.getenv("PORT", "8080"))
-    database_url: str = os.getenv("DATABASE_URL", "sqlite:///./service-platform.db")
+    database_url: str = os.getenv("DATABASE_URL", "sqlite:///./service-console.db")
     admin_user: str = os.getenv("PLATFORM_ADMIN_USER", "")
     admin_password: str = os.getenv("PLATFORM_ADMIN_PASSWORD", "")
     jwt_secret: str = os.getenv("PLATFORM_JWT_SECRET", "")

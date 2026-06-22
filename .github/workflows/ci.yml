@@ -100,12 +100,12 @@ jobs:
       - name: Build Docker image
         run: docker build -t service-hub:ci .
 
-  service-platform:
+  service-console:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
       run:
-        working-directory: service-platform
+        working-directory: service-console
 
     steps:
       - name: Checkout repository
@@ -123,7 +123,7 @@ jobs:
         run: python -m compileall app migrations
 
       - name: Import smoke test
-        run: python -c "import sys; sys.path.insert(0, '.'); import app.main; print('service-platform import ok')"
+        run: python -c "import sys; sys.path.insert(0, '.'); import app.main; print('service-console import ok')"
 
       - name: Validate Alembic upgrade
         run: |
@@ -147,14 +147,14 @@ jobs:
         run: python -m pytest -p pytest_cov --cov=app --cov-report=term-missing --cov-fail-under=94 -q
 
       - name: Build Docker image
-        run: docker build -t service-platform:ci .
+        run: docker build -t service-console:ci .
 
-  service-platform-web:
+  service-console-web:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
       run:
-        working-directory: service-platform/web
+        working-directory: service-console/web
 
     steps:
       - name: Checkout repository

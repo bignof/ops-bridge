@@ -1,1 +1,0 @@
-"""service-platform application package."""

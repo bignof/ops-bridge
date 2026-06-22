@@ -52,7 +52,7 @@ _docs_kwargs = (
     if settings.enable_docs
     else {"docs_url": None, "redoc_url": None, "openapi_url": None}
 )
-app = FastAPI(title="service-platform", version="0.1.0", lifespan=lifespan, **_docs_kwargs)
+app = FastAPI(title="service-console", version="0.1.0", lifespan=lifespan, **_docs_kwargs)
 
 # ── 中间件注册 ───────────────────────────────────────────────────────────────────
 # ⚠️ add_middleware **逆序**生效(最后 add 的在**最外层**先跑)。期望的链(外→内):

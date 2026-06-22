@@ -1,0 +1,1 @@
+"""service-console application package."""
