@@ -13,6 +13,7 @@ import {
   LogoutOutlined,
   PartitionOutlined,
   RocketOutlined,
+  SyncOutlined,
   UserOutlined,
 } from '@ant-design/icons';
 import { useAuth } from '../auth/AuthContext';
@@ -22,7 +23,7 @@ const { Header, Sider, Content } = Layout;
 // 左侧栏三组菜单:
 //   配置:命名空间 / 服务 / 插件 / 服务插件
 //   发布:插件上传 / 插件发布 / 获取记录
-//   运维:节点(启停重启重部署 + 二次确认) / 操作审计(只读命令审计)
+//   运维:服务对账(意图⋈现实,纳管收件箱) / 实例(发现只读) / 节点(启停重启重部署 + 二次确认) / 操作审计(只读命令审计)
 // key 即对应路由 path(供 createHashRouter 的 children 挂载)。
 const MENU_ITEMS: MenuProps['items'] = [
   {
@@ -51,6 +52,7 @@ const MENU_ITEMS: MenuProps['items'] = [
     label: '运维',
     type: 'group',
     children: [
+      { key: '/reconciliation', icon: <SyncOutlined />, label: '服务对账' },
       { key: '/instances', icon: <DesktopOutlined />, label: '实例' },
       { key: '/nodes', icon: <ClusterOutlined />, label: '节点' },
       { key: '/node-operations', icon: <AuditOutlined />, label: '操作审计' },

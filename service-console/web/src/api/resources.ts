@@ -180,6 +180,59 @@ export async function listInstances<T = InstanceRow>(
   return list<T>('nodes/instances', params);
 }
 
+// ── 服务对账(reconciliation,意图 Service ⋈ 现实发现实例 by nacosServiceName)────────────
+// 对账页 = 把「意图」(平台 Service 台账)与「现实」(agent 发现的实例)按 nacosServiceName 关联,
+// 实时算出三态(后端不落表、不分页,直接回全集)。纳管动作**无专用端点**:= 预填 namespace +
+// nacosServiceName 后调既有 `create('services', ...)` 建 Service,成功后该项即从「已发现未纳管」消失。
+
+/**
+ * 「已发现未纳管」收件箱一项(对齐后端 UnmanagedServiceOut,全 camelCase)。
+ * 在跑但其 `nacosService` ∉ 任何 Service.nacosServiceName → 待纳管。同一 nacosService 跨多 agent
+ * 聚成一项:`agentIds` 汇总所有承载该服务的 agent(= 命名空间 code),`instanceCount` 为该服务
+ * 跨 agent 的 active 发现实例合计。纳管时用 `nacosService` 预填新建 Service 的 serviceCode/nacosServiceName。
+ */
+export interface UnmanagedServiceRow {
+  nacosService: string;
+  /** 承载该服务的 agent 列表(= 命名空间 code);纳管表单据此预选命名空间。 */
+  agentIds: string[];
+  /** 该 nacosService 下 active 发现实例总数(跨 agent 合计)。 */
+  instanceCount: number;
+}
+
+/**
+ * 「纳管了但没实例」一项(对齐后端 ManagedDownServiceOut,全 camelCase)。
+ * Service.nacosServiceName 非空,却无任何 active 发现实例匹配 → 「该起没起」。
+ * `namespaceCode` 可空(无关联命名空间时,列显「-」)。
+ */
+export interface ManagedDownServiceRow {
+  serviceCode: string;
+  nacosServiceName: string;
+  /** 所属命名空间 code;可空(列显「-」)。 */
+  namespaceCode: string | null;
+}
+
+/**
+ * 服务对账响应(对齐后端 ReconciliationOut,全 camelCase)。
+ * - `runningButUnmanaged`:已发现未纳管(收件箱)。
+ * - `managedButDown`:纳管了但没活跃实例(该起没起)。
+ * - `versionDrift`:**本期恒空**(DiscoveredNode 暂无实例携带的插件版本字段,无从比对);
+ *   类型留 `unknown[]` 占位,待后端实现后再细化(前端本期仅展示「暂无」占位)。
+ */
+export interface ReconciliationResult {
+  runningButUnmanaged: UnmanagedServiceRow[];
+  managedButDown: ManagedDownServiceRow[];
+  versionDrift: unknown[];
+}
+
+/**
+ * 服务对账:GET /api/nodes/reconciliation。后端实时计算、**不分页**(直接回三态全集)。
+ * 失败由调用页自行兜底(本端点为只读拉取,全局兜底 toast 已由 client 拦截器统一处理)。
+ */
+export async function getReconciliation(): Promise<ReconciliationResult> {
+  const r = await client.get<ReconciliationResult>('/api/nodes/reconciliation');
+  return r.data;
+}
+
 /**
  * 新建:POST /api/<resource>(201)。返回响应体(可能含 show-once 明文)。
  * `suppressGlobalError`:CrudTable 对 409「编码已存在」本地精确提示,故 opt-out 全局兜底防双 toast。
