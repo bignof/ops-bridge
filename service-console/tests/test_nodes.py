@@ -1322,3 +1322,177 @@ def test_list_instances_paginates(client: TestClient) -> None:
 
 def test_list_instances_requires_auth(client: TestClient) -> None:
     assert client.get("/api/nodes/instances").status_code == 401
+
+
+# =====================================================================================
+# P4-0:跨机聚合 store.aggregate_discovered_by_nacos
+# =====================================================================================
+#
+# 按 nacos_service 把 active 发现实例分组(同 nacosService 跨多 agent 聚成一组);nacos_service 为
+# None 的行跳过;status 过滤(默认 active,None 取全集)。供服务对账(P3-7)与将来跨 agent 投放复用。
+
+
+def test_aggregate_discovered_by_nacos_groups_across_agents(client: TestClient) -> None:
+    # 同一 nacosService 跨两个 agent 各一实例 → 聚成一组(list 含两 agent 的行,评审 H-5)。
+    _mk_discovered("agent-a", "shared-nacos", container_name="a-1", dir_="/srv/a")
+    _mk_discovered("agent-b", "shared-nacos", container_name="b-1", dir_="/srv/b")
+    _mk_discovered("agent-a", "other-nacos", container_name="a-2", dir_="/srv/c")
+
+    grouped = store.aggregate_discovered_by_nacos()
+    assert set(grouped.keys()) == {"shared-nacos", "other-nacos"}
+    # shared-nacos 跨两 agent 聚到一组
+    assert {dn.agent_id for dn in grouped["shared-nacos"]} == {"agent-a", "agent-b"}
+    assert len(grouped["shared-nacos"]) == 2
+    assert {dn.agent_id for dn in grouped["other-nacos"]} == {"agent-a"}
+
+
+def test_aggregate_discovered_by_nacos_skips_none_nacos(client: TestClient) -> None:
+    # nacos_service 为 None 的发现行(docker 发现到但 nacos 无注册)不参与按服务对账 → 不进任何组。
+    _mk_discovered("agent-a", "has-nacos", container_name="a-1", dir_="/srv/a")
+    # 直接落一条 nacos_service=None 的发现行(_mk_discovered 强制传 nacos,故走 store.create_row)。
+    now = datetime.now(timezone.utc)
+    store.create_row(
+        DiscoveredNodeModel,
+        {
+            "agent_id": "agent-a",
+            "container_name": "a-orphan",
+            "compose_service": "app",
+            "dir": "/srv/orphan",
+            "running": True,
+            "nacos_service": None,  # 未匹配 nacos
+            "healthy": None,
+            "status": "active",
+            "heartbeat_at": now,
+            "first_seen_at": now,
+        },
+    )
+    grouped = store.aggregate_discovered_by_nacos()
+    assert set(grouped.keys()) == {"has-nacos"}  # None 组不存在
+    assert None not in grouped
+
+
+def test_aggregate_discovered_by_nacos_status_filter(client: TestClient) -> None:
+    # 默认只聚 active;status=None 取全集(含 stale)。
+    _mk_discovered("agent-a", "n1", container_name="active-1", status="active")
+    _mk_discovered("agent-a", "n1", container_name="stale-1", status="stale")
+
+    active = store.aggregate_discovered_by_nacos()  # 默认 active
+    assert {dn.container_name for dn in active["n1"]} == {"active-1"}
+
+    all_rows = store.aggregate_discovered_by_nacos(status=None)
+    assert {dn.container_name for dn in all_rows["n1"]} == {"active-1", "stale-1"}
+
+
+def test_store_list_services_with_namespace_code(client: TestClient) -> None:
+    # 取全部 Service + LEFT JOIN namespaceCode(对账意图侧用,不分页)。
+    ns = _mk_ns("agent-svc")
+    _mk_svc(ns, "svc-1", nacos="svc-1-nacos")
+    _mk_svc(ns, "svc-2", nacos=None)
+
+    rows = store.list_services_with_namespace_code()
+    by_code = {r["service_code"]: r for r in rows}
+    assert by_code["svc-1"]["nacos_service_name"] == "svc-1-nacos"
+    assert by_code["svc-1"]["namespace_code"] == "agent-svc"
+    assert by_code["svc-2"]["nacos_service_name"] is None
+
+
+# =====================================================================================
+# P3-7:服务对账 GET /api/nodes/reconciliation(意图 Service ⋈ 现实 DiscoveredNode）
+# =====================================================================================
+#
+# 三态:runningButUnmanaged(发现实例的 nacosService ∉ 任何 Service.nacos_service_name)/
+# managedButDown(Service.nacos_service_name 非空但无 active 发现实例)/ versionDrift(本期空)。
+# 按 nacos_service_name 关联;不分页。纳管走既有 POST /api/services(不在此端点)。
+
+
+def test_reconciliation_running_but_unmanaged_aggregates_agents(client: TestClient) -> None:
+    # 有发现实例但无对应 Service → 进 runningButUnmanaged;同 nacosService 跨多 agent 聚合 agentIds(H-5)。
+    h = _h(client)
+    # 现实侧:nacosService=ghost-nacos 跨两 agent 各一实例,无任何 Service 纳管它。
+    _mk_discovered("agent-1", "ghost-nacos", container_name="g-1", dir_="/srv/1")
+    _mk_discovered("agent-2", "ghost-nacos", container_name="g-2", dir_="/srv/2")
+
+    body = client.get("/api/nodes/reconciliation", headers=h).json()
+    unmanaged = body["runningButUnmanaged"]
+    assert len(unmanaged) == 1
+    item = unmanaged[0]
+    assert item["nacosService"] == "ghost-nacos"
+    assert set(item["agentIds"]) == {"agent-1", "agent-2"}  # 跨 agent 聚合
+    assert item["instanceCount"] == 2
+    # 它不在 managedButDown(没纳管)
+    assert body["managedButDown"] == []
+    # camel 契约:无 snake key
+    for snake in ("nacos_service", "agent_ids", "instance_count"):
+        assert snake not in item
+
+
+def test_reconciliation_managed_but_down(client: TestClient) -> None:
+    # 有 Service(nacosServiceName 非空)但无任何 active 发现实例 → managedButDown。
+    h = _h(client)
+    ns = _mk_ns("agent-md")
+    _mk_svc(ns, "svc-down", nacos="down-nacos")
+    # 不 seed 任何 down-nacos 的 active 发现实例
+
+    body = client.get("/api/nodes/reconciliation", headers=h).json()
+    down = body["managedButDown"]
+    assert len(down) == 1
+    assert down[0]["serviceCode"] == "svc-down"
+    assert down[0]["nacosServiceName"] == "down-nacos"
+    assert down[0]["namespaceCode"] == "agent-md"
+    # 没有未纳管项(发现侧为空)
+    assert body["runningButUnmanaged"] == []
+    for snake in ("service_code", "nacos_service_name", "namespace_code"):
+        assert snake not in down[0]
+
+
+def test_reconciliation_normal_managed_in_neither(client: TestClient) -> None:
+    # 正常纳管(Service 有 + 实例 active 且 nacos 名匹配)→ 既不在 runningButUnmanaged 也不在 managedButDown。
+    h = _h(client)
+    ns = _mk_ns("agent-ok")
+    _mk_svc(ns, "svc-ok", nacos="ok-nacos")
+    _mk_discovered("agent-ok", "ok-nacos", container_name="ok-1", dir_="/srv/ok", status="active")
+
+    body = client.get("/api/nodes/reconciliation", headers=h).json()
+    assert body["runningButUnmanaged"] == []
+    assert body["managedButDown"] == []
+
+
+def test_reconciliation_version_drift_always_empty(client: TestClient) -> None:
+    # versionDrift 本期恒空(DiscoveredNode 暂无实例插件版本字段)。
+    h = _h(client)
+    ns = _mk_ns("agent-vd")
+    _mk_svc(ns, "svc-vd", nacos="vd-nacos")
+    _mk_discovered("agent-vd", "vd-nacos", container_name="vd-1", status="active")
+
+    body = client.get("/api/nodes/reconciliation", headers=h).json()
+    assert body["versionDrift"] == []
+
+
+def test_reconciliation_stale_instance_makes_managed_down(client: TestClient) -> None:
+    # 现实侧只取 active:某 Service 仅有 stale 实例(无 active)→ 仍算 managedButDown(该起没起)。
+    h = _h(client)
+    ns = _mk_ns("agent-stale")
+    _mk_svc(ns, "svc-stale", nacos="stale-nacos")
+    _mk_discovered("agent-stale", "stale-nacos", container_name="s-1", status="stale")  # 仅 stale
+
+    body = client.get("/api/nodes/reconciliation", headers=h).json()
+    assert {d["nacosServiceName"] for d in body["managedButDown"]} == {"stale-nacos"}
+    # stale 实例不进现实侧 active 聚合 → 不会被当成未纳管
+    assert body["runningButUnmanaged"] == []
+
+
+def test_reconciliation_service_without_nacos_skipped(client: TestClient) -> None:
+    # Service.nacos_service_name 为空 → 无法按 nacos 对账 → 既不进 managedButDown 也不影响其它。
+    h = _h(client)
+    ns = _mk_ns("agent-nonacos2")
+    _mk_svc(ns, "svc-nonacos", nacos=None)
+
+    body = client.get("/api/nodes/reconciliation", headers=h).json()
+    assert body["managedButDown"] == []
+    assert body["runningButUnmanaged"] == []
+    assert body["versionDrift"] == []
+
+
+def test_reconciliation_requires_auth(client: TestClient) -> None:
+    # 无 Bearer → default-deny 中间件 / require_session 401。
+    assert client.get("/api/nodes/reconciliation").status_code == 401

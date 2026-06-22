@@ -48,12 +48,15 @@ from app.hub.db_models import DiscoveredNodeModel
 from app.models import (
     DiscoveredNodeListOut,
     DiscoveredNodeOut,
+    ManagedDownServiceOut,
     NodeActionIn,
     NodeActionOut,
     NodeListOut,
     NodeOperationOut,
     NodeOperationsListOut,
     NodeOut,
+    ReconciliationOut,
+    UnmanagedServiceOut,
 )
 
 
@@ -257,6 +260,84 @@ async def list_discovered_instances(
         page=page,
         page_size=page_size,
         total_page=math.ceil(count / page_size) if page_size else 0,
+    )
+
+
+@router.get(
+    "/reconciliation",
+    response_model=ReconciliationOut,
+    summary="服务对账(意图 ⋈ 现实)",
+    description=(
+        "实时计算(不落表)意图 Service ⋈ 现实 DiscoveredNode(按 nacosServiceName 关联)的三态:"
+        "runningButUnmanaged(在跑但没纳管,『已发现未纳管』收件箱,同 nacosService 跨多 agent 聚合)/ "
+        "managedButDown(纳管了但没实例)/ versionDrift(本期空)。数据量=服务数,不分页。"
+        "**纳管动作不在此端点**:纳管 = 前端预填 namespace + nacosServiceName 后调既有 POST /api/services 创建 Service。"
+    ),
+)
+async def reconcile_services(_: str = Depends(require_session)) -> ReconciliationOut:
+    """服务对账:意图(`Service`)⋈ 现实(active `DiscoveredNode`),**按 `nacos_service_name` 关联**。
+
+    判定逻辑(设计 §3.4):
+    - **现实侧**:`store.aggregate_discovered_by_nacos(status="active")` → `{nacosService: [实例...]}`
+      (nacosService 为 None 的容器已在 store 层跳过,不参与按服务对账)。
+    - **意图侧**:`store.list_services_with_namespace_code()` → 全部 Service 行(含 namespaceCode)。
+    - **runningButUnmanaged**:现实侧出现、但其 nacosService **∉** 任何 `Service.nacos_service_name`
+      的服务 → 「已发现未纳管」收件箱。同一 nacosService 跨多 agent 的实例聚成一项(评审 H-5):
+      `agentIds` 汇总承载该服务的全部 agent(去重、稳定序),`instanceCount` 为跨 agent 实例合计。
+    - **managedButDown**:`Service.nacos_service_name` **非空**、但该 nacos 名**无任何 active 发现实例**
+      的 Service → 「该起没起」。(nacosServiceName 为空的 Service 无法按 nacos 对账,直接跳过——
+      它既不算 down 也无从关联实例。)
+    - **versionDrift**:**本期恒空** + TODO(需实例携带插件版本,DiscoveredNode 暂无该字段;镜像漂移
+      另见设计 P4-4)。不硬凑。
+    """
+    # 现实侧:按 nacos 名聚合的 active 发现实例(跨 agent)。
+    discovered_by_nacos = store.aggregate_discovered_by_nacos(status="active")
+    # 意图侧:全部 Service(含 namespaceCode);收集「已纳管的 nacos 名集合」用于判收件箱。
+    services = store.list_services_with_namespace_code()
+    managed_nacos_names = {
+        svc["nacos_service_name"] for svc in services if svc["nacos_service_name"]
+    }
+
+    # ① runningButUnmanaged:发现实例的 nacosService ∉ 已纳管集合 → 收件箱(跨 agent 聚合)。
+    running_but_unmanaged: list[UnmanagedServiceOut] = []
+    for nacos_name, instances in discovered_by_nacos.items():
+        if nacos_name in managed_nacos_names:
+            continue
+        # 跨多 agent 聚合 agentIds(去重 + 稳定序:按首次出现顺序);instanceCount = 跨 agent 实例合计。
+        agent_ids: list[str] = []
+        for dn in instances:
+            if dn.agent_id not in agent_ids:
+                agent_ids.append(dn.agent_id)
+        running_but_unmanaged.append(
+            UnmanagedServiceOut(
+                nacos_service=nacos_name,
+                agent_ids=agent_ids,
+                instance_count=len(instances),
+            )
+        )
+
+    # ② managedButDown:Service.nacos_service_name 非空但无 active 发现实例 → 该起没起。
+    managed_but_down: list[ManagedDownServiceOut] = []
+    for svc in services:
+        nacos_name = svc["nacos_service_name"]
+        if not nacos_name:  # 无 nacos 名的 Service 无法按 nacos 对账,跳过(既非 down 也无从关联)
+            continue
+        if nacos_name not in discovered_by_nacos:
+            managed_but_down.append(
+                ManagedDownServiceOut(
+                    service_code=svc["service_code"],
+                    nacos_service_name=nacos_name,
+                    namespace_code=svc["namespace_code"],
+                )
+            )
+
+    # ③ versionDrift:本期恒空(DiscoveredNode 暂无实例插件版本字段,无从比对;镜像漂移见 P4-4)。
+    # TODO(P4-4 / 实例上报插件版本后):实例携带各插件版本 → 与 active service_plugin_version 比对,
+    #   不一致的服务进 versionDrift(待投放)。需先给 DiscoveredNode/上报协议加插件版本字段。
+    return ReconciliationOut(
+        running_but_unmanaged=running_but_unmanaged,
+        managed_but_down=managed_but_down,
+        version_drift=[],
     )
 
 

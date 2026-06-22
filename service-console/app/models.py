@@ -427,6 +427,59 @@ class DiscoveredNodeListOut(ListEnvelope[DiscoveredNodeOut]):
     """实例列表响应(具体子类,避开泛型 response_model 的 Pydantic 警告路径)。"""
 
 
+# --- 服务对账(P3-7,意图 Service ⋈ 现实 DiscoveredNode by nacosServiceName) ---
+#
+# 对账实时计算(不落表),把「意图」(Service 表)与「现实」(DiscoveredNode 发现实例)按
+# `nacos_service_name` 关联,产出三态(设计 §3.4):
+# - runningButUnmanaged:发现实例的 nacosService ∉ 任何 Service.nacos_service_name → 「已发现未纳管」收件箱。
+# - managedButDown:Service.nacos_service_name 非空但无任何 active 发现实例 → 该起没起。
+# - versionDrift:本期空(DiscoveredNode 暂无插件版本字段,见端点 TODO)。
+# 纳管动作不新增端点:纳管 = 预填 namespace + nacosServiceName 后调既有 `POST /api/services` create。
+
+
+class UnmanagedServiceOut(BaseModel):
+    """「已发现未纳管」收件箱一项:在跑但无对应 Service 的 nacosService。
+
+    同一 `nacosService` 跨多 agent 的实例聚成一项(评审 H-5):`agentIds` 汇总所有承载该服务的
+    agent,`instanceCount` 为该 nacosService 下 active 发现实例总数(跨 agent 合计)。前端「纳管」时
+    用 `nacosService` 预填 `POST /api/services` 的 nacosServiceName(namespace 由用户选 agent 决定)。
+    """
+
+    model_config = MODEL_CONFIG
+
+    nacos_service: str
+    agent_ids: list[str]
+    instance_count: int
+
+
+class ManagedDownServiceOut(BaseModel):
+    """「纳管了但没实例」一项:Service.nacos_service_name 非空,却无任何 active 发现实例匹配。
+
+    `serviceCode`(分发标识)/ `nacosServiceName`(对账 link key)/ `namespaceCode`(所属 agent)
+    供前端定位「该起没起」的服务。
+    """
+
+    model_config = MODEL_CONFIG
+
+    service_code: str
+    nacos_service_name: str
+    namespace_code: str | None = None
+
+
+class ReconciliationOut(BaseModel):
+    """服务对账响应:三态各一组。数据量 = 服务数(通常不大),**不分页**(直接返回全集)。
+
+    `versionDrift` 本期恒为空数组(DiscoveredNode 暂无实例携带的插件版本字段,无从比对;镜像漂移另见
+    设计 P4-4)——返回空而非硬凑,待实例上报插件版本后再实现。
+    """
+
+    model_config = MODEL_CONFIG
+
+    running_but_unmanaged: list[UnmanagedServiceOut]
+    managed_but_down: list[ManagedDownServiceOut]
+    version_drift: list[dict] = []
+
+
 # --- 节点操作下发 + 操作审计(Task 10b) -----------------------------------
 
 

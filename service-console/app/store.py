@@ -188,6 +188,58 @@ def list_discovered_nodes_for_agents(
         return list(session.execute(stmt).scalars().all())
 
 
+def aggregate_discovered_by_nacos(
+    status: str | None = "active",
+) -> dict[str, list[DiscoveredNodeModel]]:
+    """跨机聚合(P4-0):按 `nacos_service` 把发现实例分组 → `{nacos_service: [DiscoveredNodeModel...]}`。
+
+    一个「跨多台机」的逻辑服务 = **同 `nacos_service` 在多个 agent 上各有实例**(ns ↔ agent 1:1,
+    跨机即跨 agent;见设计 §4.1 评审 M12)。本函数把所有 agent 的 active 发现行按 nacos 名聚到一起,
+    供服务对账(P3-7,意图 `Service` ⋈ 现实 `DiscoveredNode` by nacosServiceName)与将来 P4-1
+    跨 agent 顺序投放协调器复用。
+
+    - `status`:默认 `"active"`(只聚本轮上报命中的活跃实例,排除缺席被标 stale 的旧行);传 `None`
+      则不按 status 过滤(取全集,含 stale)。
+    - **`nacos_service` 为 None 的行跳过**——未匹配 nacos 的容器(docker 发现到但 nacos 无注册)无法
+      按服务对账,不参与分组(否则会聚成一个含义不明的 None 组)。
+
+    分组内各 list 按 id 升序(稳定顺序);同一 nacos 名跨多 agent 的实例会落进同一 list(评审 H-5
+    「同 nacosService 跨多 agent 聚合」)。
+    """
+    filters: list[Any] = []
+    if status is not None:
+        filters.append(DiscoveredNodeModel.status == status)
+    grouped: dict[str, list[DiscoveredNodeModel]] = {}
+    with _db().session_factory() as session:
+        stmt = select(DiscoveredNodeModel).where(*filters).order_by(DiscoveredNodeModel.id.asc())
+        for dn in session.execute(stmt).scalars().all():
+            if dn.nacos_service is None:  # 未匹配 nacos 的容器不参与按服务对账(跳过)
+                continue
+            grouped.setdefault(dn.nacos_service, []).append(dn)
+    return grouped
+
+
+def list_services_with_namespace_code() -> list[dict[str, Any]]:
+    """取**全部** Service 行 + LEFT JOIN 回 `namespace_code`(服务对账 P3-7 用,不分页)。
+
+    对账实时计算意图侧(`Service`)⋈ 现实侧(`DiscoveredNode`),数据量 = 服务数(通常不大),故
+    一次取全集而非分页(避免逐页拼装)。每行 dict 含 `service_code` / `nacos_service_name` /
+    `namespace_code`(namespace 缺失时为 None,LEFT JOIN)。复用 `list_rows_joined` 的列/JOIN 范式,
+    但这里取全量(不传 page/page_size 上的硬上限,服务数小)。
+    """
+    with _db().session_factory() as session:
+        stmt = (
+            select(
+                Service.service_code,
+                Service.nacos_service_name,
+                Namespace.code.label("namespace_code"),
+            )
+            .outerjoin(Namespace, Namespace.id == Service.namespace_id)
+            .order_by(Service.id.asc())
+        )
+        return [dict(m) for m in session.execute(stmt).mappings().all()]
+
+
 def create_row(model: type[ModelT], values: dict[str, Any]) -> ModelT:
     """插入一行;`created_at`/`updated_at` 若模型有该列且未显式传入则自动补当前 UTC。
 
