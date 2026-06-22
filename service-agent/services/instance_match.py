@@ -26,6 +26,23 @@ def match_instance(instance, containers):
     return None
 
 
+def matching_containers(instance, containers):
+    """返回**所有**匹配该实例的容器（冲突检测用,不像 match_instance 只取第一个）。
+
+    与 match_instance 同优先级:先按宿主发布端口;该层无命中再退 bridge IP。返回所选层的
+    全部候选 —— 命中 >1 即「一实例多容器」冲突(评审 M3:同机两工程注册容器内同端口 →
+    端口主键命中失败落 IP 兜底、IP 也撞 → 张冠李戴;须冲突告警,不静默取第一个）。
+    """
+    port = int(instance["port"])
+    by_port = [c for c in containers if port in _published_host_ports(c)]
+    if by_port:
+        return by_port
+    ip = instance.get("ip")
+    if not ip:
+        return []
+    return [c for c in containers if ip in _bridge_ips(c)]
+
+
 def compose_project(container):
     """读容器 docker inspect 的 com.docker.compose.project label（compose 工程名）。
 

@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from services import discovery, docker_cli
+from services import discovery, docker_cli, instance_match
 
 
 # --------------------------------------------------------------------------- #
@@ -142,3 +142,121 @@ def test_collect_handles_missing_config_name_and_state(monkeypatch):
             "running": False,
         }
     ]
+
+
+def test_collect_uses_passed_containers_without_calling_docker(monkeypatch):
+    def boom(timeout=30):
+        raise AssertionError("传了 containers 就不该再调 docker")
+
+    monkeypatch.setattr(docker_cli, "list_all_containers", boom)
+    out = discovery.collect_local_containers(managed_root="", containers=[_c()])
+    assert [r["containerId"] for r in out] == ["c1"]
+
+
+# --------------------------------------------------------------------------- #
+# instance_match.matching_containers（P3-2 冲突检测用)
+# --------------------------------------------------------------------------- #
+
+
+def _raw(cid, *, host_port=None, ip=None, project="proj", service="svc", workdir="/data/a", running=True, image="img:1"):
+    ports = {"13000/tcp": [{"HostPort": str(host_port)}]} if host_port is not None else {}
+    networks = {"bridge": {"IPAddress": ip}} if ip is not None else {}
+    return {
+        "Id": cid,
+        "Name": f"/{project}-{service}-1",
+        "State": {"Running": running},
+        "NetworkSettings": {"Ports": ports, "Networks": networks},
+        "Config": {
+            "Image": image,
+            "Labels": {
+                "com.docker.compose.project": project,
+                "com.docker.compose.service": service,
+                "com.docker.compose.project.working_dir": workdir,
+            },
+        },
+    }
+
+
+def test_matching_containers_by_port_returns_all_candidates():
+    a = _raw("a", host_port=18029)
+    b = _raw("b", host_port=18029)  # 同宿主端口(异常,但要被检出)
+    c = _raw("c", host_port=19000)
+    got = instance_match.matching_containers({"port": 18029, "ip": "x"}, [a, b, c])
+    assert {x["Id"] for x in got} == {"a", "b"}
+
+
+def test_matching_containers_falls_back_to_ip_when_no_port():
+    a = _raw("a", host_port=19000, ip="172.18.0.5")
+    got = instance_match.matching_containers({"port": 18029, "ip": "172.18.0.5"}, [a])
+    assert [x["Id"] for x in got] == ["a"]
+
+
+def test_matching_containers_empty_when_no_port_and_no_ip():
+    a = _raw("a", host_port=19000, ip="172.18.0.9")
+    assert instance_match.matching_containers({"port": 18029}, [a]) == []  # 无 ip key
+    assert instance_match.matching_containers({"port": 18029, "ip": "1.2.3.4"}, [a]) == []
+
+
+# --------------------------------------------------------------------------- #
+# discovery.enrich_with_nacos
+# --------------------------------------------------------------------------- #
+
+
+def test_enrich_single_match_attaches_service_and_health():
+    raw = [_raw("a", host_port=18029)]
+    records = discovery.collect_local_containers(containers=raw)
+    instances = [{"serviceName": "wms", "ip": "10.0.0.1", "port": 18029, "healthy": True}]
+    enriched, warnings = discovery.enrich_with_nacos(records, raw, instances)
+    assert warnings == []
+    assert enriched[0]["nacosService"] == "wms"
+    assert enriched[0]["healthy"] is True
+
+
+def test_enrich_no_match_keeps_none(monkeypatch):
+    raw = [_raw("a", host_port=18029)]
+    records = discovery.collect_local_containers(containers=raw)
+    enriched, warnings = discovery.enrich_with_nacos(records, raw, [])  # 无 nacos 实例(已停/未注册仍报出)
+    assert warnings == []
+    assert enriched[0]["nacosService"] is None
+    assert enriched[0]["healthy"] is None
+
+
+def test_enrich_unhealthy_instance_propagates():
+    raw = [_raw("a", host_port=18029)]
+    records = discovery.collect_local_containers(containers=raw)
+    instances = [{"serviceName": "wms", "ip": "x", "port": 18029, "healthy": False}]
+    enriched, _ = discovery.enrich_with_nacos(records, raw, instances)
+    assert enriched[0]["healthy"] is False
+
+
+def test_enrich_one_instance_multi_container_warns():
+    raw = [_raw("a", host_port=18029), _raw("b", host_port=18029)]
+    records = discovery.collect_local_containers(containers=raw)
+    instances = [{"serviceName": "wms", "ip": "x", "port": 18029, "healthy": True}]
+    enriched, warnings = discovery.enrich_with_nacos(records, raw, instances)
+    assert [w["type"] for w in warnings] == ["instance-multi-container"]
+    assert warnings[0]["nacosService"] == "wms"
+    assert set(warnings[0]["containerIds"]) == {"a", "b"}
+    assert all(r["nacosService"] == "wms" for r in enriched)  # 各容器各 1 实例命中 → 仍可标
+
+
+def test_enrich_one_container_multi_instance_warns_and_nulls():
+    raw = [_raw("a", host_port=18029)]
+    records = discovery.collect_local_containers(containers=raw)
+    instances = [
+        {"serviceName": "wms", "ip": "x", "port": 18029, "healthy": True},
+        {"serviceName": "erp", "ip": "y", "port": 18029, "healthy": True},  # 都认领容器 a
+    ]
+    enriched, warnings = discovery.enrich_with_nacos(records, raw, instances)
+    assert [w["type"] for w in warnings] == ["container-multi-instance"]
+    assert set(warnings[0]["nacosServices"]) == {"wms", "erp"}
+    assert enriched[0]["nacosService"] is None  # 歧义不猜
+    assert enriched[0]["healthy"] is None
+
+
+def test_enrich_does_not_mutate_input_records():
+    raw = [_raw("a", host_port=18029)]
+    records = discovery.collect_local_containers(containers=raw)
+    snapshot = dict(records[0])
+    discovery.enrich_with_nacos(records, raw, [{"serviceName": "wms", "ip": "x", "port": 18029, "healthy": True}])
+    assert records[0] == snapshot  # 原 record 未被注入 nacosService
