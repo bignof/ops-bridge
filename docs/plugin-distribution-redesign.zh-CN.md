@@ -4,6 +4,12 @@
 > agent 兼做**每主机插件缓存** + **拓扑自动发现**;平台只维护「服务→插件→版本」,不再手配节点/目录。
 > 方案 = 上文选定的 **A(agent 直连 platform)**,且**包字节走 HTTP 不走 WS**。本文是完整方案,非最小改造。
 
+> 🔺 **覆盖性声明(2026-06-22 决策,服务拓扑以此 + 计划 M 阶段为准,优先于下文各 §)**:
+> 1. **hub + platform 已合并为单一 `service-console`**(一服务一 DB)。下文凡「platform」「hub」「platform → hub(WS)」措辞,一律读作 **service-console 内部**;原 hub 的 agent-WS / rolling / logs 路由是 console 进程内模块,**控制链由「跨进程 WS 调用」退化为「进程内直调」**,`hub_client` + 内部 `HUB_ADMIN_TOKEN`/`SERVICE_HUB_URL` 删除。agent↔console 仍是 WS(控制)+ HTTP(分发回源)。
+> 2. **失败收敛 mode = freeze**:滚动中某实例失败 → 失败即停 + 标记「停在第 N 个」+ 人工重试/回滚,**不自动回滚**(故无需 per-实例「上一 deployed 版本」字段)。下文 §4.1 G5 / §8 `Rollout` 按此读。
+> 3. **跨机服务(同 `nacos_service_name` 跨多 ns)发布 = 按 `nacos_service_name` 事务扇出置活**(单一真相的强模型):一次 publish 找出所有 ns-Service 行事务性同步置活(任一失败整体回滚 active),对账按 `nacos_service_name` 检 N 行不一致告警。**据此消解下文 §4「平台 active 版本是单一真相」与 §4.1/M12「跨多 ns」的措辞冲突**——active 仍 per-(ns,service) 行存储,但 publish 以 nacos 名为单位事务扇出,逻辑上对外即单一真相。
+> 4. dir/镜像/容器**寻址权威 = DiscoveredNode**(§3.3 已述,推翻 v3);node-operations 下发链(`nodes.py`)须随之从 `Service.dir` 迁到 `DiscoveredNode`(见计划 P3-6)。
+
 ## 0. 设计原则
 
 1. **worker 零凭据**:worker 只跟本机 agent 说话,不持任何 token / URL 密钥。
