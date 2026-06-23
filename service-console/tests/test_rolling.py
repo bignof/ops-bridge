@@ -397,10 +397,14 @@ def test_on_task_done_clean_completion_no_error(caplog):
 
 
 class _FakeDN:
-    """聚合返回的发现行替身:协调器只读 .agent_id 用于定位承载该服务的 agent(稳定序去重)。"""
+    """聚合返回的发现行替身:协调器 restart 模式只读 .agent_id 定位承载该服务的 agent(稳定序去重);
+    pull-redeploy 模式还按 .container_id → .dir 解析 compose 目录,故二者带默认 None(对齐真实
+    DiscoveredNodeModel 的 nullable 列;restart 路径不读 dir,留 None 即得空映射,逐行等价不受影响)。"""
 
-    def __init__(self, agent_id):
+    def __init__(self, agent_id, container_id=None, dir=None):
         self.agent_id = agent_id
+        self.container_id = container_id
+        self.dir = dir
 
 
 class FakeServiceHubState:
@@ -700,3 +704,225 @@ def test_run_service_rolling_instance_filter_subset_force_degraded(monkeypatch):
 
     assert hub.finished["status"] == "degraded"
     assert hub.finished["degraded"] is True  # 全集 total=1 → degraded(与是否灰度无关)
+
+
+# =====================================================================================
+# pull-redeploy:逐实例发 graceful-redeploy(带 image + 该实例 compose 目录 dir);
+# dir 解析不到 → 失败即停;其余(健康门 / instance_filter / 失败即停 / degraded)复用同一逻辑。
+# =====================================================================================
+
+
+class FakeRedeployHubState:
+    """pull-redeploy 协调器专用桩:list-instances 仍按 agent 脚本化,但等待的滚动命令是
+    `graceful-redeploy`(非 graceful-restart)。其余与 FakeServiceHubState 同款。
+
+    `call_agent` 按 requestId 路由的真实语义下,payload type 不影响 await(见生产 call_agent);
+    此桩据 message['type'] 取脚本回包,故显式认 graceful-redeploy。
+    """
+
+    def __init__(self, list_results=None, redeploy_results=None, *, call_side_effect=None):
+        self.list_results = list_results or {}
+        self.redeploy_results = list(redeploy_results or [])
+        self.call_side_effect = call_side_effect
+        self.calls = []
+        self.node_updates = []
+        self.finished = None
+
+    async def call_agent(self, agent_id, message, timeout):
+        self.calls.append((agent_id, message))
+        if self.call_side_effect is not None:
+            raise self.call_side_effect
+        if message["type"] == "list-instances":
+            return self.list_results[agent_id]
+        if message["type"] == "graceful-redeploy":
+            return self.redeploy_results.pop(0)
+        raise AssertionError(f"未预期的命令类型: {message['type']}")
+
+    async def update_rolling_nodes(self, task_id, nodes):
+        self.node_updates.append([dict(n) for n in nodes])
+
+    async def finish_rolling(self, task_id, status, *, nodes=None, error=None, degraded=False):
+        self.finished = {"status": status, "nodes": nodes, "error": error, "degraded": degraded}
+
+
+def _patch_agg_with_dirs(monkeypatch, grouped):
+    """打桩聚合,group 行带 container_id→dir(pull-redeploy 据此解析 compose 目录)。
+
+    grouped:{nacosService: [(agent_id, container_id, dir), ...]} → 转 _FakeDN 带这三字段。
+    """
+    import app.store as store
+
+    fake = {
+        svc: [_FakeDN(a, container_id=cid, dir=d) for (a, cid, d) in rows]
+        for svc, rows in grouped.items()
+    }
+    monkeypatch.setattr(store, "aggregate_discovered_by_nacos", lambda status="active": fake)
+
+
+def test_run_service_rolling_pull_redeploy_sends_redeploy_with_image_and_dir(monkeypatch):
+    # mode=pull-redeploy:两 agent 各 1 实例(全集=2,非 force 过健康门)→ 逐实例发 graceful-redeploy,
+    # payload 带正确 image + 各实例 containerId 对应的 dir;成功路径 → done。
+    _patch_agg_with_dirs(monkeypatch, {"svc": [
+        ("agent-a", "a1", "/srv/a/admin"),
+        ("agent-b", "b1", "/srv/b/admin"),
+    ]})
+    hub = FakeRedeployHubState(
+        list_results={
+            "agent-a": {"status": "success", "instances": [_inst("ha:1", "a1")]},
+            "agent-b": {"status": "success", "instances": [_inst("hb:1", "b1")]},
+        },
+        redeploy_results=[{"status": "success"}, {"status": "success"}],
+    )
+    asyncio.run(rolling_router._run_service_rolling(
+        "t1", "svc", False, hub, FakeSettings(), mode="pull-redeploy", image="reg/app:v2"))
+
+    assert hub.finished["status"] == "done"
+    assert hub.finished["degraded"] is False
+    # 发的全是 graceful-redeploy(无 graceful-restart),且数量=实例数。
+    assert not any(m["type"] == "graceful-restart" for _, m in hub.calls)
+    rd = [(aid, m) for aid, m in hub.calls if m["type"] == "graceful-redeploy"]
+    assert len(rd) == 2
+    assert [aid for aid, _ in rd] == ["agent-a", "agent-b"]
+    # 每条都带目标 image,dir 按 containerId 解析。
+    assert all(m["image"] == "reg/app:v2" for _, m in rd)
+    assert rd[0][1]["containerId"] == "a1" and rd[0][1]["dir"] == "/srv/a/admin"
+    assert rd[1][1]["containerId"] == "b1" and rd[1][1]["dir"] == "/srv/b/admin"
+    # 与 restart 同套通用字段仍在。
+    assert rd[0][1]["healthBaseUrl"] == "http://ha:1"
+    assert [n["status"] for n in hub.finished["nodes"]] == ["done", "done"]
+
+
+def test_run_service_rolling_pull_redeploy_unresolvable_dir_fail_stops(monkeypatch):
+    # 某实例 containerId 在发现行里无 dir(解析不到)→ 失败即停:该节点 failed、余下 skipped、
+    # task failed,且不对该实例发 graceful-redeploy。
+    # 全集 2 实例过健康门;第 2 个实例(b1)的 dir 缺失。
+    _patch_agg_with_dirs(monkeypatch, {"svc": [
+        ("agent-a", "a1", "/srv/a/admin"),
+        ("agent-b", "b1", None),  # dir 缺失 → 解析不到
+    ]})
+    hub = FakeRedeployHubState(
+        list_results={
+            "agent-a": {"status": "success", "instances": [_inst("ha:1", "a1")]},
+            "agent-b": {"status": "success", "instances": [_inst("hb:1", "b1")]},
+        },
+        redeploy_results=[{"status": "success"}],  # 只有 a1 会真发
+    )
+    asyncio.run(rolling_router._run_service_rolling(
+        "t1", "svc", False, hub, FakeSettings(), mode="pull-redeploy", image="reg/app:v2"))
+
+    assert hub.finished["status"] == "failed"
+    assert "compose 目录" in hub.finished["error"]
+    rd = [m for _, m in hub.calls if m["type"] == "graceful-redeploy"]
+    assert len(rd) == 1  # 只对 a1 发过;b1 解析不到 dir,即停,不发
+    nodes = hub.finished["nodes"]
+    assert nodes[0]["status"] == "done"
+    assert nodes[1]["status"] == "failed" and "compose 目录" in nodes[1]["error"]
+
+
+def test_run_service_rolling_pull_redeploy_first_instance_dir_missing_no_calls(monkeypatch):
+    # 边界:第一个实例就解析不到 dir → 立即失败即停,一条 graceful-redeploy 都不发,全部节点 failed/skipped。
+    _patch_agg_with_dirs(monkeypatch, {"svc": [
+        ("agent-a", "a1", None),
+        ("agent-b", "b1", "/srv/b/admin"),
+    ]})
+    hub = FakeRedeployHubState(
+        list_results={
+            "agent-a": {"status": "success", "instances": [_inst("ha:1", "a1")]},
+            "agent-b": {"status": "success", "instances": [_inst("hb:1", "b1")]},
+        },
+    )
+    asyncio.run(rolling_router._run_service_rolling(
+        "t1", "svc", False, hub, FakeSettings(), mode="pull-redeploy", image="reg/app:v2"))
+
+    assert hub.finished["status"] == "failed"
+    assert not any(m["type"] == "graceful-redeploy" for _, m in hub.calls)
+    nodes = hub.finished["nodes"]
+    assert nodes[0]["status"] == "failed"
+    assert nodes[1]["status"] == "skipped"
+
+
+def test_run_service_rolling_pull_redeploy_redeploy_failure_fail_stops(monkeypatch):
+    # graceful-redeploy 自身返回 failed(如镜像非白名单/重建失败)→ 失败即停,与 restart 失败同收敛。
+    _patch_agg_with_dirs(monkeypatch, {"svc": [
+        ("agent-a", "a1", "/srv/a/admin"),
+        ("agent-b", "b1", "/srv/b/admin"),
+    ]})
+    hub = FakeRedeployHubState(
+        list_results={
+            "agent-a": {"status": "success", "instances": [_inst("ha:1", "a1")]},
+            "agent-b": {"status": "success", "instances": [_inst("hb:1", "b1")]},
+        },
+        redeploy_results=[{"status": "failed", "error": "镜像来源不在白名单: reg/app:v2"}],
+    )
+    asyncio.run(rolling_router._run_service_rolling(
+        "t1", "svc", False, hub, FakeSettings(), mode="pull-redeploy", image="reg/app:v2"))
+
+    assert hub.finished["status"] == "failed"
+    rd = [m for _, m in hub.calls if m["type"] == "graceful-redeploy"]
+    assert len(rd) == 1  # 第 1 个失败即停,不发第 2 个
+    nodes = hub.finished["nodes"]
+    assert nodes[0]["status"] == "failed" and "白名单" in nodes[0]["error"]
+    assert nodes[1]["status"] == "skipped"
+
+
+def test_run_service_rolling_pull_redeploy_health_gate_uses_full_set(monkeypatch):
+    # pull-redeploy 同样走集群健康门:全集 1 实例、非 force → 拒(<2),不发任何 graceful-redeploy。
+    _patch_agg_with_dirs(monkeypatch, {"svc": [("agent-a", "a1", "/srv/a/admin")]})
+    hub = FakeRedeployHubState(
+        list_results={"agent-a": {"status": "success", "instances": [_inst("ha:1", "a1")]}},
+    )
+    asyncio.run(rolling_router._run_service_rolling(
+        "t1", "svc", False, hub, FakeSettings(), mode="pull-redeploy", image="reg/app:v2"))
+
+    assert hub.finished["status"] == "failed"
+    assert "集群健康实例数=1<2" in hub.finished["error"]
+    assert not any(m["type"] == "graceful-redeploy" for _, m in hub.calls)
+
+
+def test_run_service_rolling_pull_redeploy_instance_filter_rolls_only_subset(monkeypatch):
+    # pull-redeploy + 灰度:全集 2(过门),instance_filter 只点 b1 → 只对 b1 发 graceful-redeploy。
+    _patch_agg_with_dirs(monkeypatch, {"svc": [
+        ("agent-a", "a1", "/srv/a/admin"),
+        ("agent-b", "b1", "/srv/b/admin"),
+    ]})
+    hub = FakeRedeployHubState(
+        list_results={
+            "agent-a": {"status": "success", "instances": [_inst("ha:1", "a1")]},
+            "agent-b": {"status": "success", "instances": [_inst("hb:1", "b1")]},
+        },
+        redeploy_results=[{"status": "success"}],
+    )
+    asyncio.run(rolling_router._run_service_rolling(
+        "t1", "svc", False, hub, FakeSettings(),
+        mode="pull-redeploy", image="reg/app:v2", instance_filter={"b1"}))
+
+    assert hub.finished["status"] == "done"
+    rd = [(aid, m) for aid, m in hub.calls if m["type"] == "graceful-redeploy"]
+    assert len(rd) == 1
+    assert rd[0][0] == "agent-b" and rd[0][1]["containerId"] == "b1"
+    assert rd[0][1]["dir"] == "/srv/b/admin"
+    assert [n["containerId"] for n in hub.finished["nodes"]] == ["b1"]
+
+
+# === restart 等价回归:显式 mode='restart'/image=None 与不传两参逐行等价 ===
+
+
+def test_run_service_rolling_restart_mode_explicit_equivalent(monkeypatch):
+    # 显式传 mode='restart'(image=None)与既有用例不传两参完全一致:逐实例发 graceful-restart、done。
+    _patch_agg(monkeypatch, {"svc": ["agent-a", "agent-b"]})
+    hub = FakeServiceHubState(
+        list_results={
+            "agent-a": {"status": "success", "instances": [_inst("ha:1", "a1")]},
+            "agent-b": {"status": "success", "instances": [_inst("hb:1", "b1")]},
+        },
+        graceful_results=[{"status": "success"}, {"status": "success"}],
+    )
+    asyncio.run(rolling_router._run_service_rolling(
+        "t1", "svc", False, hub, FakeSettings(), mode="restart", image=None))
+
+    assert hub.finished["status"] == "done"
+    # 仍走 graceful-restart(非 redeploy),不带 image/dir(restart payload 无这两字段)。
+    gr = [m for _, m in hub.calls if m["type"] == "graceful-restart"]
+    assert [m["containerId"] for m in gr] == ["a1", "b1"]
+    assert all("image" not in m and "dir" not in m for m in gr)
+    assert not any(m["type"] == "graceful-redeploy" for _, m in hub.calls)

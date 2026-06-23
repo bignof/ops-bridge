@@ -153,8 +153,11 @@ def test_list_rollouts_pagination(client: TestClient) -> None:
 
 
 class _FakeDN:
-    def __init__(self, agent_id):
+    # restart 路径只读 .agent_id;pull-redeploy 还读 .container_id/.dir(对齐真实 nullable 列,默认 None)。
+    def __init__(self, agent_id, container_id=None, dir=None):
         self.agent_id = agent_id
+        self.container_id = container_id
+        self.dir = dir
 
 
 class FakeServiceHubState:
@@ -327,6 +330,8 @@ def _capture_coordinator(monkeypatch) -> dict:
         captured["force"] = force
         captured["rollout_id"] = kwargs.get("rollout_id")
         captured["instance_filter"] = kwargs.get("instance_filter")
+        captured["mode"] = kwargs.get("mode")
+        captured["image"] = kwargs.get("image")
 
     monkeypatch.setattr(rollouts_mod, "_run_service_rolling", fake_coordinator)
     return captured
@@ -372,10 +377,12 @@ def test_create_rollout_subset_rolls_only_that_container_e2e(hub_client: TestCli
 
     state = main_module.hub_state
 
-    # 聚合定位到单 agent(承载该服务);_FakeDN 仅需 .agent_id。
+    # 聚合定位到单 agent(承载该服务);restart 路径只读 .agent_id,container_id/dir 默认 None。
     class _FakeDN:
         def __init__(self, agent_id):
             self.agent_id = agent_id
+            self.container_id = None
+            self.dir = None
 
     monkeypatch.setattr(
         store_mod, "aggregate_discovered_by_nacos",
@@ -417,12 +424,78 @@ def test_create_rollout_subset_rolls_only_that_container_e2e(hub_client: TestCli
 
 
 def test_create_rollout_invalid_mode_returns_422(hub_client: TestClient) -> None:
-    # mode 非 restart → 422 占位(不假装能跑 pull-redeploy);且不建任何 rollout 行。
+    # mode 既非 restart 也非 pull-redeploy → 422;且不建任何 rollout 行。
     resp = hub_client.post(
-        "/api/rollouts", json={"serviceName": "svc-422", "mode": "pull-redeploy"}, headers=ADMIN)
+        "/api/rollouts", json={"serviceName": "svc-422", "mode": "bogus"}, headers=ADMIN)
     assert resp.status_code == 422
-    assert "pull-redeploy" in resp.json()["detail"]
+    assert "不支持的投放模式" in resp.json()["detail"]
     assert store.list_rollouts(service_name="svc-422")["total"] == 0
+
+
+def test_create_rollout_pull_redeploy_without_image_returns_422(hub_client: TestClient) -> None:
+    # pull-redeploy 缺 image → 422,且不建 rollout 行。
+    resp = hub_client.post(
+        "/api/rollouts", json={"serviceName": "svc-pr-noimg", "mode": "pull-redeploy"}, headers=ADMIN)
+    assert resp.status_code == 422
+    assert "pull-redeploy 投放须指定 image" in resp.json()["detail"]
+    assert store.list_rollouts(service_name="svc-pr-noimg")["total"] == 0
+
+
+def test_create_rollout_pull_redeploy_with_image_passes_mode_and_image(
+    hub_client: TestClient, monkeypatch
+) -> None:
+    # pull-redeploy + image → 200 返 ids,且 mode/image 透传给协调器。
+    captured = _capture_coordinator(monkeypatch)
+    resp = hub_client.post(
+        "/api/rollouts",
+        json={"serviceName": "svc-pr", "mode": "pull-redeploy", "image": "reg/app:v2"},
+        headers=ADMIN)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "rolloutId" in body and "taskId" in body
+    assert captured["mode"] == "pull-redeploy"
+    assert captured["image"] == "reg/app:v2"
+    assert captured["service_name"] == "svc-pr"
+    # rollout 行已建(mode 落库 pull-redeploy;image 本期不落库)。
+    row = store.get_rollout(body["rolloutId"])
+    assert row is not None and row.mode == "pull-redeploy"
+
+
+def test_create_rollout_restart_mode_passes_none_image(hub_client: TestClient, monkeypatch) -> None:
+    # restart(缺省/显式)→ 200,mode=restart 透传、image=None(协调器忽略)。
+    captured = _capture_coordinator(monkeypatch)
+    resp = hub_client.post("/api/rollouts", json={"serviceName": "svc-r"}, headers=ADMIN)
+    assert resp.status_code == 200
+    assert captured["mode"] == "restart"
+    assert captured["image"] is None
+
+
+def test_retry_pull_redeploy_returns_422_no_image_column(hub_client: TestClient) -> None:
+    # pull-redeploy 原投放重试:表无 image 列取不回 → 422,引导走发布弹窗;不建新 rollout。
+    store.create_rollout(
+        rollout_id="ro-pr-retry", service_name="svc-prr", mode="pull-redeploy", force=False)
+    store.finish_rollout("ro-pr-retry", "failed", error="x", frozen=True)
+
+    before = store.list_rollouts(service_name="svc-prr")["total"]
+    resp = hub_client.post("/api/rollouts/ro-pr-retry/retry", headers=ADMIN)
+    assert resp.status_code == 422
+    assert "pull-redeploy 重试需重新指定 image" in resp.json()["detail"]
+    # 没建新 rollout(仍只有原来那条)。
+    assert store.list_rollouts(service_name="svc-prr")["total"] == before
+
+
+def test_rollback_pull_redeploy_returns_422_no_image_column(hub_client: TestClient) -> None:
+    # pull-redeploy 原投放回滚(即便有 previous_target)→ 422(表无 image 列),不建新 rollout。
+    store.create_rollout(
+        rollout_id="ro-pr-rb", service_name="svc-prb", mode="pull-redeploy",
+        target="reg/app:v3", previous_target="reg/app:v2")
+    store.finish_rollout("ro-pr-rb", "failed", frozen=True)
+
+    before = store.list_rollouts(service_name="svc-prb")["total"]
+    resp = hub_client.post("/api/rollouts/ro-pr-rb/rollback", headers=ADMIN)
+    assert resp.status_code == 422
+    assert "pull-redeploy 回滚需重新指定 image" in resp.json()["detail"]
+    assert store.list_rollouts(service_name="svc-prb")["total"] == before
 
 
 def test_create_rollout_conflict_returns_409_no_orphan(hub_client: TestClient) -> None:

@@ -117,7 +117,8 @@ _CROSS_AGENT_SENTINEL = "*"
 
 
 async def _run_service_rolling(
-    task_id, service_name, force, hub_state, settings, rollout_id=None, instance_filter=None
+    task_id, service_name, force, hub_state, settings,
+    rollout_id=None, instance_filter=None, mode="restart", image=None,
 ):
     """跨 agent(跨机)顺序滚动协调器(P4-1,设计 §4.1)。
 
@@ -128,6 +129,19 @@ async def _run_service_rolling(
     abort,而是**过滤丢弃**(unmatched = 别机实例,本协调器逐 agent 各取本机 matched);③ 集群
     健康门 ≥2 从「单机内」升级为「集群级」(跨 agent 实例合计)。失败收敛 = freeze(失败即停,
     不回滚)。
+
+    `mode`(零中断滚动重拉镜像,默认 'restart' = 现状):
+    - `'restart'`:逐实例发 `graceful-restart`(原地重启容器)。**逐行不变**,见下「等价回归保证」。
+    - `'pull-redeploy'`:逐实例改发 `graceful-redeploy`(单实例 drain→拉新镜像→重建→wait-ready),
+      payload 额外带 `image`(= 入参 image,目标镜像)与 `dir`(= **该实例 containerId 对应的 compose
+      工程目录**)。**dir 解析来源**:从 `group`(= agg[service_name] 的 DiscoveredNode 行,发现权威)
+      构建 `{dn.container_id: dn.dir}` 映射,按 node 的 containerId 取 dir;**取不到 dir → 该实例失败
+      即停**(无 dir 无法定位 compose 工程,继续滚会拉错目录)。其余(健康门 / instance_filter 灰度 /
+      一次只滚一个 / 失败即停 / degraded / _finish 回写)与 restart **完全一致,不分 mode 复制一套**——
+      只在「发哪个命令 + 带不带 image/dir」处分流。
+    - 等待 result type 在 'pull-redeploy' 下是 `graceful-redeploy-result`,但 `call_agent` 按 requestId
+      路由响应(不校验 type,见 hub.store.call_agent / resolve_pending),故 payload type 不同也能 await
+      到,`res.get("status")` 照常判,无需特别适配。
 
     `rollout_id`(P4-2/P4-3,默认 None = 现状,裸滚不受影响):非空时本协调器除了写 rolling_task
     终态,还把同一终态回写到 rollouts 表 —— done/degraded 写终态不冻结;failed 置 frozen=True
@@ -144,9 +158,10 @@ async def _run_service_rolling(
       `roll_list`(非全集)。degraded 标记仍按**全集** total<2(集群整体是否处于降级容量)。
     - instance_filter 非空但 roll_list 为空(指定的 containerId 都不在该服务健康实例内)→ failed。
 
-    **等价回归保证**:`rollout_id=None` 且 `instance_filter=None` 时,本函数与改造前**逐行等价**
-    (健康门、落 nodes、失败即停、degraded、终态回写都不变;roll_list 退化为全量 targets,_finish 仅多
-    一层透传)。既有 test_rolling.py 的 `_run_service_rolling` 用例(均不传这两参)复跑即验证此等价。
+    **等价回归保证**:`rollout_id=None`、`instance_filter=None` 且 `mode='restart'`(image 随之为
+    None)时,本函数与改造前**逐行等价**(健康门、落 nodes、发 graceful-restart、失败即停、degraded、
+    终态回写都不变;roll_list 退化为全量 targets,_finish 仅多一层透传,命令分流退化为 restart 分支)。
+    既有 test_rolling.py 的 `_run_service_rolling` 用例(均不传 mode/image)复跑即验证此等价。
 
     TODO(后续加固,本期不做):continuous cross-probe —— 滚 A 期间持续重探 B/C 健康。MVP 靠
     「全局一次只滚一个 + 每步 wait-ready」已保证至多一个 down;对「独立第三方实例在滚动期间自行
@@ -174,6 +189,15 @@ async def _run_service_rolling(
         if not agent_ids:
             await _finish("failed", error="无发现实例(nacos 未发现该服务的活跃实例)")
             return
+
+        # pull-redeploy 模式按 containerId 解析 compose 工程目录(dir):来源 = group 的发现行
+        # (发现权威,非手配),{container_id: dir} 映射。container_id/dir 为空的行不入映射(无从定位)。
+        # restart 模式不需要 dir,映射留空(逐行等价,不影响 graceful-restart 分支)。
+        dir_by_container = {
+            dn.container_id: dn.dir
+            for dn in group
+            if dn.container_id and dn.dir
+        }
 
         # 2. 逐 agent 收集 matched-local healthy 实例 → 跨 agent 有序列表(先按 agent 序、agent 内按返回序)。
         targets: list[dict] = []
@@ -231,14 +255,33 @@ async def _run_service_rolling(
             nodes[idx]["status"] = "in-progress"
             await hub_state.update_rolling_nodes(task_id, nodes)
             req = str(uuid.uuid4())
-            res = await hub_state.call_agent(node["agentId"], {
-                "type": "graceful-restart", "requestId": req,
+            # 命令分流(仅此处按 mode 分):restart → graceful-restart(原地重启);
+            # pull-redeploy → graceful-redeploy(额外带 image + 该实例的 compose 目录 dir)。
+            # 其余字段(requestId/containerId/healthBaseUrl/三个超时)两条命令完全相同。
+            common = {
+                "requestId": req,
                 "containerId": node["containerId"],
                 "healthBaseUrl": f"http://{node['address']}",
                 "settleSec": settings.rolling_settle_sec,
                 "shutdownTimeoutSec": settings.rolling_shutdown_timeout,
                 "readyTimeoutSec": settings.rolling_ready_timeout,
-            }, timeout=settings.rolling_cmd_timeout)
+            }
+            if mode == "pull-redeploy":
+                node_dir = dir_by_container.get(node["containerId"])
+                if not node_dir:
+                    # 无 dir 无法定位该实例 compose 工程 → 失败即停(余下标 skipped,与 graceful 失败同收敛)。
+                    nodes[idx]["status"] = "failed"
+                    nodes[idx]["error"] = "无法解析实例 compose 目录(dir)"
+                    for n in nodes[idx + 1:]:
+                        n["status"] = "skipped"
+                    await _finish(
+                        "failed", nodes=nodes,
+                        error=f"节点 {node['agentId']}/{node['address']} 无法解析实例 compose 目录(dir)")
+                    return
+                msg = {"type": "graceful-redeploy", **common, "image": image, "dir": node_dir}
+            else:
+                msg = {"type": "graceful-restart", **common}
+            res = await hub_state.call_agent(node["agentId"], msg, timeout=settings.rolling_cmd_timeout)
             if res.get("status") != "success":
                 # 失败即停(freeze,不回滚):该节点 failed,余下全部标 skipped。
                 nodes[idx]["status"] = "failed"

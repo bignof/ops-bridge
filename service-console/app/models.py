@@ -256,13 +256,14 @@ class ServiceImageSetCurrentIn(BaseModel):
 
 
 class RolloutCreateIn(BaseModel):
-    """投放请求 body:`{serviceName, namespace?, mode?='restart', force?, target?, trigger?='manual', instances?}`。
+    """投放请求 body:`{serviceName, namespace?, mode?='restart', force?, target?, trigger?='manual', instances?, image?}`。
 
-    `mode` 仅 'restart' 本期可跑(协调器走 graceful-restart);'pull-redeploy' 路由层 422 占位
-    (列保留两值待后续批次)。`target` 是本次投放 desired-state 的人读摘要(可选,审计用)。
-    `trigger` 缺省 'manual';retry/rollback 内部入口会覆盖为对应值,不由客户端指定那两值。
-    `instances`(P5-2 灰度,可选):containerId 列表;非空 → 只滚该实例子集(canary),其余不动
-    (健康门仍按全集判定);空/缺省 → 全量滚。子集信息本期不持久化到 rollouts 行。
+    `mode`:'restart'(协调器逐实例 graceful-restart 原地重启)| 'pull-redeploy'(逐实例
+    graceful-redeploy 滚动重拉镜像);其它值路由层 422。`image`:pull-redeploy 的目标镜像,**该模式下
+    必填**(缺 → 422),restart 时忽略;本期不落 rollouts 行(无 image 列)。`target` 是本次投放
+    desired-state 的人读摘要(可选,审计用)。`trigger` 缺省 'manual';retry/rollback 内部入口会覆盖为
+    对应值,不由客户端指定那两值。`instances`(P5-2 灰度,可选):containerId 列表;非空 → 只滚该实例
+    子集(canary),其余不动(健康门仍按全集判定);空/缺省 → 全量滚。子集信息本期不持久化到 rollouts 行。
     """
 
     model_config = MODEL_CONFIG
@@ -274,6 +275,7 @@ class RolloutCreateIn(BaseModel):
     target: str | None = None
     trigger: str = "manual"
     instances: list[str] | None = None
+    image: str | None = None
 
 
 class RolloutOut(BaseModel):
