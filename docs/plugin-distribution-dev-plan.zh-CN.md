@@ -93,7 +93,7 @@ P4 的 publish→自动滚动 依赖 §4.1 协调器(同批,不可早于它)
 | **P3-7 ✓** | **纳管模型**:`GET /api/nodes/reconciliation` 实时算意图 Service ⋈ 现实 DiscoveredNode(by nacosServiceName)三态:runningButUnmanaged(收件箱,跨 agent 聚合 agentIds)/ managedButDown / versionDrift(本期空,需实例带插件版本)。纳管=前端预填 ns+nacosName 调既有 `POST /api/services`(无新端点)。**前端纳管/对账页待**(随 SPA 批次) | service-console 后端(✓);SPA 纳管/对账页(待) | P3-5 | **后端已完成**(420 测试 95.24%);收件箱+对账三态(versionDrift 除外)可查 |
 | **P3-8 ✓** | **服务「插件配置」二级页 UI**(评审 H-4①):`ServicePluginsPage` 重构为「顶部选服务→该服务绑定配置」二级页:已绑插件表(插件/当前版本/操作)、绑定(候选剔已绑)、解绑、改版本(releases 版本历史 + reactivate 切版本)。接既有 service-plugins/plugins/services/releases 端点。**有意偏差**:用下拉选服务(非原型「从服务列表进入并锁定」)以避免改共享 CrudTable/ServicesPage;**已知 cap**:当前版本展示从 releases 主表 join(无 ?serviceId 过滤,pageSize≤200,>200 显「未发布」,标 TODO 待后端加参) | service-console(SPA) | P3-5 | **已完成**(web 106 vitest 绿、lint/build 过、覆盖率门达标);配置二级页可用 |
 | **P3-9 ✓** | **实例实时日志 UI(§4.3)—— 后端已有,合并后同进程**:agent `core/log_sessions.py` + console `app/routers/logs.py`(SSE,fan-out,e2e)**均已落地**;本任务只做 console 实例页日志查看器 UI:SPA 直连 console SSE,`dir` 取自 DiscoveredNode、`agentId` 取自所属 agent;**复用既有 `sessionId/dir/logs_*` 协议,勿另造** | service-console(SPA) | M, P3-5 | 实例页看实时日志;关闭即断;离线实例不可用 |
-| P3-10 | **console SPA 顶栏命名空间切换器**(评审 L-6;原型已实现,现 SPA `AppShell` 无):切 ns → 实例/服务/获取记录及统计卡按当前 ns 过滤;**跨机服务(跨 ns)需提供不被 ns 切散的 by-nacosService 聚合视图**(评审 L-7) | service-console(SPA `AppShell`) | P3-5 | 切 ns 过滤各页;跨机服务有聚合入口 |
+| **P3-10 ✓** | **console SPA 顶栏命名空间切换器**(评审 L-6;原型已实现,现 SPA `AppShell` 无):切 ns → 实例/服务/获取记录及统计卡按当前 ns 过滤;**跨机服务(跨 ns)需提供不被 ns 切散的 by-nacosService 聚合视图**(评审 L-7) | service-console(SPA `AppShell`) | P3-5 | 切 ns 过滤各页;跨机服务有聚合入口 |
 
 **P3 验收**:UI 自动出现 admin/2admin 等节点(含已停);实例页接 SSE 看实时日志;实例运维按 DiscoveredNode 寻址。
 
@@ -105,8 +105,8 @@ P4 的 publish→自动滚动 依赖 §4.1 协调器(同批,不可早于它)
 | --- | --- | --- | --- | --- |
 | **P4-0 ✓** | **跨机聚合查询**(评审 M-11/L-9):`store.aggregate_discovered_by_nacos(status)` 按 `nacos_service` 聚合 active DiscoveredNode → `{nacosService:[实例...]}`(None nacos 跳过、跨 agent 同名聚一组),作协调器与三态对账共同输入 | service-console `store.py` | P3-3, P3-4 | **已完成**(同 nacosService 跨 2 agent 正确分组,420 测试绿) |
 | **P4-1 ✓** | **跨 agent 顺序协调器**(评审 M10/L1):新增 `_run_service_rolling` + `POST /api/service-rolling`(admin-token,middleware 白名单):按 nacos 名聚合定位各 agent → 逐 agent 取 matched-local healthy 汇成一条全局列表 → **全局一次只滚一个**(graceful drain→restart→wait-ready)→ 集群级健康门(合计<2 且非 force 拒)→ 任一失败 freeze(余下 skipped、不回滚)。unmatched 在协调器内过滤(单 agent `_run_rolling` 保留 abort 作误配安全网,定向单机用);锁按 serviceName(哨兵 agent="*")防同服务并发。**continuous cross-probe 留 TODO**(MVP「一次只滚一个+wait-ready」已保证至多一个 down) | service-console `rolling.py`/`store.py`/`middleware.py` | M, P4-0 | **已完成**(435 测试绿,95.35%);跨机顺序滚、零中断、失败即停 |
-| P4-2 | **publish/rollback 触发控制链**(评审 M1,现只改 DB active):active 变更 → 触发滚动(**进程内直调,不经 hub_client**);**跨机服务按 P0-4 事务扇出置活后一并触发**;restart / pull-redeploy 共用 P4-1 协调器(评审 M11) | service-console(`releases.py` + `rolling.py`) | M, P4-1 | 改 active → 自动滚 → 实例跑新版;跨机一次 publish 扇出 N ns |
-| P4-3 | **失败即停(freeze)+ 收敛记录**:`Rollout` 运行记录(P0-3)落库;失败 → 标记 + 停后续 + **冻结半迁移态等人工**(不自动回滚);提供人工重试/手动回滚(走重投上一版)入口 | service-console | P4-1 | 注入失败 → 失败即停 + 状态可见可人工处置 |
+| **P4-2 ✓** | **publish/rollback 触发控制链**(评审 M1;**实现改为 desired-state「显式投放」**:不动写端点,新增 `POST /api/rollouts` 复用 P4-1 协调器,f486375):active 变更 → 触发滚动(**进程内直调,不经 hub_client**);**跨机服务按 P0-4 事务扇出置活后一并触发**;restart / pull-redeploy 共用 P4-1 协调器(评审 M11) | service-console(`releases.py` + `rolling.py`) | M, P4-1 | 改 active → 自动滚 → 实例跑新版;跨机一次 publish 扇出 N ns |
+| **P4-3 ✓** | **失败即停(freeze)+ 收敛记录**(f486375):`Rollout` 运行记录(P0-3)落库;失败 → 标记 + 停后续 + **冻结半迁移态等人工**(不自动回滚);提供人工重试/手动回滚(走重投上一版)入口 | service-console | P4-1 | 注入失败 → 失败即停 + 状态可见可人工处置 |
 | **P4-4 ✓(后端台账)** | **服务「镜像配置」二级页 + ServiceImage 台账**(评审 H-4②):`db_models` 加 `ServiceImage`(service_id, image, isCurrent, createdAt)历史表 + 迁移 + store/路由;UI 当前/历史/**回滚→pull-redeploy**;`nodes.py` redeploy 改读 ServiceImage 当前行(与 P3-6 对齐) | service-console(`db_models`+迁移+路由+SPA) | M, P4-1 | 镜像配置页可用;回滚走 pull-redeploy |
 | P4-5 | **统一 desired-state 发布 UI**(评审 H-4③④):发布弹窗 = 暂存意图 → svcDiff → **按 diff 自动选 restart/pull-redeploy** + 变更摘要 + 逐实例进度;**镜像漂移纳入实例页 + 服务对账(镜像)**;**漂移强制重投(服务级 reapply)/同步漂移实例(单实例),不改意图**与「diff 发布」并列为两条路径(评审 L-5) | service-console(SPA + P4-1/P4-4 后端) | P4-1, P4-4 | 发布弹窗按 diff 选机制;镜像漂移可见可修 |
 | P4-6 | agent **预热**:console 通知「新版本将至」→ agent 提前回源缓存 | service-console + service-agent | P1 | 滚动时 worker 拉取零等待 |
@@ -119,7 +119,7 @@ P4 的 publish→自动滚动 依赖 §4.1 协调器(同批,不可早于它)
 
 | ID | 任务 | 仓库 / 模块 | 前置 | 验收 |
 | --- | --- | --- | --- | --- |
-| P5-1 | **审计口径 = 回源粒度**(评审 M2/M9/H-7,决策已定):console `fetch_record` = **回源粒度**(ns/service + 回源版本/时间),不承诺 per-container;caller 取 agent 反查(源 IP→容器),不信 worker 自报 header;**原型「获取记录」已改回源粒度口径**;per-container 审计若需则走 agent 本地日志(可选,另起任务) | service-console + service-agent | P1 | 审计口径=回源粒度、不可伪造 |
+| **P5-1 ✓** | **审计口径 = 回源粒度**(评审 M2/M9/H-7,决策已定;**核实已落地**:`distribution.query_plugins` 每命中写一行 fetch_record,粒度 = ns/service/plugin/version + remark,无 per-container/worker 自报字段,调用方靠 pull token 反解 ns;读端点 `fetch_records.py` 同口径,无需改码):console `fetch_record` = **回源粒度**(ns/service + 回源版本/时间),不承诺 per-container;caller 取 agent 反查(源 IP→容器),不信 worker 自报 header;**原型「获取记录」已改回源粒度口径**;per-container 审计若需则走 agent 本地日志(可选,另起任务) | service-console + service-agent | P1 | 审计口径=回源粒度、不可伪造 |
 | P5-2 | 灰度发布(只滚部分实例 / 按 DiscoveredNode 子集) | service-console | P4 | 可灰度 |
 | P5-3 | 缓存 sha256 校验(**可选**,按 §5 取舍不阻塞、不强制) | service-console + agent | P1 | 启用后校验生效 |
 | P5-4 | 可观测面板(agent /health 扩展、`Rollout` 发布运行记录、发布→投放关联视图) | service-console + agent | P3/P4 | 面板齐全 |
