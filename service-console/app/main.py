@@ -36,6 +36,7 @@ from app.hub.routers.agents import router as agents_router
 from app.hub.routers.commands import router as commands_router
 from app.hub.routers.logs import router as logs_router
 from app.hub.routers.rolling import router as rolling_router
+from app.hub.routers.rollouts import router as rollouts_router
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -116,4 +117,5 @@ app.include_router(agents_router)
 app.include_router(commands_router)
 app.include_router(logs_router)
 app.include_router(rolling_router)
+app.include_router(rollouts_router)  # P4-2/P4-3:/api/rollouts(显式投放 + 失败即停 freeze)
 app.include_router(agent_ws_router)

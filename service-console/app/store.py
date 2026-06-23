@@ -27,6 +27,7 @@ from app.db_models import (
     Plugin,
     PluginAttachment,
     PluginVersion,
+    Rollout,
     Service,
     ServiceImage,
     ServicePlugin,
@@ -812,3 +813,124 @@ def add_service_image(service_id: int, image: str) -> ServiceImage:
         session.commit()
         session.refresh(record)
         return record
+
+
+# --- 投放运行记录(Rollout,P4-2/P4-3) -------------------------------------
+#
+# 一行 = 一次「显式投放」的运行态(见 db_models.Rollout 的设计注释)。store 层只管落库/读取,
+# 不碰并发锁(互斥复用 rolling_tasks.active_key 的 UNIQUE,由路由层建 rolling task 时把关)。
+# 返回 ORM 行(snake);路由层经 RolloutOut.model_validate(...) 转 camelCase(照 ServiceImageOut)。
+#
+# ⚠️ 这些函数被协调器(rolling.py)经 asyncio.to_thread 同步调用,故全部写成同步函数
+#    (与 store 其它函数同构;asyncio.to_thread 包装在调用方)。
+
+
+def create_rollout(
+    *,
+    rollout_id: str,
+    service_name: str,
+    namespace: str | None = None,
+    mode: str = "restart",
+    trigger: str = "manual",
+    target: str | None = None,
+    previous_target: str | None = None,
+    force: bool = False,
+    rolling_task_id: str | None = None,
+) -> Rollout:
+    """插一条 status='running' 的投放记录,返回 ORM 行。
+
+    created_at 服务端填当前 UTC;status 恒以 'running' 起步(终态由 finish_rollout 据滚动结果回写)。
+    id 由调用方传入(与关联的 rolling task_id 各自独立的 uuid,本表 id 不等于 rolling_task_id)。
+    """
+    now = _now()
+    with _db().session_factory() as session:
+        record = Rollout(
+            id=rollout_id,
+            namespace=namespace,
+            service_name=service_name,
+            mode=mode,
+            trigger=trigger,
+            target=target,
+            previous_target=previous_target,
+            status="running",
+            frozen=False,  # 起步不冻结;失败即停时由 finish_rollout 置 True
+            rolling_task_id=rolling_task_id,
+            force=force,
+            created_at=now,
+            finished_at=None,
+        )
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+        return record
+
+
+def finish_rollout(
+    rollout_id: str,
+    status: str,
+    *,
+    error: str | None = None,
+    frozen: bool = False,
+    rolling_task_id: str | None = None,
+) -> Rollout | None:
+    """单事务更新投放终态 + finished_at;行不存在返回 None(防御,正常不发生)。
+
+    frozen 由调用方据终态传入(失败即停 → True,即半迁移态等人工 retry/rollback)。
+    rolling_task_id 可选补写(建 task 后才拿到时回填;None 不覆盖既有值)。
+    """
+    now = _now()
+    with _db().session_factory() as session:
+        record = session.get(Rollout, rollout_id)
+        if record is None:
+            return None
+        record.status = status
+        record.error = error
+        record.frozen = bool(frozen)
+        if rolling_task_id is not None:  # None 不覆盖(create 时若已写则保留)
+            record.rolling_task_id = rolling_task_id
+        record.finished_at = now
+        session.commit()
+        session.refresh(record)
+        return record
+
+
+def get_rollout(rollout_id: str) -> Rollout | None:
+    with _db().session_factory() as session:
+        return session.get(Rollout, rollout_id)
+
+
+def list_rollouts(
+    *,
+    namespace: str | None = None,
+    service_name: str | None = None,
+    status: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
+) -> dict[str, Any]:
+    """分页查投放记录(created_at 倒序,最新在前),返回 `{rows, total}`。
+
+    同 created_at 时再按 id 倒序兜底稳定顺序。可按 namespace / service_name / status 过滤。
+    """
+    page = max(1, page)
+    page_size = max(1, page_size)
+    filters: list[Any] = []
+    if namespace is not None:
+        filters.append(Rollout.namespace == namespace)
+    if service_name is not None:
+        filters.append(Rollout.service_name == service_name)
+    if status is not None:
+        filters.append(Rollout.status == status)
+    with _db().session_factory() as session:
+        count_stmt = select(func.count()).select_from(Rollout)
+        base = select(Rollout)
+        for cond in filters:
+            base = base.where(cond)
+            count_stmt = count_stmt.where(cond)
+        total = int(session.execute(count_stmt).scalar_one())
+        base = (
+            base.order_by(Rollout.created_at.desc(), Rollout.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        rows = list(session.execute(base).scalars().all())
+        return {"rows": rows, "total": total}

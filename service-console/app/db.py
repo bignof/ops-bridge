@@ -12,7 +12,7 @@ class Base(DeclarativeBase):
 
 
 class Database:
-    # 合并后 14 张表(console 8 + 镜像台账 1 + 并入的 hub 4 + 发现 1);模型见 app/db_models.py 与 app/hub/db_models.py。
+    # 合并后 15 张表(console 8 + 镜像台账 1 + 投放记录 1 + 并入的 hub 4 + 发现 1);模型见 app/db_models.py 与 app/hub/db_models.py。
     _managed_tables = {
         # console
         "namespace",
@@ -25,6 +25,8 @@ class Database:
         "fetch_record",
         # 镜像台账(P4-4)
         "service_images",
+        # 投放运行记录(P4-2/P4-3)
+        "rollouts",
         # 并入的 hub(S4)
         "agents",
         "commands",

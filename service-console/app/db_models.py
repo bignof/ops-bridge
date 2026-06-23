@@ -146,3 +146,37 @@ class ServiceImage(Base):
     image: Mapped[str] = mapped_column(String(2048))
     is_current: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class Rollout(Base):
+    # 投放运行记录(P4-2/P4-3):一次「显式投放(Rollout)」= 把 desired-state 推到运行实例的一轮编排。
+    #
+    # 设计取舍(刻意「显式投放」而非「改 active 即自动滚」):发布/切版/切镜像只改 DB(维持现状),
+    # 漂移在实例页/对账可见,由人显式发起投放或回滚 —— 故本表记录的是「投放动作」的运行态,
+    # 与 service_plugin_version/service_images 的 desired-state 解耦(本期不动那些写端点)。
+    #
+    # frozen 语义(失败即停 / freeze):跨机滚动失败即停(failed→剩余 skipped,不回滚),留下「半迁移态」
+    # (一部分实例已是新态、一部分仍旧态);此时把本行 frozen=True 标记为「冻结待人工」——提醒运维
+    # 这次投放没全部完成、需人工 retry/rollback 收敛,而非系统自动续滚或回退(自动行为在半态下更危险)。
+    #
+    # 单活/锁不在本表:并发互斥复用 rolling_tasks.active_key(= serviceName)的 UNIQUE,本表不另立锁。
+    __tablename__ = "rollouts"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # uuid4 字符串
+    namespace: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    service_name: Mapped[str] = mapped_column(String(255), index=True)  # = nacosService
+    # mode:'restart'(本期唯一可跑路径,走 graceful-restart 协调器)| 'pull-redeploy'(列保留两值,
+    # 协调器尚不支持,路由层对其 422;待后续批次接入)。
+    mode: Mapped[str] = mapped_column(String(32))
+    # trigger:'manual' | 'publish' | 'rollback' | 'retry' —— 这次投放因何而起(审计 + 区分重试/回滚链)。
+    trigger: Mapped[str] = mapped_column(String(32))
+    target: Mapped[str | None] = mapped_column(Text, nullable=True)  # 本次投放 desired-state 的人读摘要
+    previous_target: Mapped[str | None] = mapped_column(Text, nullable=True)  # 回滚参考(上一版人读摘要)
+    # status:'running' | 'done' | 'degraded' | 'failed' —— 与底层 rolling_task 终态对齐回写。
+    status: Mapped[str] = mapped_column(String(32))
+    frozen: Mapped[bool] = mapped_column(Boolean, default=False)  # 失败即冻结(半迁移态等人工)
+    rolling_task_id: Mapped[str | None] = mapped_column(String(64), nullable=True)  # 关联 rolling_tasks 运行
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    force: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

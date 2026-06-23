@@ -116,7 +116,7 @@ async def rolling_restart(
 _CROSS_AGENT_SENTINEL = "*"
 
 
-async def _run_service_rolling(task_id, service_name, force, hub_state, settings):
+async def _run_service_rolling(task_id, service_name, force, hub_state, settings, rollout_id=None):
     """跨 agent(跨机)顺序滚动协调器(P4-1,设计 §4.1)。
 
     跨机零中断 = 把承载同一 nacos 服务的**各 agent 的 matched-local healthy 实例**汇成一条
@@ -127,11 +127,27 @@ async def _run_service_rolling(task_id, service_name, force, hub_state, settings
     健康门 ≥2 从「单机内」升级为「集群级」(跨 agent 实例合计)。失败收敛 = freeze(失败即停,
     不回滚)。
 
+    `rollout_id`(P4-2/P4-3,默认 None = 现状,裸滚不受影响):非空时本协调器除了写 rolling_task
+    终态,还把同一终态回写到 rollouts 表 —— done/degraded 写终态不冻结;failed 置 frozen=True
+    (失败即停留下半迁移态,标记「冻结待人工」)。为保证**每条终态出口**(8 个:无发现实例 / 某
+    agent list 失败 / total==0 / total<2 非 force / graceful 失败即停 / 全成功 / 超时 / 通用异常)
+    都同步回写、不漏分支,把 finish_rolling 收敛进下方局部 `_finish` 闭包统一落两边。rollout_id=None
+    时 `_finish` 行为与改造前逐一调 hub_state.finish_rolling 完全一致(只是多一层透传)。
+
     TODO(后续加固,本期不做):continuous cross-probe —— 滚 A 期间持续重探 B/C 健康。MVP 靠
     「全局一次只滚一个 + 每步 wait-ready」已保证至多一个 down;对「独立第三方实例在滚动期间自行
     故障」的连续探测是后续加固项,不在本期范围。
     """
     import app.store as store
+
+    async def _finish(status_value, *, nodes=None, error=None, degraded=False):
+        # 先写 rolling_task 终态(行为同改造前);再(仅当本次投放有 rollout_id)把同一终态回写
+        # rollouts 表。failed → frozen=True(半迁移态等人工);done/degraded → 不冻结。
+        await hub_state.finish_rolling(task_id, status_value, nodes=nodes, error=error, degraded=degraded)
+        if rollout_id is not None:
+            await asyncio.to_thread(
+                store.finish_rollout, rollout_id, status_value,
+                error=error, frozen=(status_value == "failed"), rolling_task_id=task_id)
 
     try:
         # 1. 定位 agents:按 nacos 名聚合 active 发现实例 → 取承载该服务的不重复 agent(稳定序)。
@@ -142,8 +158,7 @@ async def _run_service_rolling(task_id, service_name, force, hub_state, settings
             if dn.agent_id not in agent_ids:
                 agent_ids.append(dn.agent_id)
         if not agent_ids:
-            await hub_state.finish_rolling(
-                task_id, "failed", error="无发现实例(nacos 未发现该服务的活跃实例)")
+            await _finish("failed", error="无发现实例(nacos 未发现该服务的活跃实例)")
             return
 
         # 2. 逐 agent 收集 matched-local healthy 实例 → 跨 agent 有序列表(先按 agent 序、agent 内按返回序)。
@@ -155,8 +170,8 @@ async def _run_service_rolling(task_id, service_name, force, hub_state, settings
                 {"type": "list-instances", "requestId": req, "serviceName": service_name},
                 timeout=settings.rolling_cmd_timeout)
             if listed.get("status") != "success":
-                await hub_state.finish_rolling(
-                    task_id, "failed",
+                await _finish(
+                    "failed",
                     error=f"list-instances 失败(agent {agent_id}): {listed.get('error')}")
                 return
             for inst in listed.get("instances") or []:
@@ -171,13 +186,12 @@ async def _run_service_rolling(task_id, service_name, force, hub_state, settings
         # 3. 集群健康门(跨 agent 实例合计):0 → 无可滚;<2 且非 force → 拒(零中断不可达)。
         total = len(targets)
         if total == 0:
-            await hub_state.finish_rolling(
-                task_id, "failed", error="无可滚实例(各 agent 均无 matched 且 healthy 的本机实例)")
+            await _finish(
+                "failed", error="无可滚实例(各 agent 均无 matched 且 healthy 的本机实例)")
             return
         if total < 2 and not force:
-            await hub_state.finish_rolling(
-                task_id, "failed",
-                error=f"集群健康实例数={total}<2,无法零中断滚动;扩容或 force")
+            await _finish(
+                "failed", error=f"集群健康实例数={total}<2,无法零中断滚动;扩容或 force")
             return
 
         # 4. 全局逐一滚:先把全部 targets 落 nodes(pending,带 agentId+address+containerId),再按序滚。
@@ -202,20 +216,20 @@ async def _run_service_rolling(task_id, service_name, force, hub_state, settings
                 nodes[idx]["error"] = res.get("error")
                 for n in nodes[idx + 1:]:
                     n["status"] = "skipped"
-                await hub_state.finish_rolling(
-                    task_id, "failed", nodes=nodes,
+                await _finish(
+                    "failed", nodes=nodes,
                     error=f"节点 {node['agentId']}/{node['address']} 失败,停止滚动")
                 return
             nodes[idx]["status"] = "done"
             await hub_state.update_rolling_nodes(task_id, nodes)
 
         # 5. 全部成功:集群实例 <2(force 放行)标 degraded,否则 done。
-        await hub_state.finish_rolling(
-            task_id, "degraded" if total < 2 else "done", nodes=nodes, degraded=(total < 2))
+        await _finish(
+            "degraded" if total < 2 else "done", nodes=nodes, degraded=(total < 2))
     except asyncio.TimeoutError:
-        await hub_state.finish_rolling(task_id, "failed", error="等待 agent 命令结果超时")
+        await _finish("failed", error="等待 agent 命令结果超时")
     except Exception as exc:  # noqa: BLE001
-        await hub_state.finish_rolling(task_id, "failed", error=str(exc))
+        await _finish("failed", error=str(exc))
 
 
 class ServiceRollingRequest(BaseModel):

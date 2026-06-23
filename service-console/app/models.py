@@ -252,6 +252,65 @@ class ServiceImageSetCurrentIn(BaseModel):
     image: str
 
 
+# --- 投放运行记录(Rollout,P4-2/P4-3) -------------------------------------
+
+
+class RolloutCreateIn(BaseModel):
+    """投放请求 body:`{serviceName, namespace?, mode?='restart', force?, target?, trigger?='manual'}`。
+
+    `mode` 仅 'restart' 本期可跑(协调器走 graceful-restart);'pull-redeploy' 路由层 422 占位
+    (列保留两值待后续批次)。`target` 是本次投放 desired-state 的人读摘要(可选,审计用)。
+    `trigger` 缺省 'manual';retry/rollback 内部入口会覆盖为对应值,不由客户端指定那两值。
+    """
+
+    model_config = MODEL_CONFIG
+
+    service_name: str
+    namespace: str | None = None
+    mode: str = "restart"
+    force: bool = False
+    target: str | None = None
+    trigger: str = "manual"
+
+
+class RolloutOut(BaseModel):
+    """投放记录行响应(camelCase,照 ServiceImageOut 套路:store 返回 ORM 行 → model_validate)。"""
+
+    model_config = MODEL_CONFIG
+
+    id: str
+    namespace: str | None = None
+    service_name: str
+    mode: str
+    trigger: str
+    target: str | None = None
+    previous_target: str | None = None
+    status: str
+    frozen: bool
+    rolling_task_id: str | None = None
+    error: str | None = None
+    force: bool
+    created_at: datetime
+    finished_at: datetime | None = None
+
+
+class RolloutDetailOut(RolloutOut):
+    """单条投放详情:在行字段之外嵌入底层滚动运行进度(便于前端看逐实例状态)。
+
+    `rollingTask` = `hub_state.get_rolling_task(rolling_task_id)` 的返回(已是 camelCase 的
+    nodes/status 等);无关联 task 或查不到时为 None。该子结构来自 hub 侧、形态独立,故用宽松 dict
+    透传而非再建一套 Pydantic 镜像(避免与 hub 的 `_rolling_to_dict` 契约漂移)。
+    """
+
+    model_config = MODEL_CONFIG
+
+    rolling_task: dict | None = None
+
+
+class RolloutListOut(ListEnvelope[RolloutOut]):
+    """投放记录列表响应(具体子类,避开泛型 response_model 的 Pydantic 警告路径)。"""
+
+
 # --- service_plugin 资源(Task 6b) -----------------------------------------
 
 
