@@ -110,6 +110,39 @@ def test_set_current_scope_is_per_service(client: TestClient) -> None:
     assert len(a_current) == 1 and a_current[0].image == "registry/a:1.0"
 
 
+# --- store.get_current_service_image(P4-4-wiring:redeploy 镜像源) ----------
+
+
+def test_get_current_service_image_none_when_no_current(client: TestClient) -> None:
+    # 未设过 current(无行 / 仅历史行)→ None。
+    sid = _mk_service("svc-cur-none")
+    assert store.get_current_service_image(sid) is None
+    # 只 add 历史(不置 current)仍 None。
+    store.add_service_image(sid, "registry/svc:0.9")
+    assert store.get_current_service_image(sid) is None
+
+
+def test_get_current_service_image_returns_current_row(client: TestClient) -> None:
+    # set-current 后返回该当前行;切版后跟随到新的 current。
+    sid = _mk_service("svc-cur-1")
+    store.set_current_image(sid, "registry/svc:1.0")
+    cur = store.get_current_service_image(sid)
+    assert cur is not None and cur.image == "registry/svc:1.0" and cur.is_current is True
+
+    store.set_current_image(sid, "registry/svc:2.0")  # 切版
+    cur2 = store.get_current_service_image(sid)
+    assert cur2 is not None and cur2.image == "registry/svc:2.0"
+
+
+def test_get_current_service_image_scoped_per_service(client: TestClient) -> None:
+    # 作用域 = 单 service:对 A 设 current 不会被 B 的 current 串味。
+    sid_a = _mk_service("svc-cur-a")
+    sid_b = _mk_service("svc-cur-b")
+    store.set_current_image(sid_a, "registry/a:1.0")
+    assert store.get_current_service_image(sid_b) is None
+    assert store.get_current_service_image(sid_a).image == "registry/a:1.0"
+
+
 # --- store.list_service_images 倒序 ----------------------------------------
 
 

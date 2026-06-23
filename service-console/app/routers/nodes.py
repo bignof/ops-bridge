@@ -384,13 +384,16 @@ class _NodeAddressing:
     """寻址解析结果(P3-6「发现权威」):节点操作据此派生 hub payload 的 dir / image / 工程对齐。
 
     - `dir` / `image`:**优先取自 DiscoveredNode(权威)**,仅 (agent, nacosService) 暂无
-      DiscoveredNode 时回退 `Service.dir` / `Service.default_image`。
+      DiscoveredNode 时回退 `Service.dir` / `Service.default_image`。注意:`image` 是发现的
+      **正在运行镜像**,仅用于寻址/展示;**redeploy 要拉的「期望镜像」另有来源**(见 `service_id`)。
     - `container_id`:DiscoveredNode 的真实容器 id(回退路径下为 None;当前 dispatch payload 暂不
       消费它,留作将来逐实例精确操作)。
     - `nacos_service_name`:= Service.nacos_service_name(逻辑服务入口,优雅路径校验/透传用)。
     - `expected_compose_project`:优先 DiscoveredNode 的真实 `compose_project`(agent 发现的真值,
       比从 dir basename 猜更准);DiscoveredNode 无此值 / 无 DiscoveredNode 时回退
       `_compose_default_project(dir)` 启发式。供优雅 drain 做工程对齐守卫(matched)。
+    - `service_id`:= Service.id(P4-4-wiring)。redeploy 镜像源要查 ServiceImage 当前行(desired),
+      据此 service_id 定位台账;台账无当前行时才回退到上面发现/手配的 `image`。
     """
 
     dir: str | None
@@ -398,6 +401,7 @@ class _NodeAddressing:
     container_id: str | None
     nacos_service_name: str | None
     expected_compose_project: str | None
+    service_id: int | None
 
 
 def _resolve_addressing(
@@ -431,6 +435,7 @@ def _resolve_addressing(
             container_id=None,
             nacos_service_name=nacos,
             expected_compose_project=_compose_default_project(svc.dir),
+            service_id=svc.id,
         )
 
     discovered = store.list_discovered_nodes(agent_id, nacos, status="active")
@@ -443,6 +448,7 @@ def _resolve_addressing(
             container_id=None,
             nacos_service_name=nacos,
             expected_compose_project=_compose_default_project(svc.dir),
+            service_id=svc.id,
         )
 
     if len(discovered) == 1:
@@ -468,6 +474,7 @@ def _resolve_addressing(
         container_id=dn.container_id,
         nacos_service_name=nacos,
         expected_compose_project=dn.compose_project or _compose_default_project(dn.dir),
+        service_id=svc.id,
     )
 
 
@@ -557,8 +564,16 @@ async def dispatch_node_action(
     addr = _resolve_addressing(agent_id, service_code, body.compose_project)
     dir_ = addr.dir
     nacos = addr.nacos_service_name
-    default_image = addr.image
     mode = body.mode
+
+    # P4-4-wiring:**redeploy 镜像源 = 台账声明的「当前/期望镜像」(ServiceImage is_current 行,desired)
+    # 优先,回退 addr.image**。取舍:P3-6 让 addr.image 成为寻址/展示权威(= agent 发现的「正在运行」
+    # 镜像),但「重新拉取部署」要拉的是运维在台账上钉的期望镜像(可能比在跑的新,正是要靠 redeploy 推上去),
+    # 而非把当前在跑的镜像再拉一遍。故仅当台账无当前行(未在镜像台账里设过 current)时,才回退到 addr.image
+    # 维持现状。只影响 redeploy 用到的镜像源,**不改 start/stop/restart**,也不改 addr.image 本身(寻址/展示
+    # 仍是发现权威)。「无镜像 → 400」的语义随之变为:台账无当前行 **且** addr.image 也为空。
+    current_img = store.get_current_service_image(addr.service_id) if addr.service_id else None
+    deploy_image = current_img.image if current_img else addr.image
 
     # ② mode 必填校验:stop / redeploy 须显式 mode;restart 缺省按 graceful;start 忽略 mode。
     if action in ("stop", "redeploy") and mode is None:
@@ -587,14 +602,15 @@ async def dispatch_node_action(
             health_base_url = await _derive_health_base_url(agent_id, nacos, addr.expected_compose_project)
             payload.update(action="stop", mode="graceful", healthBaseUrl=health_base_url, shutdownTimeoutSec=_GRACEFUL_SHUTDOWN_TIMEOUT_SEC, serviceName=nacos)
         elif action == "redeploy" and effective_mode == "force":
-            if not default_image:
+            # deploy_image = 台账当前行(desired)优先,回退 addr.image;两者皆空 → 400(需配置)。
+            if not deploy_image:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, "重部署需配置 defaultImage")
-            payload.update(action="pull-redeploy", mode="force", image=default_image)
+            payload.update(action="pull-redeploy", mode="force", image=deploy_image)
         else:  # redeploy graceful
-            if not default_image:
+            if not deploy_image:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, "重部署需配置 defaultImage")
             health_base_url = await _derive_health_base_url(agent_id, nacos, addr.expected_compose_project)
-            payload.update(action="pull-redeploy", mode="graceful", image=default_image, healthBaseUrl=health_base_url, shutdownTimeoutSec=_GRACEFUL_SHUTDOWN_TIMEOUT_SEC)
+            payload.update(action="pull-redeploy", mode="graceful", image=deploy_image, healthBaseUrl=health_base_url, shutdownTimeoutSec=_GRACEFUL_SHUTDOWN_TIMEOUT_SEC)
 
         resp = await hub_client.dispatch_command(agent_id, payload)
         # dispatch 成功:返回 hub 生成的 requestId(该命令进 /api/node-operations 审计列表)。

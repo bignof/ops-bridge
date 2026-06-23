@@ -607,3 +607,96 @@ def test_run_service_rolling_generic_exception_yields_failed(monkeypatch):
 
     assert hub.finished["status"] == "failed"
     assert "agent 连接不可用" in hub.finished["error"]
+
+
+# =====================================================================================
+# P5-2:灰度(instance_filter 子集滚)—— 健康门按全集、只滚子集;子集未命中 → failed;None 等价
+# =====================================================================================
+
+
+def test_run_service_rolling_instance_filter_rolls_only_subset(monkeypatch):
+    # 全集 2 个 matched+healthy 实例(健康门按全集放行,非 force 也过);instance_filter 只点 1 个 →
+    # **只对该 containerId 发 graceful-restart**,另一个不动。degraded 按全集 total=2 → 不标 degraded。
+    _patch_agg(monkeypatch, {"svc": ["agent-a", "agent-b"]})
+    hub = FakeServiceHubState(
+        list_results={
+            "agent-a": {"status": "success", "instances": [_inst("ha:1", "a1")]},
+            "agent-b": {"status": "success", "instances": [_inst("hb:1", "b1")]},
+        },
+        graceful_results=[{"status": "success"}],  # 只该滚一个
+    )
+    asyncio.run(rolling_router._run_service_rolling(
+        "t1", "svc", False, hub, FakeSettings(), instance_filter={"b1"}))
+
+    assert hub.finished["status"] == "done"
+    assert hub.finished["degraded"] is False  # degraded 按全集判定(全集=2,不降级)
+    gr = [(aid, m) for aid, m in hub.calls if m["type"] == "graceful-restart"]
+    assert len(gr) == 1  # 只滚子集里的那一个
+    assert gr[0][0] == "agent-b"
+    assert gr[0][1]["containerId"] == "b1"
+    # 落表 nodes 只含子集那一个。
+    assert [n["containerId"] for n in hub.finished["nodes"]] == ["b1"]
+
+
+def test_run_service_rolling_instance_filter_health_gate_uses_full_set(monkeypatch):
+    # 健康门按**全集**:全集只 1 个健康实例、非 force → 即便灰度只想滚这 1 个,也被全集门拒(<2)。
+    # 证明灰度子集受全集保护(不会绕过集群健康门)。
+    _patch_agg(monkeypatch, {"svc": ["agent-a"]})
+    hub = FakeServiceHubState(
+        list_results={"agent-a": {"status": "success", "instances": [_inst("ha:1", "a1")]}},
+    )
+    asyncio.run(rolling_router._run_service_rolling(
+        "t1", "svc", False, hub, FakeSettings(), instance_filter={"a1"}))
+
+    assert hub.finished["status"] == "failed"
+    assert "集群健康实例数=1<2" in hub.finished["error"]  # 全集门拒,非子集逻辑
+    assert not any(m["type"] == "graceful-restart" for _, m in hub.calls)
+
+
+def test_run_service_rolling_instance_filter_no_match_fails(monkeypatch):
+    # 全集健康门放行(2 实例),但 instance_filter 指定的 containerId 都不在健康集 → failed(子集未命中)。
+    _patch_agg(monkeypatch, {"svc": ["agent-a", "agent-b"]})
+    hub = FakeServiceHubState(
+        list_results={
+            "agent-a": {"status": "success", "instances": [_inst("ha:1", "a1")]},
+            "agent-b": {"status": "success", "instances": [_inst("hb:1", "b1")]},
+        },
+    )
+    asyncio.run(rolling_router._run_service_rolling(
+        "t1", "svc", False, hub, FakeSettings(), instance_filter={"nope"}))
+
+    assert hub.finished["status"] == "failed"
+    assert "灰度子集未命中" in hub.finished["error"]
+    assert not any(m["type"] == "graceful-restart" for _, m in hub.calls)
+
+
+def test_run_service_rolling_instance_filter_none_equivalent_to_full(monkeypatch):
+    # 等价回归:instance_filter=None(显式)与不传一致 —— 全量滚。
+    _patch_agg(monkeypatch, {"svc": ["agent-a", "agent-b"]})
+    hub = FakeServiceHubState(
+        list_results={
+            "agent-a": {"status": "success", "instances": [_inst("ha:1", "a1")]},
+            "agent-b": {"status": "success", "instances": [_inst("hb:1", "b1")]},
+        },
+        graceful_results=[{"status": "success"}, {"status": "success"}],
+    )
+    asyncio.run(rolling_router._run_service_rolling(
+        "t1", "svc", False, hub, FakeSettings(), instance_filter=None))
+
+    assert hub.finished["status"] == "done"
+    gr = [m for _, m in hub.calls if m["type"] == "graceful-restart"]
+    assert [m["containerId"] for m in gr] == ["a1", "b1"]  # 全量两个都滚
+
+
+def test_run_service_rolling_instance_filter_subset_force_degraded(monkeypatch):
+    # 灰度 + 全集<2 + force:全集门放行(force),只滚子集那一个,degraded 按全集 total=1 → 标 degraded。
+    _patch_agg(monkeypatch, {"svc": ["agent-a"]})
+    hub = FakeServiceHubState(
+        list_results={"agent-a": {"status": "success", "instances": [_inst("ha:1", "a1")]}},
+        graceful_results=[{"status": "success"}],
+    )
+    asyncio.run(rolling_router._run_service_rolling(
+        "t1", "svc", True, hub, FakeSettings(), instance_filter={"a1"}))
+
+    assert hub.finished["status"] == "degraded"
+    assert hub.finished["degraded"] is True  # 全集 total=1 → degraded(与是否灰度无关)

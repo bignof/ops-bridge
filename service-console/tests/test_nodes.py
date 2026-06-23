@@ -960,6 +960,123 @@ def test_op_dispatch_no_discovered_and_service_empty_still_400(client: TestClien
     assert resp.status_code == 400
 
 
+# =====================================================================================
+# P4-4-wiring:redeploy 镜像源 = ServiceImage 当前行(desired)优先,回退 addr.image
+# =====================================================================================
+#
+# redeploy(pull-redeploy)要拉的是台账声明的「期望/当前镜像」(ServiceImage is_current 行),
+# 而非寻址权威 addr.image(= 发现/手配的「正在运行」镜像)。仅台账无当前行时回退 addr.image。
+# 只影响 redeploy,不改 start/stop/restart(它们仍用 addr.dir / 不消费 image)。
+
+
+def test_op_redeploy_force_uses_service_image_current_over_addr(client: TestClient, monkeypatch) -> None:
+    # 核心:台账有 is_current 行 → redeploy force 的 image 取台账当前行,而非 Service.default_image / 发现值。
+    h = _h(client)
+    ns = _mk_ns("agent-sic")
+    sid = _mk_svc(ns, "svc-sic", nacos="sic-nacos")  # Service.default_image=registry/svc-sic:1.0
+    # 台账钉一个期望镜像(与 Service.default_image 不同),应被优先采用。
+    store.set_current_image(sid, "registry/desired:9")
+
+    box = {}
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch(box))
+    resp = client.post("/api/nodes/agent-sic/svc-sic/redeploy", json={"mode": "force"}, headers=h)
+    assert resp.status_code == 200
+    assert box["payload"]["image"] == "registry/desired:9"  # 台账 desired 当前行优先
+
+
+def test_op_redeploy_force_service_image_current_over_discovered(client: TestClient, monkeypatch) -> None:
+    # 台账当前行也**优先于发现值**(P3-6 让 addr.image=发现的在跑镜像,但 redeploy 拉的是 desired)。
+    h = _h(client)
+    ns = _mk_ns("agent-sicd")
+    sid = _mk_svc(ns, "svc-sicd", nacos="sicd-nacos")
+    _mk_discovered("agent-sicd", "sicd-nacos", container_name="c1", dir_="/srv/x", image="registry/running:7")
+    store.set_current_image(sid, "registry/desired:9")
+
+    box = {}
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch(box))
+    resp = client.post("/api/nodes/agent-sicd/svc-sicd/redeploy", json={"mode": "force"}, headers=h)
+    assert resp.status_code == 200
+    # image 取台账 desired(非发现的在跑镜像);dir 仍是发现权威。
+    assert box["payload"]["image"] == "registry/desired:9"
+    assert box["payload"]["dir"] == "/srv/x"
+
+
+def test_op_redeploy_force_falls_back_to_addr_when_no_current(client: TestClient, monkeypatch) -> None:
+    # 台账无当前行 → 回退 addr.image(= 发现值优先,无发现则 Service.default_image)。这里有发现值。
+    h = _h(client)
+    ns = _mk_ns("agent-sicf")
+    _mk_svc(ns, "svc-sicf", nacos="sicf-nacos")  # 不 set_current_image
+    _mk_discovered("agent-sicf", "sicf-nacos", container_name="c1", dir_="/srv/y", image="registry/running:7")
+
+    box = {}
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch(box))
+    resp = client.post("/api/nodes/agent-sicf/svc-sicf/redeploy", json={"mode": "force"}, headers=h)
+    assert resp.status_code == 200
+    assert box["payload"]["image"] == "registry/running:7"  # 回退 addr.image(发现值)
+
+
+def test_op_redeploy_force_falls_back_to_service_image_when_no_current_no_discovered(client: TestClient, monkeypatch) -> None:
+    # 台账无当前行 + 无发现行 → 回退 Service.default_image(= addr.image 的最终回退)。
+    h = _h(client)
+    ns = _mk_ns("agent-sics")
+    _mk_svc(ns, "svc-sics", nacos="sics-nacos")  # default_image=registry/svc-sics:1.0;无 current、无发现
+    box = {}
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch(box))
+    resp = client.post("/api/nodes/agent-sics/svc-sics/redeploy", json={"mode": "force"}, headers=h)
+    assert resp.status_code == 200
+    assert box["payload"]["image"] == "registry/svc-sics:1.0"  # 回退 Service.default_image
+
+
+def test_op_redeploy_graceful_uses_service_image_current(client: TestClient, monkeypatch) -> None:
+    # graceful 分支同样取台账当前行(两条 redeploy 分支共用同一镜像源逻辑)。
+    h = _h(client)
+    ns = _mk_ns("agent-sicg")
+    sid = _mk_svc(ns, "svc-sicg", nacos="sicg-nacos")
+    store.set_current_image(sid, "registry/desired:9")
+
+    box = {}
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch(box))
+    monkeypatch.setattr(
+        nodes.hub_client,
+        "list_instances",
+        _aval({"status": "success", "instances": [{"address": "10.0.0.8", "healthy": True, "matched": True}]}),
+    )
+    resp = client.post("/api/nodes/agent-sicg/svc-sicg/redeploy", json={"mode": "graceful"}, headers=h)
+    assert resp.status_code == 200
+    p = box["payload"]
+    assert p["image"] == "registry/desired:9"
+    assert p["healthBaseUrl"] == "http://10.0.0.8"
+
+
+def test_op_redeploy_no_current_no_addr_image_400(client: TestClient, monkeypatch) -> None:
+    # 台账无当前行 **且** addr.image 也为空(Service.default_image=None、无发现行)→ 400(需配置)。
+    h = _h(client)
+    ns = _mk_ns("agent-sic0")
+    store.create_row(
+        Service,
+        {"namespace_id": ns, "service_code": "svc-sic0", "dir": "/opt/svc-sic0", "default_image": None, "nacos_service_name": "sic0-nacos"},
+    )
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _amust_not_call("无镜像不应 dispatch"))
+    resp = client.post("/api/nodes/agent-sic0/svc-sic0/redeploy", json={"mode": "force"}, headers=h)
+    assert resp.status_code == 400
+
+
+def test_op_start_unaffected_by_service_image_current(client: TestClient, monkeypatch) -> None:
+    # 不变式:start/stop/restart 不受 ServiceImage 当前行影响(它们不消费 image)。
+    # 即便台账设了 current,start 的 payload 仍只带 action+dir,无 image。
+    h = _h(client)
+    ns = _mk_ns("agent-sicst")
+    sid = _mk_svc(ns, "svc-sicst", nacos="sicst-nacos")
+    store.set_current_image(sid, "registry/desired:9")
+
+    box = {}
+    monkeypatch.setattr(nodes.hub_client, "dispatch_command", _capture_dispatch(box))
+    resp = client.post("/api/nodes/agent-sicst/svc-sicst/start", json={}, headers=h)
+    assert resp.status_code == 200
+    assert box["payload"]["action"] == "start"
+    assert "image" not in box["payload"]  # start 不带 image,不受台账当前行影响
+
+
 def test_op_multi_instance_without_compose_project_409(client: TestClient, monkeypatch) -> None:
     # 多实例(同一 nacosService 两个 compose 工程)+ 不带 composeProject → 409(请指定 composeProject)。
     h = _h(client)
@@ -1098,6 +1215,24 @@ def test_resolve_addressing_no_nacos_falls_back_to_service(client: TestClient) -
     assert addr.image == "reg/nn:1"
     assert addr.container_id is None
     assert addr.nacos_service_name is None
+
+
+def test_resolve_addressing_carries_service_id(client: TestClient) -> None:
+    # P4-4-wiring:_resolve_addressing 的每个返回点都填 service_id=svc.id(供 redeploy 查台账当前行)。
+    ns = _mk_ns("agent-rasid")
+    # ① 有发现行(权威分支)
+    sid_a = _mk_svc(ns, "svc-rasid-a", nacos="rasid-a-nacos")
+    _mk_discovered("agent-rasid", "rasid-a-nacos", container_name="c1", dir_="/srv/a", image="reg/a:1")
+    assert nodes._resolve_addressing("agent-rasid", "svc-rasid-a").service_id == sid_a
+    # ② 无发现行(迁移期回退分支)
+    sid_b = _mk_svc(ns, "svc-rasid-b", nacos="rasid-b-nacos")
+    assert nodes._resolve_addressing("agent-rasid", "svc-rasid-b").service_id == sid_b
+    # ③ 无 nacos(直接回退分支)
+    sid_c = store.create_row(
+        Service,
+        {"namespace_id": ns, "service_code": "svc-rasid-c", "dir": "/opt/c", "default_image": "reg/c:1", "nacos_service_name": None},
+    ).id
+    assert nodes._resolve_addressing("agent-rasid", "svc-rasid-c").service_id == sid_c
 
 
 def test_store_list_discovered_nodes_for_agents_queries(client: TestClient) -> None:

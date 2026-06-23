@@ -17,11 +17,15 @@ import sqlalchemy as sa
 from fastapi.testclient import TestClient
 
 from app import store
+from app.auth import issue_token
 from app.db import Database
 from app.db_models import Rollout
 from app.hub.routers import rolling as rolling_router
 
-ADMIN = {"X-Admin-Token": "test-admin-token"}
+# 鉴权改平台 JWT(Rollout 端点从 X-Admin-Token → require_session,供 SPA Bearer 直调)。
+# 直接用 issue_token 签一个 admin 会话 token(settings.jwt_secret 来自 conftest env,确定性、
+# 不依赖 fixture/HTTP login),组成 Bearer 头给所有端点测试复用。
+ADMIN = {"Authorization": f"Bearer {issue_token('admin')}"}
 
 
 # =====================================================================================
@@ -284,11 +288,11 @@ def test_run_service_rolling_without_rollout_id_unchanged(client: TestClient, mo
 # =====================================================================================
 
 
-def test_rollouts_router_mounted_requires_admin_token(hub_client: TestClient) -> None:
-    # 未带 token → 403(证明白名单放行后由端点首行 _require_admin_token 把关),而非 401 / 404。
+def test_rollouts_router_mounted_requires_jwt(hub_client: TestClient) -> None:
+    # 鉴权改 JWT:未带 Bearer → 401(/api/** default-deny 中间件先挡,已从白名单移除 /api/rollouts),
+    # 而非旧的 admin-token 403。证明端点已并入平台 JWT 体系(SPA 可直调)。
     resp = hub_client.post("/api/rollouts", json={"serviceName": "s"})
-    assert resp.status_code == 403
-    assert resp.json() == {"detail": "Invalid admin token"}
+    assert resp.status_code == 401
 
 
 def test_create_rollout_returns_ids(hub_client: TestClient) -> None:
@@ -304,6 +308,112 @@ def test_create_rollout_returns_ids(hub_client: TestClient) -> None:
     assert row is not None
     assert row.service_name == "svc-ep"
     assert main_module.hub_state is not None
+
+
+def _capture_coordinator(monkeypatch) -> dict:
+    """把 rollouts 路由引用的 _run_service_rolling 换成不真跑的 async 桩,捕获透传的 kwargs。
+
+    rollouts.py 经 `from ...rolling import _run_service_rolling` 绑进自身命名空间,故在
+    `app.hub.routers.rollouts` 上 patch 才生效。桩什么都不做(后台任务空跑),只记录入参 —— 让端点
+    层断言「body.instances → instance_filter」这一透传契约,不依赖真协调器/真 agent 连接。
+    """
+    import app.hub.routers.rollouts as rollouts_mod
+
+    captured: dict = {}
+
+    async def fake_coordinator(task_id, service_name, force, hub_state, settings, **kwargs):
+        captured["task_id"] = task_id
+        captured["service_name"] = service_name
+        captured["force"] = force
+        captured["rollout_id"] = kwargs.get("rollout_id")
+        captured["instance_filter"] = kwargs.get("instance_filter")
+
+    monkeypatch.setattr(rollouts_mod, "_run_service_rolling", fake_coordinator)
+    return captured
+
+
+def test_create_rollout_with_instances_passes_subset_filter(hub_client: TestClient, monkeypatch) -> None:
+    # P5-2:body.instances 非空 → 透传成 instance_filter=set(instances)(灰度只滚子集)。
+    captured = _capture_coordinator(monkeypatch)
+    resp = hub_client.post(
+        "/api/rollouts", json={"serviceName": "svc-canary", "instances": ["c1", "c2"]}, headers=ADMIN)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "rolloutId" in body and "taskId" in body
+    # 协调器拿到的 instance_filter 是这两个 containerId 的集合。
+    assert captured["instance_filter"] == {"c1", "c2"}
+    assert captured["service_name"] == "svc-canary"
+    assert captured["rollout_id"] == body["rolloutId"]
+
+
+def test_create_rollout_without_instances_filter_is_none(hub_client: TestClient, monkeypatch) -> None:
+    # 不带 instances → instance_filter=None(全量,回归)。
+    captured = _capture_coordinator(monkeypatch)
+    resp = hub_client.post("/api/rollouts", json={"serviceName": "svc-full"}, headers=ADMIN)
+    assert resp.status_code == 200
+    assert captured["instance_filter"] is None
+
+
+def test_create_rollout_empty_instances_filter_is_none(hub_client: TestClient, monkeypatch) -> None:
+    # 空列表 instances → 视同全量(instance_filter=None),不是「子集为空」。
+    captured = _capture_coordinator(monkeypatch)
+    resp = hub_client.post(
+        "/api/rollouts", json={"serviceName": "svc-empty", "instances": []}, headers=ADMIN)
+    assert resp.status_code == 200
+    assert captured["instance_filter"] is None
+
+
+def test_create_rollout_subset_rolls_only_that_container_e2e(hub_client: TestClient, monkeypatch) -> None:
+    # 端到端(真协调器):mock list-instances 返回 2 个 matched+healthy 实例,instances 只点 1 个 →
+    # 只对该 containerId 发 graceful-restart(另一个不动)。验证 body→协调器→agent 整条链的灰度行为。
+    import app.main as main_module
+    import app.store as store_mod
+    from app.hub.routers import rolling as rolling_mod
+
+    state = main_module.hub_state
+
+    # 聚合定位到单 agent(承载该服务);_FakeDN 仅需 .agent_id。
+    class _FakeDN:
+        def __init__(self, agent_id):
+            self.agent_id = agent_id
+
+    monkeypatch.setattr(
+        store_mod, "aggregate_discovered_by_nacos",
+        lambda status="active": {"svc-e2e": [_FakeDN("agent-e2e")]})
+
+    calls: list = []
+
+    async def fake_call_agent(agent_id, message, timeout):
+        calls.append((agent_id, message))
+        if message["type"] == "list-instances":
+            return {"status": "success", "instances": [
+                {"address": "ha:1", "containerId": "a1", "healthy": True, "matched": True},
+                {"address": "ha:2", "containerId": "a2", "healthy": True, "matched": True},
+            ]}
+        return {"status": "success"}  # graceful-restart
+
+    monkeypatch.setattr(state, "call_agent", fake_call_agent)
+
+    resp = hub_client.post(
+        "/api/rollouts", json={"serviceName": "svc-e2e", "instances": ["a2"]}, headers=ADMIN)
+    assert resp.status_code == 200
+    rollout_id = resp.json()["rolloutId"]
+
+    # 后台任务异步跑;等它把 rollout 推进到终态(done)。
+    async def _await_done():
+        for _ in range(100):
+            row = await asyncio.to_thread(store.get_rollout, rollout_id)
+            if row is not None and row.status in ("done", "degraded", "failed"):
+                return row
+            await asyncio.sleep(0.02)
+        return await asyncio.to_thread(store.get_rollout, rollout_id)
+
+    row = asyncio.run(_await_done())
+    assert row.status == "done"
+    # 只对 a2(灰度子集)发了 graceful-restart,a1 未被滚。
+    gr = [m for _, m in calls if m["type"] == "graceful-restart"]
+    assert len(gr) == 1
+    assert gr[0]["containerId"] == "a2"
 
 
 def test_create_rollout_invalid_mode_returns_422(hub_client: TestClient) -> None:
@@ -350,8 +460,9 @@ def test_list_rollouts_endpoint_filter_and_envelope(hub_client: TestClient) -> N
         assert snake not in row
 
 
-def test_list_rollouts_endpoint_requires_admin_token(hub_client: TestClient) -> None:
-    assert hub_client.get("/api/rollouts").status_code == 403
+def test_list_rollouts_endpoint_requires_jwt(hub_client: TestClient) -> None:
+    # 鉴权改 JWT:无 Bearer → 401(default-deny)。
+    assert hub_client.get("/api/rollouts").status_code == 401
 
 
 def test_get_rollout_endpoint_embeds_rolling_task(hub_client: TestClient) -> None:
@@ -420,8 +531,9 @@ def test_retry_missing_returns_404(hub_client: TestClient) -> None:
     assert resp.status_code == 404
 
 
-def test_retry_requires_admin_token(hub_client: TestClient) -> None:
-    assert hub_client.post("/api/rollouts/x/retry").status_code == 403
+def test_retry_requires_jwt(hub_client: TestClient) -> None:
+    # 鉴权改 JWT:无 Bearer → 401(default-deny)。
+    assert hub_client.post("/api/rollouts/x/retry").status_code == 401
 
 
 def test_rollback_requires_previous_target(hub_client: TestClient) -> None:
@@ -461,5 +573,6 @@ def test_rollback_missing_returns_404(hub_client: TestClient) -> None:
     assert resp.status_code == 404
 
 
-def test_rollback_requires_admin_token(hub_client: TestClient) -> None:
-    assert hub_client.post("/api/rollouts/x/rollback").status_code == 403
+def test_rollback_requires_jwt(hub_client: TestClient) -> None:
+    # 鉴权改 JWT:无 Bearer → 401(default-deny)。
+    assert hub_client.post("/api/rollouts/x/rollback").status_code == 401

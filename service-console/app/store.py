@@ -753,6 +753,26 @@ def list_service_images(service_id: int) -> list[ServiceImage]:
         return list(session.execute(stmt).scalars().all())
 
 
+def get_current_service_image(service_id: int) -> ServiceImage | None:
+    """取某 service 当前镜像行(is_current=True)的台账行;无当前行返回 None。
+
+    P4-4-wiring(redeploy 镜像源):重部署(pull-redeploy)要拉的是**台账声明的「期望/当前镜像」
+    (desired)**,而非 DiscoveredNode 发现的「正在运行的镜像」。redeploy 寻址据此取镜像源 ——
+    优先用本函数返回的 is_current 行,仅台账无当前行时回退发现/手配的 `addr.image`。
+
+    单活由 `set_current_image` 在单事务内维护(同 service 至多一行 is_current=True),故这里
+    `at most one`;若历史数据异常多了行(不应发生),取 id 最小的一行(稳定),不抛错。
+    """
+    with _db().session_factory() as session:
+        stmt = (
+            select(ServiceImage)
+            .where(ServiceImage.service_id == service_id, ServiceImage.is_current.is_(True))
+            .order_by(ServiceImage.id.asc())
+            .limit(1)
+        )
+        return session.execute(stmt).scalars().first()
+
+
 def set_current_image(service_id: int, image: str) -> ServiceImage:
     """把 (service_id, image) 置为该 service 的当前镜像(单活),返回置后的当前镜像行。
 

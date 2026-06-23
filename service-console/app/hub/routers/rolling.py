@@ -116,7 +116,9 @@ async def rolling_restart(
 _CROSS_AGENT_SENTINEL = "*"
 
 
-async def _run_service_rolling(task_id, service_name, force, hub_state, settings, rollout_id=None):
+async def _run_service_rolling(
+    task_id, service_name, force, hub_state, settings, rollout_id=None, instance_filter=None
+):
     """跨 agent(跨机)顺序滚动协调器(P4-1,设计 §4.1)。
 
     跨机零中断 = 把承载同一 nacos 服务的**各 agent 的 matched-local healthy 实例**汇成一条
@@ -129,10 +131,22 @@ async def _run_service_rolling(task_id, service_name, force, hub_state, settings
 
     `rollout_id`(P4-2/P4-3,默认 None = 现状,裸滚不受影响):非空时本协调器除了写 rolling_task
     终态,还把同一终态回写到 rollouts 表 —— done/degraded 写终态不冻结;failed 置 frozen=True
-    (失败即停留下半迁移态,标记「冻结待人工」)。为保证**每条终态出口**(8 个:无发现实例 / 某
-    agent list 失败 / total==0 / total<2 非 force / graceful 失败即停 / 全成功 / 超时 / 通用异常)
-    都同步回写、不漏分支,把 finish_rolling 收敛进下方局部 `_finish` 闭包统一落两边。rollout_id=None
-    时 `_finish` 行为与改造前逐一调 hub_state.finish_rolling 完全一致(只是多一层透传)。
+    (失败即停留下半迁移态,标记「冻结待人工」)。为保证**每条终态出口**(无发现实例 / 某 agent
+    list 失败 / total==0 / total<2 非 force / 灰度子集未命中 / graceful 失败即停 / 全成功 / 超时 /
+    通用异常)都同步回写、不漏分支,把 finish_rolling 收敛进下方局部 `_finish` 闭包统一落两边。
+
+    `instance_filter`(P5-2 灰度,默认 None = 全量,裸滚不受影响):containerId 集合;非 None 时只滚
+    其中的实例子集(canary),其余不动。**关键不变式 —— 健康门按「全集」判定、滚动只滚「子集」**:
+    - 集群健康门(total==0 / total<2 非 force)仍按**全量 targets** 判定 —— 灰度即便只点 1 个实例滚,
+      也受全集保护(全集 healthy≥2 或 force 才放行),避免「全集就 2 个、灰度滚其一时另一个恰好挂掉」
+      导致瞬时 0 健康。
+    - 门通过后再按 instance_filter 过滤出实际要滚的 `roll_list`;落 nodes / 逐一滚 / 失败即停都基于
+      `roll_list`(非全集)。degraded 标记仍按**全集** total<2(集群整体是否处于降级容量)。
+    - instance_filter 非空但 roll_list 为空(指定的 containerId 都不在该服务健康实例内)→ failed。
+
+    **等价回归保证**:`rollout_id=None` 且 `instance_filter=None` 时,本函数与改造前**逐行等价**
+    (健康门、落 nodes、失败即停、degraded、终态回写都不变;roll_list 退化为全量 targets,_finish 仅多
+    一层透传)。既有 test_rolling.py 的 `_run_service_rolling` 用例(均不传这两参)复跑即验证此等价。
 
     TODO(后续加固,本期不做):continuous cross-probe —— 滚 A 期间持续重探 B/C 健康。MVP 靠
     「全局一次只滚一个 + 每步 wait-ready」已保证至多一个 down;对「独立第三方实例在滚动期间自行
@@ -183,7 +197,8 @@ async def _run_service_rolling(task_id, service_name, force, hub_state, settings
                         "containerId": inst["containerId"],
                     })
 
-        # 3. 集群健康门(跨 agent 实例合计):0 → 无可滚;<2 且非 force → 拒(零中断不可达)。
+        # 3. 集群健康门(**按全集 targets 判定**,灰度子集亦受全集保护):0 → 无可滚;<2 且非 force →
+        #    拒(零中断不可达)。灰度只滚子集也走这道全集门 —— 见函数 docstring「健康门按全集」不变式。
         total = len(targets)
         if total == 0:
             await _finish(
@@ -194,9 +209,23 @@ async def _run_service_rolling(task_id, service_name, force, hub_state, settings
                 "failed", error=f"集群健康实例数={total}<2,无法零中断滚动;扩容或 force")
             return
 
-        # 4. 全局逐一滚:先把全部 targets 落 nodes(pending,带 agentId+address+containerId),再按序滚。
+        # 3.5 灰度子集过滤(P5-2):instance_filter=None → roll_list=全量 targets(裸滚等价);否则取
+        #     containerId ∈ instance_filter 的子集。健康门已在上面按全集放行,这里只决定**实际滚哪些**。
+        if instance_filter is None:
+            roll_list = targets
+        else:
+            roll_list = [t for t in targets if t["containerId"] in instance_filter]
+            if not roll_list:
+                # 指定了灰度子集却无一命中该服务的健康实例(containerId 写错 / 实例已不在健康集)→ failed。
+                await _finish(
+                    "failed",
+                    error="灰度子集未命中任何可滚实例(containerId 不在该服务健康实例内)")
+                return
+
+        # 4. 全局逐一滚:把 **roll_list**(全量或灰度子集)落 nodes(pending,带 agentId+address+containerId),
+        #    再按序滚(全局一次只滚一个的不变式在子集内仍成立)。
         nodes = [{"agentId": t["agentId"], "address": t["address"],
-                  "containerId": t["containerId"], "status": "pending"} for t in targets]
+                  "containerId": t["containerId"], "status": "pending"} for t in roll_list]
         await hub_state.update_rolling_nodes(task_id, nodes)
         for idx, node in enumerate(nodes):
             nodes[idx]["status"] = "in-progress"
@@ -223,7 +252,8 @@ async def _run_service_rolling(task_id, service_name, force, hub_state, settings
             nodes[idx]["status"] = "done"
             await hub_state.update_rolling_nodes(task_id, nodes)
 
-        # 5. 全部成功:集群实例 <2(force 放行)标 degraded,否则 done。
+        # 5. 全部成功:**degraded 仍按全集 total<2 判定**(集群整体容量是否降级,与是否灰度无关;
+        #    force 放行的小集群滚完标 degraded),否则 done。
         await _finish(
             "degraded" if total < 2 else "done", nodes=nodes, degraded=(total < 2))
     except asyncio.TimeoutError:

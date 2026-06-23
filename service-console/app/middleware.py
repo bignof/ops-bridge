@@ -45,9 +45,6 @@ WHITELIST_PREFIXES: tuple[str, ...] = (
     "/api/commands",
     "/api/rolling-restart",
     "/api/service-rolling",
-    # P4-2/P4-3:投放(Rollout)端点同走 admin-token 自校验(端点首行 _require_admin_token),
-    # 故白名单放行 JWT default-deny。注:不与 /api/rolling-restart 前缀重叠(startswith 各自独立)。
-    "/api/rollouts",
 )
 
 

@@ -5,8 +5,12 @@
 本组端点显式发起一次「投放」把 desired-state 推到运行实例(或回滚)。一次投放 = 一条 rollouts 记录
 (运行态)+ 一条底层 rolling_task(跨机顺序滚动的逐实例进度),二者经 rollout.rolling_task_id 关联。
 
-鉴权:全部走 hub 自带的 X-Admin-Token(与 /api/service-rolling 同款),已在 SessionGuard 白名单
-放行(见 middleware WHITELIST 的 `/api/rollouts`),由各端点首行 `_require_admin_token` 把关。
+鉴权:走平台 JWT(`Depends(require_session)`,与 /api/services、/api/nodes 等 SPA 直调端点同款)。
+SPA(Rollout 记录页 / 发布弹窗)只持 Bearer JWT 直调本组端点,故**不**用 hub 的 X-Admin-Token
+(SPA 拿不到它)。`/api/rollouts/**` 走 `/api/**` 的 default-deny JWT 中间件(已从 middleware
+WHITELIST 移除),端点内 `Depends(require_session)` 作纵深防御(双层)。注:间接的跨机滚动入口
+`/api/rolling-restart`、`/api/service-rolling` 仍走 admin-token(它们由 nodes.py 的 JWT BFF 转调,
+非 SPA 直调),不在本次改动范围。
 
 并发互斥:复用 rolling_tasks.active_key(= serviceName)的 UNIQUE —— 同一 nacos 服务同时只允许一次
 投放(撞锁 → 409)。**先建 rolling task 成功、再建 rollout**,保证撞锁时不留半条 running 的孤儿
@@ -26,10 +30,10 @@ import asyncio
 import math
 import uuid
 
-from fastapi import APIRouter, Header, HTTPException, Path, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 
 from app import store
-from app.hub.api_support import _require_admin_token
+from app.auth import require_session
 from app.hub.store import RollingConflict
 from app.models import RolloutCreateIn, RolloutDetailOut, RolloutListOut, RolloutOut
 # 复用 rolling.py 的后台任务台账 + 收尾回调 + 跨机协调器(同一份,不另立一套)。
@@ -53,6 +57,7 @@ async def _start_rollout(
     target: str | None,
     previous_target: str | None,
     trigger: str,
+    instances: list[str] | None = None,
 ) -> dict:
     """内部 helper:建锁 → 建 rollout → 后台跑跨机滚动,返回 `{rolloutId, taskId}`。
 
@@ -63,6 +68,10 @@ async def _start_rollout(
     active_key UNIQUE 会抛 RollingConflict(调用方映射 409),此时尚未建 rollout → 不留半条 running
     的孤儿 rollout 记录。建完 rollout 再起后台任务,把 rollout_id 透传给协调器,由其在每个终态出口
     回写 rollout(done/degraded 不冻结;failed → frozen=True)。
+
+    `instances`(P5-2 灰度,默认 None = 全量):containerId 列表;非空时转成 set 作 instance_filter
+    透传给协调器 → 只滚该子集(健康门仍按全集判定,见 `_run_service_rolling` 不变式)。retry/rollback
+    入口本期**不带** instances(整体重滚,见各入口注释);子集信息本期不持久化到 rollouts 行。
     """
     import app.main as main_module
 
@@ -88,11 +97,13 @@ async def _start_rollout(
         rolling_task_id=task_id,
     )
 
-    # 3. 后台跑跨机顺序滚动协调器,透传 rollout_id(终态由协调器回写两边)。复用 rolling.py 的
-    #    _background 集合 + _on_task_done 收尾,与 /api/service-rolling 同构。
+    # 3. 后台跑跨机顺序滚动协调器,透传 rollout_id(终态由协调器回写两边)+ instance_filter(灰度子集,
+    #    空列表/None → None = 全量)。复用 rolling.py 的 _background 集合 + _on_task_done 收尾,
+    #    与 /api/service-rolling 同构。
     bg = asyncio.create_task(
         _run_service_rolling(
-            task_id, service_name, force, main_module.hub_state, _hub_settings, rollout_id=rollout_id))
+            task_id, service_name, force, main_module.hub_state, _hub_settings,
+            rollout_id=rollout_id, instance_filter=set(instances) if instances else None))
     _background.add(bg)
     bg.add_done_callback(_on_task_done)
 
@@ -106,9 +117,8 @@ async def _start_rollout(
 )
 async def create_rollout_endpoint(
     body: RolloutCreateIn,
-    admin_token: str | None = Header(default=None, alias="X-Admin-Token", title="管理令牌"),
+    _: str = Depends(require_session),
 ):
-    _require_admin_token(admin_token)
     # mode 非 restart 本期协调器不支持(只发 graceful-restart),显式 422 占位,别假装能跑。
     if body.mode != "restart":
         raise HTTPException(
@@ -123,6 +133,7 @@ async def create_rollout_endpoint(
             target=body.target,
             previous_target=None,  # 首次投放无上一版参考(回滚参考由 rollback 入口按需带)
             trigger=body.trigger,
+            instances=body.instances,  # P5-2:非空 → 灰度只滚该子集;空/缺省 → 全量
         )
     except RollingConflict as exc:
         # 同服务已有投放占锁(active_key=serviceName)→ 409;此时未建 rollout,无孤儿。
@@ -137,14 +148,13 @@ async def create_rollout_endpoint(
     description="分页返回投放记录(createdAt 倒序);支持 namespace / serviceName / status 过滤。",
 )
 async def list_rollouts_endpoint(
-    admin_token: str | None = Header(default=None, alias="X-Admin-Token", title="管理令牌"),
+    _: str = Depends(require_session),
     namespace: str | None = Query(default=None, title="按命名空间过滤"),
     service_name: str | None = Query(default=None, alias="serviceName", title="按服务名过滤"),
     status_filter: str | None = Query(default=None, alias="status", title="按状态过滤"),
     page: int = Query(default=1, ge=1, title="页码"),
     page_size: int = Query(default=20, ge=1, le=200, alias="pageSize", title="每页条数"),
 ) -> RolloutListOut:
-    _require_admin_token(admin_token)
     result = await asyncio.to_thread(
         store.list_rollouts,
         namespace=namespace,
@@ -171,9 +181,8 @@ async def list_rollouts_endpoint(
 )
 async def get_rollout_endpoint(
     rollout_id: str = Path(...),
-    admin_token: str | None = Header(default=None, alias="X-Admin-Token", title="管理令牌"),
+    _: str = Depends(require_session),
 ) -> RolloutDetailOut:
-    _require_admin_token(admin_token)
     record = await asyncio.to_thread(store.get_rollout, rollout_id)
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="投放记录不存在")
@@ -193,9 +202,8 @@ async def get_rollout_endpoint(
 )
 async def retry_rollout_endpoint(
     rollout_id: str = Path(...),
-    admin_token: str | None = Header(default=None, alias="X-Admin-Token", title="管理令牌"),
+    _: str = Depends(require_session),
 ):
-    _require_admin_token(admin_token)
     original = await asyncio.to_thread(store.get_rollout, rollout_id)
     if original is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="投放记录不存在")
@@ -204,6 +212,9 @@ async def retry_rollout_endpoint(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"仅 failed 投放可重试(当前状态 {original.status})")
     try:
+        # P5-2:retry 本期**不带** instances(整体重滚整个服务,不复用原投放的灰度子集)——
+        # rollouts 行未持久化子集信息,且失败重试通常想把整服务推到一致;灰度子集如需重滚由前端
+        # 重新发起一次带 instances 的 POST /api/rollouts。
         result = await _start_rollout(
             service_name=original.service_name,
             namespace=original.namespace,
@@ -225,9 +236,8 @@ async def retry_rollout_endpoint(
 )
 async def rollback_rollout_endpoint(
     rollout_id: str = Path(...),
-    admin_token: str | None = Header(default=None, alias="X-Admin-Token", title="管理令牌"),
+    _: str = Depends(require_session),
 ):
-    _require_admin_token(admin_token)
     original = await asyncio.to_thread(store.get_rollout, rollout_id)
     if original is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="投放记录不存在")
@@ -242,6 +252,7 @@ async def rollback_rollout_endpoint(
             detail="无上一版可回滚(previousTarget 为空)")
     try:
         # 回滚目标 = 上一版;故新 rollout 的 target 用原 previous_target(语义:把现状推回上一版)。
+        # P5-2:rollback 同样**不带** instances(整体回滚整服务,理由同 retry)。
         result = await _start_rollout(
             service_name=original.service_name,
             namespace=original.namespace,
