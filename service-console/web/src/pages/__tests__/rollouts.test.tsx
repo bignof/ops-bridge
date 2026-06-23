@@ -8,15 +8,25 @@ import { NamespaceContext, type SelectedNamespace } from '../../context/Namespac
 //  - listRollouts(params)        → 投放记录列表(服务端分页,信封;row = RolloutOut camelCase)
 //  - getRollout(id)              → 投放详情(含 rollingTask 逐实例进度)
 //  - retryRollout(id) / rollbackRollout(id) → 失败处置,捕获入参做断言
+//  - list/listServiceImages/listInstances/createRollout → 工具栏「发起投放」弹窗(P4-5)用;
+//    本页只验「按钮打开弹窗」,弹窗内细节在 PublishRolloutModal.test.tsx,这里给最小桩。
 const listRollouts = vi.fn();
 const getRollout = vi.fn();
 const retryRollout = vi.fn();
 const rollbackRollout = vi.fn();
+const list = vi.fn();
+const listServiceImages = vi.fn();
+const listInstances = vi.fn();
+const createRollout = vi.fn();
 vi.mock('../../api/resources', () => ({
   listRollouts: (...a: unknown[]) => listRollouts(...a),
   getRollout: (...a: unknown[]) => getRollout(...a),
   retryRollout: (...a: unknown[]) => retryRollout(...a),
   rollbackRollout: (...a: unknown[]) => rollbackRollout(...a),
+  list: (...a: unknown[]) => list(...a),
+  listServiceImages: (...a: unknown[]) => listServiceImages(...a),
+  listInstances: (...a: unknown[]) => listInstances(...a),
+  createRollout: (...a: unknown[]) => createRollout(...a),
 }));
 
 // RolloutsPage 用 useNamespace();受控 NamespaceContext 喂定全局 ns。默认「全部命名空间」(null)。
@@ -164,8 +174,16 @@ describe('RolloutsPage(投放记录页)', () => {
     getRollout.mockReset();
     retryRollout.mockReset();
     rollbackRollout.mockReset();
+    list.mockReset();
+    listServiceImages.mockReset();
+    listInstances.mockReset();
+    createRollout.mockReset();
     listRollouts.mockResolvedValue(rolloutsEnvelope);
     getRollout.mockResolvedValue(detailFrozen);
+    // 发布弹窗最小桩:服务列表空(弹窗能开即可,内部细节在 PublishRolloutModal.test.tsx 覆盖)。
+    list.mockResolvedValue({ count: 0, rows: [], page: 1, pageSize: 0, totalPage: 0 });
+    listServiceImages.mockResolvedValue({ count: 0, rows: [], page: 1, pageSize: 0, totalPage: 0 });
+    listInstances.mockResolvedValue({ count: 0, rows: [], page: 1, pageSize: 0, totalPage: 0 });
   });
 
   it('渲染投放行:服务/状态 Tag/冻结列(failed+frozen 显「冻结待人工」)+ 服务端分页', async () => {
@@ -190,6 +208,20 @@ describe('RolloutsPage(投放记录页)', () => {
     const params = listRollouts.mock.calls[0]?.[0] as Record<string, unknown>;
     expect(params.page).toBeDefined();
     expect(params.pageSize).toBeDefined();
+  });
+
+  it('工具栏「发起投放」按钮:点击打开发布弹窗(P4-5 入口)', async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByText('wms-admin');
+
+    // 工具栏按钮存在(role=button,name 含「发起投放」)。
+    const publishBtn = await screen.findByRole('button', { name: byNormalizedName('发起投放') });
+    await user.click(publishBtn);
+
+    // 弹窗打开:配置阶段顶部说明出现(弹窗自身从 ../../api/resources 拉 services,这里桩为空)。
+    expect(await screen.findByText('按你的变更类型选择投放机制')).toBeInTheDocument();
+    await waitFor(() => expect(list).toHaveBeenCalledWith('services', expect.anything()));
   });
 
   it('重试按钮仅 failed 显示:running 行无「重试」,failed 行有「重试」', async () => {

@@ -432,10 +432,10 @@ export async function setCurrentImage<T = ServiceImageRow>(
   return r.data;
 }
 
-// ── 投放(Rollout,P4-2/P4-3) ──────────────────────────────────────────────────
-// 投放运行记录 + 逐实例进度 + 失败处置(重试/回滚)。后端(app/hub/routers/rollouts.py)走平台 JWT。
-// 本层只覆盖「记录列表 + 详情进度 + retry/rollback」;发起投放(POST /api/rollouts)属 P4-5 发布弹窗,
-// 本期不在此封装。
+// ── 投放(Rollout,P4-2/P4-3/P4-5) ─────────────────────────────────────────────
+// 投放运行记录 + 逐实例进度 + 失败处置(重试/回滚)+ 发起投放(P4-5 发布弹窗)。
+// 后端(app/hub/routers/rollouts.py)走平台 JWT。本层覆盖「记录列表 + 详情进度 + retry/rollback +
+// createRollout(发起)」。
 
 /** 投放状态(后端状态机):running 进行中 / done 完成 / degraded 降级完成 / failed 失败。 */
 export type RolloutStatus = 'running' | 'done' | 'degraded' | 'failed';
@@ -514,6 +514,30 @@ export interface RolloutActionOut {
   taskId: string;
 }
 
+/**
+ * 发起投放请求体(对齐后端 RolloutCreateIn,camelCase)。P4-5 发布弹窗组装:
+ * - `serviceName`:**必填**,= 该服务的 nacosServiceName(后端按它抢 rolling 锁 + 跨机寻址滚动)。
+ * - `namespace`:可空;审计 + 列表过滤用(传该服务的命名空间 code)。
+ * - `mode`:'restart'(逐实例 graceful-restart 原地重启,插件变更场景)|
+ *   'pull-redeploy'(逐实例 graceful-redeploy 滚动重拉镜像,镜像变更场景)。
+ * - `image`:**仅 pull-redeploy 必填**(缺 → 后端 422);restart 时省略(后端忽略)。
+ * - `instances`:灰度子集(containerId 列表),与 mode 正交;省略 = 全量滚(集群健康门仍按全集判定)。
+ * - `force`:集群健康实例 <2 仍强滚(可能瞬时中断)。
+ * - `target`:本次投放 desired-state 人读摘要(审计);**pull-redeploy 的 image 后端不落库**,
+ *   故建议 pull-redeploy 时把镜像 tag 填进 target 便于记录页识别。
+ * - `trigger`:缺省由后端置 'manual';retry/rollback 两值由后端内部入口覆盖,前端不传。
+ */
+export interface CreateRolloutParams {
+  serviceName: string;
+  namespace?: string | null;
+  mode: 'restart' | 'pull-redeploy';
+  image?: string;
+  instances?: string[];
+  force?: boolean;
+  target?: string;
+  trigger?: string;
+}
+
 /** 投放记录列表(服务端分页,统一信封):GET /api/rollouts?namespace=&serviceName=&status=&page=&pageSize=。 */
 export async function listRollouts<T = RolloutRow>(
   params: ListParams = {},
@@ -524,6 +548,19 @@ export async function listRollouts<T = RolloutRow>(
 /** 投放详情(含逐实例滚动进度):GET /api/rollouts/{id} → RolloutDetailOut。 */
 export async function getRollout<T = RolloutDetail>(id: string): Promise<T> {
   const r = await client.get<T>(`/api/rollouts/${id}`);
+  return r.data;
+}
+
+/**
+ * 发起投放:POST /api/rollouts(body {@link CreateRolloutParams})→ {rolloutId, taskId}。
+ * `suppressGlobalError`:发布弹窗对 422(缺 image / 非法 mode)、409(同服务投放进行中)本地精确提示,
+ * 故 opt-out 全局兜底防双 toast(401 仍由拦截器统一处理)。
+ * ⚠️ opt-out 后非预期失败的可见性由弹窗 catch 自己兜底(generic fallback),不可静默吞。
+ */
+export async function createRollout(params: CreateRolloutParams): Promise<RolloutActionOut> {
+  const r = await client.post<RolloutActionOut>('/api/rollouts', params, {
+    suppressGlobalError: true,
+  });
   return r.data;
 }
 

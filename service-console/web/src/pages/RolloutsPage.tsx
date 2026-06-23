@@ -12,10 +12,12 @@ import {
   Typography,
   message,
 } from 'antd';
+import { RocketOutlined } from '@ant-design/icons';
 import * as resources from '../api/resources';
 import type { RolloutDetail, RolloutRow, RolloutStatus } from '../api/resources';
 import { useNamespace } from '../context/NamespaceContext';
 import RollingTaskNodesTable from '../components/RollingTaskNodesTable';
+import PublishRolloutModal from '../components/PublishRolloutModal';
 
 const { Text } = Typography;
 
@@ -66,8 +68,8 @@ const canRollback = (r: Pick<RolloutRow, 'status' | 'previousTarget'>) =>
  * 投放记录页(resource `rollouts`):投放运行记录 + 逐实例进度 + 失败处置(重试/回滚)。
  *
  * 一次投放 = 一条 rollout 记录(运行态)+ 一条底层 rolling task(逐实例进度),二者经
- * rollingTaskId 关联。本页只做「记录列表 + 详情进度 + 失败重试/回滚」;**发起投放**(POST /api/rollouts)
- * 属 P4-5 发布弹窗,本页不做。
+ * rollingTaskId 关联。本页做「记录列表 + 详情进度 + 失败重试/回滚」;**发起投放**(P4-5)经工具栏
+ * 「发起投放」按钮打开 {@link PublishRolloutModal}(配置→实时进度闭环),提交成功后刷新本页列表。
  *
  * 列表:服务端分页(ProTable `request` 映射 current/pageSize → 后端 page/pageSize,读统一信封)。
  * 筛选:status(下拉)、serviceName(文本)。
@@ -98,6 +100,9 @@ export default function RolloutsPage() {
 
   // 失败处置提交中的目标(行 id + 动作),用于按钮 loading + 防重复点击。
   const [actingId, setActingId] = useState<string | null>(null);
+
+  // P4-5 发布投放弹窗开关(工具栏「发起投放」打开;提交成功后刷新本页列表)。
+  const [publishOpen, setPublishOpen] = useState(false);
 
   const reload = () => actionRef.current?.reload();
 
@@ -317,7 +322,17 @@ export default function RolloutsPage() {
         pagination={{ showSizeChanger: true }}
         search={{ labelWidth: 'auto', defaultCollapsed: false }}
         options={{ reload: true, density: false, setting: false }}
-        toolBarRender={false}
+        // 工具栏:「发起投放」入口(P4-5)→ 打开发布弹窗(配置→实时进度闭环)。
+        toolBarRender={() => [
+          <Button
+            key="publish"
+            type="primary"
+            icon={<RocketOutlined />}
+            onClick={() => setPublishOpen(true)}
+          >
+            发起投放
+          </Button>,
+        ]}
         dateFormatter="string"
         scroll={{ x: 'max-content' }}
       />
@@ -392,6 +407,14 @@ export default function RolloutsPage() {
           </Space>
         )}
       </Drawer>
+
+      {/* P4-5 发布投放弹窗:配置(选服务/机制/范围/force/摘要)→ 提交后内嵌实时逐实例进度。
+          提交成功(onSubmitted)即刷新本页记录列表(新投放即时可见);关弹窗时弹窗内部清轮询定时器。 */}
+      <PublishRolloutModal
+        open={publishOpen}
+        onClose={() => setPublishOpen(false)}
+        onSubmitted={() => reload()}
+      />
     </>
   );
 }
