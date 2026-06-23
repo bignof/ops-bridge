@@ -12,7 +12,9 @@ import {
   HistoryOutlined,
   LogoutOutlined,
   PartitionOutlined,
+  PictureOutlined,
   RocketOutlined,
+  SendOutlined,
   SyncOutlined,
   UserOutlined,
 } from '@ant-design/icons';
@@ -26,9 +28,9 @@ const ALL_NS_VALUE = '';
 const { Header, Sider, Content } = Layout;
 
 // 左侧栏三组菜单:
-//   配置:命名空间 / 服务 / 插件 / 服务配置(选服务 → 绑定/解绑插件 + 改版本)
+//   配置:命名空间 / 服务 / 插件 / 服务配置(选服务 → 绑定/解绑插件 + 改版本)/ 镜像配置(选服务 → 镜像台账 + 设为当前)
 //   发布:插件上传 / 插件发布 / 获取记录
-//   运维:服务对账(意图⋈现实,纳管收件箱) / 实例(发现只读) / 节点(启停重启重部署 + 二次确认) / 操作审计(只读命令审计)
+//   运维:服务对账(意图⋈现实,纳管收件箱) / 投放记录(投放运行记录 + 逐实例进度 + 失败重试/回滚) / 实例(发现只读) / 节点(启停重启重部署 + 二次确认) / 操作审计(只读命令审计)
 // key 即对应路由 path(供 createHashRouter 的 children 挂载)。
 const MENU_ITEMS: MenuProps['items'] = [
   {
@@ -40,6 +42,7 @@ const MENU_ITEMS: MenuProps['items'] = [
       { key: '/services', icon: <DeploymentUnitOutlined />, label: '服务' },
       { key: '/plugins', icon: <AppstoreOutlined />, label: '插件' },
       { key: '/service-plugins', icon: <ApiOutlined />, label: '服务配置' },
+      { key: '/service-images', icon: <PictureOutlined />, label: '镜像配置' },
     ],
   },
   {
@@ -58,6 +61,7 @@ const MENU_ITEMS: MenuProps['items'] = [
     type: 'group',
     children: [
       { key: '/reconciliation', icon: <SyncOutlined />, label: '服务对账' },
+      { key: '/rollouts', icon: <SendOutlined />, label: '投放记录' },
       { key: '/instances', icon: <DesktopOutlined />, label: '实例' },
       { key: '/nodes', icon: <ClusterOutlined />, label: '节点' },
       { key: '/node-operations', icon: <AuditOutlined />, label: '操作审计' },

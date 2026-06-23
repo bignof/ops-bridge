@@ -393,3 +393,154 @@ export async function listReleaseHistory<T>(
 ): Promise<ListEnvelope<T>> {
   return list<T>('releases', params);
 }
+
+// ── 镜像台账(service images,P4-4) ────────────────────────────────────────────
+// 某 service 的镜像历史 + 「设为当前」。后端(app/routers/services.py)契约:
+//  - GET  /api/services/{serviceId}/images          → ServiceImageListOut(数据量小,后端不分页,
+//    一次回全集:page=1, pageSize=count, totalPage=1)。
+//  - POST /api/services/{serviceId}/images/set-current  body {image} → 置该 image 为当前(同 service
+//    单活:其它行 isCurrent 清空),返回置后的当前镜像行。**无纯追加端点**,故「新增镜像」= set-current。
+
+/** 镜像台账行(对齐后端 ServiceImageOut,全 camelCase)。isCurrent 同 service 单活。 */
+export interface ServiceImageRow {
+  id: number;
+  serviceId: number;
+  image: string;
+  /** 是否当前镜像(同 service 仅一行为 true)。 */
+  isCurrent: boolean;
+  createdAt: string;
+}
+
+/** 镜像台账列表:GET /api/services/{serviceId}/images(后端不分页,信封一次回全集)。 */
+export async function listServiceImages<T = ServiceImageRow>(
+  serviceId: string | number,
+): Promise<ListEnvelope<T>> {
+  const r = await client.get<ListEnvelope<T>>(`/api/services/${serviceId}/images`);
+  return r.data;
+}
+
+/**
+ * 设为当前镜像:POST /api/services/{serviceId}/images/set-current(body `{image}`)。
+ * 同 service 单活(其它行 isCurrent 清空)。「新增镜像」也走本端点(后端无纯追加端点)→ 新增即置当前。
+ * 返回置后的当前镜像行。
+ */
+export async function setCurrentImage<T = ServiceImageRow>(
+  serviceId: string | number,
+  image: string,
+): Promise<T> {
+  const r = await client.post<T>(`/api/services/${serviceId}/images/set-current`, { image });
+  return r.data;
+}
+
+// ── 投放(Rollout,P4-2/P4-3) ──────────────────────────────────────────────────
+// 投放运行记录 + 逐实例进度 + 失败处置(重试/回滚)。后端(app/hub/routers/rollouts.py)走平台 JWT。
+// 本层只覆盖「记录列表 + 详情进度 + retry/rollback」;发起投放(POST /api/rollouts)属 P4-5 发布弹窗,
+// 本期不在此封装。
+
+/** 投放状态(后端状态机):running 进行中 / done 完成 / degraded 降级完成 / failed 失败。 */
+export type RolloutStatus = 'running' | 'done' | 'degraded' | 'failed';
+
+/** 投放记录行(对齐后端 RolloutOut,全 camelCase)。frozen=失败即停的半迁移态(可重试/回滚)。 */
+export interface RolloutRow {
+  id: string;
+  /** 命名空间;可空。 */
+  namespace: string | null;
+  serviceName: string;
+  /** 投放模式:restart / pull-redeploy(后者本期后端 422 占位)。 */
+  mode: string;
+  /** 触发来源:manual / publish / retry / rollback。 */
+  trigger: string;
+  /** 本次投放 desired-state 人读摘要;可空。 */
+  target: string | null;
+  /** 上一版摘要(回滚参考);可空 → 回滚按钮不可用。 */
+  previousTarget: string | null;
+  status: RolloutStatus;
+  /** 失败即停冻结(半迁移态):需人工重试或回滚。 */
+  frozen: boolean;
+  /** 关联底层滚动任务 id;可空。 */
+  rollingTaskId: string | null;
+  /** 失败原因摘要;可空。 */
+  error: string | null;
+  force: boolean;
+  createdAt: string;
+  finishedAt: string | null;
+}
+
+/**
+ * 底层滚动任务逐实例进度的单个实例(对齐 hub `_rolling_to_dict` 的 nodes 项)。
+ * 跨机滚动每实例一项:`address` 为实例寻址(host:port),`containerId` 容器 id;`agentId` 仅部分场景带。
+ * `status`:pending(待滚)/ in-progress(滚动中)/ done(完成)/ failed(失败)/ skipped(跳过)。
+ */
+export interface RollingTaskNode {
+  /** 部分场景带的 agent 标识;跨机滚动多以 address 为准,可空。 */
+  agentId?: string | null;
+  /** 实例寻址(host:port)。 */
+  address: string;
+  /** 容器 id;可空。 */
+  containerId: string | null;
+  status: 'pending' | 'in-progress' | 'done' | 'failed' | 'skipped';
+  /** 该实例失败原因;可空。 */
+  error?: string | null;
+}
+
+/**
+ * 底层滚动任务(对齐 hub `_rolling_to_dict`,camelCase)。详情页据 `nodes` 呈现逐实例进度。
+ * 与 RolloutOut 形态独立(来自 hub 侧),故宽松透传(后端 RolloutDetailOut.rollingTask 即此结构或 null)。
+ */
+export interface RollingTask {
+  taskId: string;
+  agentId: string;
+  serviceName: string;
+  /** 整体滚动状态(running/done/degraded/failed/interrupted)。 */
+  status: string;
+  degraded: boolean;
+  /** 逐实例进度。 */
+  nodes: RollingTaskNode[];
+  error: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+  finishedAt?: string | null;
+}
+
+/** 投放详情(对齐后端 RolloutDetailOut):投放行字段 + 嵌入底层滚动逐实例进度(无关联为 null)。 */
+export interface RolloutDetail extends RolloutRow {
+  /** 底层滚动逐实例进度;无关联 task 或查不到为 null。 */
+  rollingTask: RollingTask | null;
+}
+
+/** retry/rollback 响应:新建一条投放,返回 {rolloutId, taskId}。 */
+export interface RolloutActionOut {
+  rolloutId: string;
+  taskId: string;
+}
+
+/** 投放记录列表(服务端分页,统一信封):GET /api/rollouts?namespace=&serviceName=&status=&page=&pageSize=。 */
+export async function listRollouts<T = RolloutRow>(
+  params: ListParams = {},
+): Promise<ListEnvelope<T>> {
+  return list<T>('rollouts', params);
+}
+
+/** 投放详情(含逐实例滚动进度):GET /api/rollouts/{id} → RolloutDetailOut。 */
+export async function getRollout<T = RolloutDetail>(id: string): Promise<T> {
+  const r = await client.get<T>(`/api/rollouts/${id}`);
+  return r.data;
+}
+
+/**
+ * 重试投放:POST /api/rollouts/{id}/retry → {rolloutId, taskId}。
+ * 仅原记录 status=failed 可,否则后端 409(前端按钮只在 failed 行显示;非预期 409 走全局兜底 toast)。
+ */
+export async function retryRollout(id: string): Promise<RolloutActionOut> {
+  const r = await client.post<RolloutActionOut>(`/api/rollouts/${id}/retry`);
+  return r.data;
+}
+
+/**
+ * 回滚投放:POST /api/rollouts/{id}/rollback → {rolloutId, taskId}。
+ * 仅 failed 且有 previousTarget 可,否则后端 409(前端按钮只在 failed+previousTarget 非空 时显示)。
+ */
+export async function rollbackRollout(id: string): Promise<RolloutActionOut> {
+  const r = await client.post<RolloutActionOut>(`/api/rollouts/${id}/rollback`);
+  return r.data;
+}

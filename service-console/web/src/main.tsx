@@ -15,6 +15,7 @@ const NamespacesPage = lazy(() => import('./pages/NamespacesPage'));
 const ServicesPage = lazy(() => import('./pages/ServicesPage'));
 const PluginsPage = lazy(() => import('./pages/PluginsPage'));
 const ServicePluginsPage = lazy(() => import('./pages/ServicePluginsPage'));
+const ImagesPage = lazy(() => import('./pages/ImagesPage'));
 const PluginUploadPage = lazy(() => import('./pages/PluginUploadPage'));
 const ReleasesPage = lazy(() => import('./pages/ReleasesPage'));
 const FetchRecordsPage = lazy(() => import('./pages/FetchRecordsPage'));
@@ -22,6 +23,7 @@ const InstancesPage = lazy(() => import('./pages/InstancesPage'));
 const NodesPage = lazy(() => import('./pages/NodesPage'));
 const NodeOperationsPage = lazy(() => import('./pages/NodeOperationsPage'));
 const ReconciliationPage = lazy(() => import('./pages/ReconciliationPage'));
+const RolloutsPage = lazy(() => import('./pages/RolloutsPage'));
 
 // 懒加载页面统一的 Suspense fallback(居中 loading)。
 const lazyPage = (node: React.ReactNode) => (
@@ -53,10 +55,12 @@ const router = createHashRouter([
       { path: 'services', element: lazyPage(<ServicesPage />) },
       { path: 'plugins', element: lazyPage(<PluginsPage />) },
       { path: 'service-plugins', element: lazyPage(<ServicePluginsPage />) },
+      { path: 'service-images', element: lazyPage(<ImagesPage />) },
       { path: 'plugin-upload', element: lazyPage(<PluginUploadPage />) },
       { path: 'releases', element: lazyPage(<ReleasesPage />) },
       { path: 'fetch-records', element: lazyPage(<FetchRecordsPage />) },
       { path: 'reconciliation', element: lazyPage(<ReconciliationPage />) },
+      { path: 'rollouts', element: lazyPage(<RolloutsPage />) },
       { path: 'instances', element: lazyPage(<InstancesPage />) },
       { path: 'nodes', element: lazyPage(<NodesPage />) },
       { path: 'node-operations', element: lazyPage(<NodeOperationsPage />) },

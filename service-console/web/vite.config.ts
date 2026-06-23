@@ -36,9 +36,11 @@ export default defineConfig({
     setupFiles: './src/test/setup.ts',
     css: false,
     // Minor-3:jsdom + antd Select(虚拟列表/portal)在 coverage 插桩下渲染明显变慢,默认 5s
-    // testTimeout 对「创建/四级级联」这类多次开关下拉的用例偏紧,会零星 timeout flake。抬到 15s
-    // 给足余量(纯等待上限,不拖慢正常通过的用例)。
-    testTimeout: 15000,
+    // testTimeout 对「创建/四级级联」这类多次开关下拉的用例偏紧,会零星 timeout flake。
+    // P3-10:命名空间切换器新增用例后整体套件更重,coverage 全量跑时「四级级联发布 / force-stop 二次确认」
+    // 这两条 Select 密集用例稳定超过 15s(无覆盖率插桩时同样用例仅 7~13s),故再抬到 30s。纯等待上限,
+    // 不弱化覆盖率门、不跳过任何用例、不拖慢正常通过的用例(它们远在该上限内)。
+    testTimeout: 30000,
     // coverage 并发下各 worker 写 coverage-N.json,曾出现 ENOENT 竞争;固定用 forks 进程池隔离,
     // 让覆盖率产物写入稳定(代价是略慢,但消除 flake)。
     pool: 'forks',
