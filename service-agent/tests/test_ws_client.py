@@ -131,6 +131,7 @@ def test_on_message_routes_rolling(monkeypatch: pytest.MonkeyPatch) -> None:
     # ws_client 模块上(打 core.rolling 改不到已绑定引用)。
     monkeypatch.setattr(module, "handle_list_instances", lambda ws, data: calls.append(("list", data)))
     monkeypatch.setattr(module, "handle_graceful_restart", lambda ws, data: calls.append(("gr", data)))
+    monkeypatch.setattr(module, "handle_graceful_redeploy", lambda ws, data: calls.append(("grd", data)))
 
     class ImmediateThread:
         def __init__(self, target, args, daemon):
@@ -144,10 +145,13 @@ def test_on_message_routes_rolling(monkeypatch: pytest.MonkeyPatch) -> None:
 
     module._on_message(None, '{"type":"list-instances","requestId":"r1","serviceName":"s"}')
     module._on_message(None, '{"type":"graceful-restart","requestId":"g1","containerId":"c"}')
+    module._on_message(None, '{"type":"graceful-redeploy","requestId":"d1","image":"registry.example.com/app:1"}')
 
-    assert [c[0] for c in calls] == ["list", "gr"]
+    assert [c[0] for c in calls] == ["list", "gr", "grd"]
     assert calls[0][1]["serviceName"] == "s"
     assert calls[1][1]["containerId"] == "c"
+    # graceful-redeploy 作为独立 message type 正确分发到 handle_graceful_redeploy
+    assert calls[2][1]["image"] == "registry.example.com/app:1"
 
 
 def test_start_heartbeat_sends_periodic_messages(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -197,6 +197,89 @@ def _validate_base(ws, data):
 # action 处理函数
 # ─────────────────────────────────────────────
 
+class RedeployResult(TypedDict):
+    """redeploy_compose_image 的结构化返回（不发 ws，由调用方决定如何回包）。
+
+    - ok：整体是否成功（pull→down→up 全绿）。
+    - output：拼好的多段 compose 输出（含回滚痕迹），供 _reply / 日志展示。
+    - error：仅「快速失败」（缺 image / 非白名单 / 无 compose 文件 / 无服务匹配 / 超时 / 异常）
+      时为可回传的短错误串；compose 步骤失败（pull/down/up 非 0）时 error=None、靠 ok=False + output。
+    """
+    ok: bool
+    output: str
+    error: str | None
+
+
+def redeploy_compose_image(data, request_id, project_dir):
+    """重新拉镜像并重部署的**纯核心**（镜像重写 → pull → down → up -d，含回滚 + 白名单校验）。
+
+    抽出来供 handle_update（命令路径，自带 ack/_reply）与 rolling.handle_graceful_redeploy
+    （滚动路径，无 ack、单一 result type、需在重建与回结果之间插 wait-ready）共用——
+    两条路径的 compose / 回滚 / 白名单逻辑必须单一来源，绝不复制两套。
+    本函数**不发任何 ws 消息**，仅返回 RedeployResult；编排（ack / 回包 / wait-ready）交给调用方。
+    """
+    image = data.get('image')
+    if not image:
+        return RedeployResult(ok=False, output='', error="Action 'update' requires the 'image' field")
+
+    # 镜像 registry 白名单闸：在 pull / 任何 compose 改写之前拦截非白名单来源。
+    # update / pull-redeploy(force) / graceful-redeploy 都经本核心，故该校验同时覆盖三条重部署路径。
+    if not is_image_registry_allowed(image, config.IMAGE_REGISTRY_ALLOWLIST):
+        return RedeployResult(ok=False, output='', error=f"镜像来源不在白名单: {image}")
+
+    compose_file = find_compose_file(project_dir)
+    if not compose_file:
+        return RedeployResult(ok=False, output='', error=f"No docker-compose.yaml/yml found in {project_dir}")
+
+    logger.info(f"redeploy: dir={project_dir}, image={image}")
+
+    all_output = []
+    original_compose = read_compose_file(compose_file)
+
+    try:
+        updated_services = update_image_in_compose(compose_file, image)
+        if not updated_services:
+            return RedeployResult(
+                ok=False, output='\n'.join(all_output),
+                error=f"No service image matched repository of '{image}' in {compose_file}",
+            )
+
+        all_output.append(f"[info] Updated image in services: {', '.join(updated_services)}")
+
+        ok, out = run_compose(project_dir, ['pull'])
+        all_output.append(f"=== docker compose pull ===\n{out}")
+        if not ok:
+            restore_compose_file(compose_file, original_compose)
+            _append_compose_restore(all_output, compose_file)
+            return RedeployResult(ok=False, output='\n'.join(all_output), error=None)
+
+        ok, out = run_compose(project_dir, ['down'])
+        all_output.append(f"=== docker compose down ===\n{out}")
+        if not ok:
+            recovered = _recover_previous_compose(project_dir, compose_file, original_compose, all_output)
+            if not recovered:
+                all_output.append("[error] Recovery failed after unsuccessful docker compose down.")
+            return RedeployResult(ok=False, output='\n'.join(all_output), error=None)
+
+        ok, out = run_compose(project_dir, ['up', '-d'])
+        all_output.append(f"=== docker compose up -d ===\n{out}")
+        if not ok:
+            recovered = _recover_previous_compose(project_dir, compose_file, original_compose, all_output)
+            if not recovered:
+                all_output.append("[error] Recovery failed after unsuccessful docker compose up -d.")
+            return RedeployResult(ok=False, output='\n'.join(all_output), error=None)
+
+    except subprocess.TimeoutExpired:
+        restore_compose_file(compose_file, original_compose)
+        return RedeployResult(ok=False, output='\n'.join(all_output), error="Command execution timed out (5 min)")
+    except Exception as e:
+        restore_compose_file(compose_file, original_compose)
+        logger.exception("Execution error")
+        return RedeployResult(ok=False, output='\n'.join(all_output), error=str(e))
+
+    return RedeployResult(ok=True, output='\n'.join(all_output), error=None)
+
+
 def handle_update(ws, data, request_id, project_dir):
     """
     update: 修改 compose 文件中的 image 字段，然后执行
@@ -218,57 +301,17 @@ def handle_update(ws, data, request_id, project_dir):
         send_error(ws, request_id, f"No docker-compose.yaml/yml found in {project_dir}")
         return
 
-    logger.info(f"update: dir={project_dir}, image={image}")
+    # ack 后把 pull/down/up + 回滚交给共享核心 redeploy_compose_image（与 graceful-redeploy 同一份逻辑）；
+    # 本函数只负责命令路径的 ack / send_error / _reply 编排，保持对外行为不变。
     send_message(ws, {'type': 'ack', 'requestId': request_id, 'status': 'processing'})
 
-    all_output = []
-    original_compose = read_compose_file(compose_file)
-
-    try:
-        updated_services = update_image_in_compose(compose_file, image)
-        if not updated_services:
-            send_error(ws, request_id, f"No service image matched repository of '{image}' in {compose_file}")
-            return
-
-        all_output.append(f"[info] Updated image in services: {', '.join(updated_services)}")
-
-        ok, out = run_compose(project_dir, ['pull'])
-        all_output.append(f"=== docker compose pull ===\n{out}")
-        if not ok:
-            restore_compose_file(compose_file, original_compose)
-            _append_compose_restore(all_output, compose_file)
-            _reply(ws, request_id, False, '\n'.join(all_output), 'update', project_dir)
-            return
-
-        ok, out = run_compose(project_dir, ['down'])
-        all_output.append(f"=== docker compose down ===\n{out}")
-        if not ok:
-            recovered = _recover_previous_compose(project_dir, compose_file, original_compose, all_output)
-            if not recovered:
-                all_output.append("[error] Recovery failed after unsuccessful docker compose down.")
-            _reply(ws, request_id, False, '\n'.join(all_output), 'update', project_dir)
-            return
-
-        ok, out = run_compose(project_dir, ['up', '-d'])
-        all_output.append(f"=== docker compose up -d ===\n{out}")
-        if not ok:
-            recovered = _recover_previous_compose(project_dir, compose_file, original_compose, all_output)
-            if not recovered:
-                all_output.append("[error] Recovery failed after unsuccessful docker compose up -d.")
-            _reply(ws, request_id, False, '\n'.join(all_output), 'update', project_dir)
-            return
-
-    except subprocess.TimeoutExpired:
-        restore_compose_file(compose_file, original_compose)
-        send_error(ws, request_id, "Command execution timed out (5 min)")
-        return
-    except Exception as e:
-        restore_compose_file(compose_file, original_compose)
-        logger.exception("Execution error")
-        send_error(ws, request_id, str(e))
+    result = redeploy_compose_image(data, request_id, project_dir)
+    # 快速失败（无服务匹配 / 超时 / 异常）→ send_error（保持原 update 语义）；其中超时/异常前核心已回滚 compose。
+    if not result['ok'] and result['error'] is not None:
+        send_error(ws, request_id, result['error'])
         return
 
-    _reply(ws, request_id, True, '\n'.join(all_output), 'update', project_dir)
+    _reply(ws, request_id, result['ok'], result['output'], 'update', project_dir)
 
 
 def handle_restart(ws, data, request_id, project_dir):

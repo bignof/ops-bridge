@@ -357,6 +357,130 @@ def test_handle_update_restores_after_up_failure(monkeypatch: pytest.MonkeyPatch
 
 
 # ─────────────────────────────────────────────
+# redeploy_compose_image — 共享重建核心（不发 ws，返回 RedeployResult）
+# update / pull-redeploy(force) / graceful-redeploy 三条路径共用本核心
+# ─────────────────────────────────────────────
+
+def test_redeploy_core_missing_image_returns_error_without_ws(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """缺 image → 快速失败：返回 error，绝不发 ws、绝不碰 compose。"""
+    ws = FakeWebSocket()  # 用于断言：核心确实没发任何消息
+    res = handlers.redeploy_compose_image({}, "req-1", str(tmp_path))
+    assert res["ok"] is False
+    assert res["error"] == "Action 'update' requires the 'image' field"
+    assert ws.messages == []
+
+
+def test_redeploy_core_rejects_non_allowlisted_image(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """非白名单 image → 返回 error（含镜像名），不调用 compose 原语。"""
+    compose_calls: list[list[str]] = []
+    monkeypatch.setattr(handlers.config, "IMAGE_REGISTRY_ALLOWLIST", ["registry.example.com"])
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "run_compose", lambda project_dir, args: (compose_calls.append(args) or (True, "ok")))
+
+    res = handlers.redeploy_compose_image({"image": "evil.com/x:1"}, "req-1", str(tmp_path))
+
+    assert res["ok"] is False
+    assert "白名单" in res["error"]
+    assert "evil.com/x:1" in res["error"]
+    assert compose_calls == []
+
+
+def test_redeploy_core_no_compose_file_returns_error(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    monkeypatch.setattr(handlers.config, "IMAGE_REGISTRY_ALLOWLIST", [])
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: None)
+    res = handlers.redeploy_compose_image({"image": "repo/app:1"}, "req-1", str(tmp_path))
+    assert res["ok"] is False
+    assert "No docker-compose" in res["error"]
+
+
+def test_redeploy_core_success_returns_output_no_error(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """成功：ok=True、error=None、output 含被改服务，且 compose 走 pull→down→up。"""
+    compose_calls: list[list[str]] = []
+    monkeypatch.setattr(handlers.config, "IMAGE_REGISTRY_ALLOWLIST", [])
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "read_compose_file", lambda compose_file: "services: {}\n")
+    monkeypatch.setattr(handlers, "update_image_in_compose", lambda *a: ["api"])
+    monkeypatch.setattr(handlers, "run_compose", lambda project_dir, args: (compose_calls.append(args) or (True, "ok")))
+
+    res = handlers.redeploy_compose_image({"image": "repo/app:9"}, "req-1", str(tmp_path))
+
+    assert res["ok"] is True
+    assert res["error"] is None
+    assert "Updated image in services: api" in res["output"]
+    assert compose_calls == [["pull"], ["down"], ["up", "-d"]]
+
+
+def test_redeploy_core_compose_pull_failure_returns_ok_false_error_none(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """compose 步骤失败（pull 非 0）→ ok=False、error=None（靠 output 定位），且已回滚 compose。"""
+    restore_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(handlers.config, "IMAGE_REGISTRY_ALLOWLIST", [])
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "read_compose_file", lambda compose_file: "services: {}\n")
+    monkeypatch.setattr(handlers, "update_image_in_compose", lambda *a: ["api"])
+    monkeypatch.setattr(handlers, "restore_compose_file", lambda cf, c: restore_calls.append((cf, c)))
+    monkeypatch.setattr(handlers, "run_compose", lambda project_dir, args: (False, "pull failed"))
+
+    res = handlers.redeploy_compose_image({"image": "repo/app:9"}, "req-1", str(tmp_path))
+
+    assert res["ok"] is False
+    assert res["error"] is None
+    assert "Restored compose file" in res["output"]
+    assert restore_calls == [("compose.yml", "services: {}\n")]
+
+
+def test_redeploy_core_down_fail_then_recovery_fail_marks_output(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """down 失败且恢复 up 也失败 → ok=False，output 含「Recovery failed ... down」。"""
+    monkeypatch.setattr(handlers.config, "IMAGE_REGISTRY_ALLOWLIST", [])
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "read_compose_file", lambda compose_file: "services: {}\n")
+    monkeypatch.setattr(handlers, "update_image_in_compose", lambda *a: ["api"])
+    monkeypatch.setattr(handlers, "restore_compose_file", lambda cf, c: None)
+
+    def fake_run(project_dir, args):
+        if args == ["pull"]:
+            return True, "pull ok"
+        # down 失败 + 恢复 up -d 也失败
+        return False, "fail"
+
+    monkeypatch.setattr(handlers, "run_compose", fake_run)
+
+    res = handlers.redeploy_compose_image({"image": "repo/app:9"}, "req-1", str(tmp_path))
+
+    assert res["ok"] is False
+    assert res["error"] is None
+    assert "Recovery failed after unsuccessful docker compose down" in res["output"]
+
+
+def test_redeploy_core_up_fail_then_recovery_fail_marks_output(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """up 失败且恢复 up 也失败 → ok=False，output 含「Recovery failed ... up -d」。"""
+    monkeypatch.setattr(handlers.config, "IMAGE_REGISTRY_ALLOWLIST", [])
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "read_compose_file", lambda compose_file: "services: {}\n")
+    monkeypatch.setattr(handlers, "update_image_in_compose", lambda *a: ["api"])
+    monkeypatch.setattr(handlers, "restore_compose_file", lambda cf, c: None)
+
+    calls: list[list[str]] = []
+
+    def fake_run(project_dir, args):
+        calls.append(args)
+        if args == ["pull"]:
+            return True, "pull ok"
+        if args == ["down"]:
+            return True, "down ok"
+        # 首次 up -d 失败；恢复 up -d（第 4 次调用）也失败
+        return False, "up failed"
+
+    monkeypatch.setattr(handlers, "run_compose", fake_run)
+
+    res = handlers.redeploy_compose_image({"image": "repo/app:9"}, "req-1", str(tmp_path))
+
+    assert res["ok"] is False
+    assert res["error"] is None
+    assert "Recovery failed after unsuccessful docker compose up -d" in res["output"]
+    assert calls == [["pull"], ["down"], ["up", "-d"], ["up", "-d"]]
+
+
+# ─────────────────────────────────────────────
 # handle_update — 镜像 registry 白名单闸（pull 之前拦截）
 # ─────────────────────────────────────────────
 

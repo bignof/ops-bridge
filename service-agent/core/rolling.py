@@ -2,8 +2,8 @@ import logging
 import re
 import time
 
-from core.graceful import _validate_health_base_url, shutdown_headers
-from core.handlers import send_message
+from core.graceful import _validate_health_base_url, drain, shutdown_headers
+from core.handlers import redeploy_compose_image, send_message
 from services import docker_cli, http_client, nacos_client
 from services.instance_match import compose_project, match_instance
 
@@ -99,4 +99,47 @@ def handle_graceful_restart(ws, data):
         safe_error = _redact(exc)
         logger.error(f"graceful-restart 失败: {safe_error}")
         send_message(ws, {"type": "graceful-restart-result", "requestId": request_id,
+                          "status": "failed", "error": safe_error})
+
+
+def handle_graceful_redeploy(ws, data):
+    """graceful-redeploy：单实例「优雅重新拉镜像部署」（graceful-restart 的镜像版）。
+
+    与 handle_graceful_restart 完全对称——同样的 drain + wait-ready 骨架，只把「重启容器」
+    换成「拉新镜像 + 重建（含回滚 + 白名单校验）」。供跨机滚动协调器逐实例调用：
+    一次只滚一个、每步 wait-ready，保证任一时刻至多一个实例 down（零中断重部署）。
+
+    为什么 wait-ready：重建后必须等新容器 /api/health/ready=200 再回 success，
+    协调器据此才敢去滚下一个实例；少了它，协调器会在新实例尚未就绪时继续，可能多实例同时 down。
+    为什么复用 drain / redeploy_compose_image：drain（优雅排空）与镜像重建/回滚/白名单逻辑
+    必须与 stop / update 单一来源，绝不另写一套 compose 或健康探测。
+    """
+    request_id = data.get("requestId")
+    base = data.get("healthBaseUrl")
+    settle = int(data.get("settleSec", 35))
+    shutdown_timeout = int(data.get("shutdownTimeoutSec", 60))
+    ready_timeout = int(data.get("readyTimeoutSec", 180))
+    try:
+        # H1：先校验 healthBaseUrl，非法/公网地址直接拒绝，绝不 drain / 拉镜像（与 graceful-restart 同闸）
+        try:
+            _validate_health_base_url(base)
+        except ValueError as ve:
+            raise RuntimeError(f"healthBaseUrl 非法或非内网地址: {ve}") from None
+        # 1) drain：复用 core.graceful.drain（POST /api/k8s/shutdown 阻塞至 worker 排空或超时）
+        drain(base, shutdown_timeout)
+        # 2) 拉镜像 + 重建：复用 handlers.redeploy_compose_image（白名单校验 + pull→down→up + 回滚）。
+        #    它不发 ws、只回 RedeployResult；image 非白名单 / 无 compose 文件 / 重建失败均在此体现。
+        result = redeploy_compose_image(data, request_id, data.get("dir"))
+        if not result["ok"]:
+            # error（快速失败短串）优先；compose 步骤失败时 error=None，回拼好的多段 output 便于定位
+            raise RuntimeError(result["error"] or result["output"] or "重部署失败")
+        # 3) wait-ready：重建后等新容器健康就绪（与 graceful-restart 同一探测 + readyTimeoutSec）
+        if not _wait_ready(f"{base}/api/health/ready", ready_timeout):
+            raise RuntimeError("节点未在超时内 ready")
+        time.sleep(settle)
+        send_message(ws, {"type": "graceful-redeploy-result", "requestId": request_id, "status": "success"})
+    except Exception as exc:
+        safe_error = _redact(exc)
+        logger.error(f"graceful-redeploy 失败: {safe_error}")
+        send_message(ws, {"type": "graceful-redeploy-result", "requestId": request_id,
                           "status": "failed", "error": safe_error})

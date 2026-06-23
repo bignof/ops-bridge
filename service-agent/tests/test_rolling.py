@@ -6,7 +6,7 @@ import json
 import time
 
 import config
-from core import rolling
+from core import handlers, rolling
 from services import nacos_client, docker_cli, http_client
 
 
@@ -351,3 +351,167 @@ def test_wait_ready_polls_then_succeeds(monkeypatch):
         "shutdownTimeoutSec": 60, "readyTimeoutSec": 9999})
     assert ws.sent[-1]["status"] == "success"
     assert 3 in recorded  # 轮询间隔 sleep(3) 被执行
+
+
+# ─────────────────────────────────────────────
+# handle_graceful_redeploy — drain → 拉镜像/重建 → wait-ready → 回 redeploy-result
+# （graceful-restart 的镜像版，与之对称）
+# ─────────────────────────────────────────────
+
+def _redeploy_msg(**overrides):
+    """构造一条 graceful-redeploy 消息（带协调器约定的全部字段），允许覆盖。"""
+    msg = {"requestId": "d1", "containerId": "abc", "image": "registry.example.com/app:1",
+           "dir": "/data/biz-app", "healthBaseUrl": "http://192.168.0.30:18029",
+           "settleSec": 7, "shutdownTimeoutSec": 60, "readyTimeoutSec": 10}
+    msg.update(overrides)
+    return msg
+
+
+def test_graceful_redeploy_success(monkeypatch):
+    # 成功路径：drain ok → 重建 ok → wait-ready ok → 回 success；并断言 settle 步骤确实跑了
+    order = []
+    monkeypatch.setattr(rolling, "drain", lambda base, timeout=60: order.append(f"drain:{base}:{timeout}"))
+    monkeypatch.setattr(rolling, "redeploy_compose_image",
+                        lambda data, rid, pd: order.append(f"redeploy:{data.get('image')}:{pd}") or
+                        {"ok": True, "output": "up ok", "error": None})
+    monkeypatch.setattr(http_client, "get_status", lambda url, timeout=5: 200)
+    recorded = []
+    monkeypatch.setattr(time, "sleep", lambda s: recorded.append(s))
+    ws = FakeWS()
+    rolling.handle_graceful_redeploy(ws, _redeploy_msg())
+    assert ws.sent == [{"type": "graceful-redeploy-result", "requestId": "d1", "status": "success"}]
+    # 次序固定：drain 必须先于重建
+    assert order == ["drain:http://192.168.0.30:18029:60", "redeploy:registry.example.com/app:1:/data/biz-app"]
+    assert 7 in recorded  # settle 承重步骤被执行
+
+
+def test_graceful_redeploy_drain_fail_skips_rebuild(monkeypatch):
+    # drain 失败 → 不重建、回 failed（redeploy_compose_image 绝不被调用）
+    rebuilt = {"n": 0}
+    monkeypatch.setattr(rolling, "drain",
+                        lambda base, timeout=60: (_ for _ in ()).throw(RuntimeError("shutdown 返回 503")))
+    monkeypatch.setattr(rolling, "redeploy_compose_image",
+                        lambda data, rid, pd: rebuilt.__setitem__("n", rebuilt["n"] + 1) or
+                        {"ok": True, "output": "", "error": None})
+    monkeypatch.setattr(http_client, "get_status", lambda url, timeout=5: 200)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    ws = FakeWS()
+    rolling.handle_graceful_redeploy(ws, _redeploy_msg())
+    assert ws.sent[-1]["type"] == "graceful-redeploy-result"
+    assert ws.sent[-1]["status"] == "failed" and "shutdown" in ws.sent[-1]["error"]
+    assert rebuilt["n"] == 0
+
+
+def test_graceful_redeploy_rejects_non_allowlisted_image_before_pull(monkeypatch):
+    # 非白名单 image → 重建核心在 pull 之前就拦下、回 failed，且绝不真正 pull/down/up。
+    # 用真实 redeploy_compose_image（仅桩 handlers 的 compose 原语），验证拦截点确在 pull 之前。
+    monkeypatch.setattr(rolling, "drain", lambda base, timeout=60: None)
+    monkeypatch.setattr(http_client, "get_status", lambda url, timeout=5: 200)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(handlers.config, "IMAGE_REGISTRY_ALLOWLIST", ["registry.example.com"])
+    compose_calls = []
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "read_compose_file", lambda compose_file: "services: {}\n")
+    monkeypatch.setattr(handlers, "update_image_in_compose", lambda *a: ["api"])
+    monkeypatch.setattr(handlers, "run_compose",
+                        lambda project_dir, args: (compose_calls.append(args) or (True, "ok")))
+    ws = FakeWS()
+    rolling.handle_graceful_redeploy(ws, _redeploy_msg(image="evil.com/x:1"))
+    assert ws.sent[-1]["status"] == "failed"
+    assert "白名单" in ws.sent[-1]["error"]
+    # 关键：拦在 pull 之前，没有任何 compose 子命令被执行
+    assert compose_calls == []
+
+
+def test_graceful_redeploy_rebuild_fail_skips_wait_ready(monkeypatch):
+    # 重建失败（compose 步骤失败，error=None）→ 回 failed（带 output），且不再 wait-ready
+    monkeypatch.setattr(rolling, "drain", lambda base, timeout=60: None)
+    monkeypatch.setattr(rolling, "redeploy_compose_image",
+                        lambda data, rid, pd: {"ok": False, "output": "pull 失败详情", "error": None})
+    ready_calls = {"n": 0}
+    monkeypatch.setattr(http_client, "get_status",
+                        lambda url, timeout=5: ready_calls.__setitem__("n", ready_calls["n"] + 1) or 200)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    ws = FakeWS()
+    rolling.handle_graceful_redeploy(ws, _redeploy_msg())
+    assert ws.sent[-1]["status"] == "failed"
+    assert "pull 失败详情" in ws.sent[-1]["error"]
+    # 重建已失败，绝不进入 wait-ready 探测
+    assert ready_calls["n"] == 0
+
+
+def test_graceful_redeploy_wait_ready_timeout(monkeypatch):
+    # 重建成功但新容器始终非 200 → wait-ready 超时 → 回 failed
+    monkeypatch.setattr(rolling, "drain", lambda base, timeout=60: None)
+    monkeypatch.setattr(rolling, "redeploy_compose_image",
+                        lambda data, rid, pd: {"ok": True, "output": "up ok", "error": None})
+    monkeypatch.setattr(http_client, "get_status", lambda url, timeout=5: 503)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    # 单调递增 clock，快速越过 deadline，_wait_ready 有限步内超时返回 False（同 graceful-restart 套路）
+    t = {"v": 1000.0}
+    def clock():
+        t["v"] += 1000
+        return t["v"]
+    monkeypatch.setattr(time, "time", clock)
+    ws = FakeWS()
+    rolling.handle_graceful_redeploy(ws, _redeploy_msg(readyTimeoutSec=1))
+    assert ws.sent[-1]["status"] == "failed" and "ready" in ws.sent[-1]["error"]
+
+
+def test_graceful_redeploy_rejects_public_ip_before_drain(monkeypatch):
+    # H1：公网 healthBaseUrl 必须被拒，且不 drain、不重建
+    calls = {"drain": 0, "rebuild": 0}
+    monkeypatch.setattr(rolling, "drain", lambda base, timeout=60: calls.__setitem__("drain", calls["drain"] + 1))
+    monkeypatch.setattr(rolling, "redeploy_compose_image",
+                        lambda data, rid, pd: calls.__setitem__("rebuild", calls["rebuild"] + 1) or
+                        {"ok": True, "output": "", "error": None})
+    monkeypatch.setattr(http_client, "get_status", lambda url, timeout=5: 200)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    ws = FakeWS()
+    rolling.handle_graceful_redeploy(ws, _redeploy_msg(healthBaseUrl="http://8.8.8.8:18029"))
+    assert ws.sent[-1]["status"] == "failed"
+    assert "内网" in ws.sent[-1]["error"] or "公网" in ws.sent[-1]["error"]
+    assert calls["drain"] == 0 and calls["rebuild"] == 0
+
+
+def test_graceful_redeploy_rejects_empty_url_before_drain(monkeypatch):
+    # H1：healthBaseUrl 缺失/为空必须被拒，不 drain、不重建
+    calls = {"drain": 0, "rebuild": 0}
+    monkeypatch.setattr(rolling, "drain", lambda base, timeout=60: calls.__setitem__("drain", calls["drain"] + 1))
+    monkeypatch.setattr(rolling, "redeploy_compose_image",
+                        lambda data, rid, pd: calls.__setitem__("rebuild", calls["rebuild"] + 1) or
+                        {"ok": True, "output": "", "error": None})
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    ws = FakeWS()
+    msg = _redeploy_msg()
+    del msg["healthBaseUrl"]
+    rolling.handle_graceful_redeploy(ws, msg)
+    assert ws.sent[-1]["status"] == "failed"
+    assert calls["drain"] == 0 and calls["rebuild"] == 0
+
+
+def test_graceful_redeploy_error_redacts_token(monkeypatch):
+    # H2 纵深防御：即便底层异常串里带 accessToken，回 hub 的 error 也必须脱敏
+    monkeypatch.setattr(rolling, "drain", lambda base, timeout=60: None)
+    def boom(data, rid, pd):
+        raise RuntimeError("失败 url=http://x/list?accessToken=SECRET&k=1")
+    monkeypatch.setattr(rolling, "redeploy_compose_image", boom)
+    monkeypatch.setattr(http_client, "get_status", lambda url, timeout=5: 200)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    ws = FakeWS()
+    rolling.handle_graceful_redeploy(ws, _redeploy_msg())
+    assert ws.sent[-1]["status"] == "failed"
+    assert "SECRET" not in ws.sent[-1]["error"]
+    assert "accessToken=***" in ws.sent[-1]["error"]
+
+
+def test_graceful_redeploy_ready_timeout_zero_probes_once(monkeypatch):
+    # L1：readyTimeoutSec=0 但节点已 ready（get_status→200），应至少探一次并成功
+    monkeypatch.setattr(rolling, "drain", lambda base, timeout=60: None)
+    monkeypatch.setattr(rolling, "redeploy_compose_image",
+                        lambda data, rid, pd: {"ok": True, "output": "up ok", "error": None})
+    monkeypatch.setattr(http_client, "get_status", lambda url, timeout=5: 200)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    ws = FakeWS()
+    rolling.handle_graceful_redeploy(ws, _redeploy_msg(readyTimeoutSec=0))
+    assert ws.sent[-1]["status"] == "success"
