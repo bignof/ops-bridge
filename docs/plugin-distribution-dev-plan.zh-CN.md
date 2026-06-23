@@ -107,9 +107,9 @@ P4 的 publish→自动滚动 依赖 §4.1 协调器(同批,不可早于它)
 | **P4-1 ✓** | **跨 agent 顺序协调器**(评审 M10/L1):新增 `_run_service_rolling` + `POST /api/service-rolling`(admin-token,middleware 白名单):按 nacos 名聚合定位各 agent → 逐 agent 取 matched-local healthy 汇成一条全局列表 → **全局一次只滚一个**(graceful drain→restart→wait-ready)→ 集群级健康门(合计<2 且非 force 拒)→ 任一失败 freeze(余下 skipped、不回滚)。unmatched 在协调器内过滤(单 agent `_run_rolling` 保留 abort 作误配安全网,定向单机用);锁按 serviceName(哨兵 agent="*")防同服务并发。**continuous cross-probe 留 TODO**(MVP「一次只滚一个+wait-ready」已保证至多一个 down) | service-console `rolling.py`/`store.py`/`middleware.py` | M, P4-0 | **已完成**(435 测试绿,95.35%);跨机顺序滚、零中断、失败即停 |
 | **P4-2 ✓** | **publish/rollback 触发控制链**(评审 M1;**实现改为 desired-state「显式投放」**:不动写端点,新增 `POST /api/rollouts` 复用 P4-1 协调器,f486375):active 变更 → 触发滚动(**进程内直调,不经 hub_client**);**跨机服务按 P0-4 事务扇出置活后一并触发**;restart / pull-redeploy 共用 P4-1 协调器(评审 M11) | service-console(`releases.py` + `rolling.py`) | M, P4-1 | 改 active → 自动滚 → 实例跑新版;跨机一次 publish 扇出 N ns |
 | **P4-3 ✓** | **失败即停(freeze)+ 收敛记录**(f486375):`Rollout` 运行记录(P0-3)落库;失败 → 标记 + 停后续 + **冻结半迁移态等人工**(不自动回滚);提供人工重试/手动回滚(走重投上一版)入口 | service-console | P4-1 | 注入失败 → 失败即停 + 状态可见可人工处置 |
-| **P4-4 ✓(后端台账)** | **服务「镜像配置」二级页 + ServiceImage 台账**(评审 H-4②):`db_models` 加 `ServiceImage`(service_id, image, isCurrent, createdAt)历史表 + 迁移 + store/路由;UI 当前/历史/**回滚→pull-redeploy**;`nodes.py` redeploy 改读 ServiceImage 当前行(与 P3-6 对齐) | service-console(`db_models`+迁移+路由+SPA) | M, P4-1 | 镜像配置页可用;回滚走 pull-redeploy |
-| P4-5 | **统一 desired-state 发布 UI**(评审 H-4③④):发布弹窗 = 暂存意图 → svcDiff → **按 diff 自动选 restart/pull-redeploy** + 变更摘要 + 逐实例进度;**镜像漂移纳入实例页 + 服务对账(镜像)**;**漂移强制重投(服务级 reapply)/同步漂移实例(单实例),不改意图**与「diff 发布」并列为两条路径(评审 L-5) | service-console(SPA + P4-1/P4-4 后端) | P4-1, P4-4 | 发布弹窗按 diff 选机制;镜像漂移可见可修 |
-| P4-6 | agent **预热**:console 通知「新版本将至」→ agent 提前回源缓存 | service-console + service-agent | P1 | 滚动时 worker 拉取零等待 |
+| **P4-4 ✓(台账+wiring+UI)** | **服务「镜像配置」二级页 + ServiceImage 台账**(评审 H-4②;台账 be48a2a + redeploy 读当前行 wiring 48455b0 + ImagesPage UI 4dd4d96):`db_models` 加 `ServiceImage`(service_id, image, isCurrent, createdAt)历史表 + 迁移 + store/路由;UI 当前/历史/**回滚→pull-redeploy**;`nodes.py` redeploy 改读 ServiceImage 当前行(与 P3-6 对齐) | service-console(`db_models`+迁移+路由+SPA) | M, P4-1 | 镜像配置页可用;回滚走 pull-redeploy |
+| **P4-5 ✓** | **统一 desired-state 发布 UI**(评审 H-4③④;PublishRolloutModal 闭环:选服务→机制 restart/pull-redeploy[含 graceful-redeploy 双仓 a645ecd+83abd11]→灰度→投放→轮询逐实例进度;**机制本期手选、非自动 diff**;镜像漂移检测待后续;入口 RolloutsPage):发布弹窗 = 暂存意图 → svcDiff → **按 diff 自动选 restart/pull-redeploy** + 变更摘要 + 逐实例进度;**镜像漂移纳入实例页 + 服务对账(镜像)**;**漂移强制重投(服务级 reapply)/同步漂移实例(单实例),不改意图**与「diff 发布」并列为两条路径(评审 L-5) | service-console(SPA + P4-1/P4-4 后端) | P4-1, P4-4 | 发布弹窗按 diff 选机制;镜像漂移可见可修 |
+| **P4-6 ✓** | agent **预热**(042f467 console restart 投放前 best-effort 并行预热 + agent prewarm 处理器双仓):console 通知「新版本将至」→ agent 提前回源缓存 | service-console + service-agent | P1 | 滚动时 worker 拉取零等待 |
 
 **P4 验收**:改 active → 跨机顺序滚都跑新版零中断;注入失败 → 失败即停(freeze)+ 可人工处置;镜像/插件两管理面 + desired-state 发布可交付。
 
@@ -120,9 +120,9 @@ P4 的 publish→自动滚动 依赖 §4.1 协调器(同批,不可早于它)
 | ID | 任务 | 仓库 / 模块 | 前置 | 验收 |
 | --- | --- | --- | --- | --- |
 | **P5-1 ✓** | **审计口径 = 回源粒度**(评审 M2/M9/H-7,决策已定;**核实已落地**:`distribution.query_plugins` 每命中写一行 fetch_record,粒度 = ns/service/plugin/version + remark,无 per-container/worker 自报字段,调用方靠 pull token 反解 ns;读端点 `fetch_records.py` 同口径,无需改码):console `fetch_record` = **回源粒度**(ns/service + 回源版本/时间),不承诺 per-container;caller 取 agent 反查(源 IP→容器),不信 worker 自报 header;**原型「获取记录」已改回源粒度口径**;per-container 审计若需则走 agent 本地日志(可选,另起任务) | service-console + service-agent | P1 | 审计口径=回源粒度、不可伪造 |
-| P5-2 | 灰度发布(只滚部分实例 / 按 DiscoveredNode 子集) | service-console | P4 | 可灰度 |
+| **P5-2 ✓(后端)** | 灰度发布(只滚部分实例 / 按 DiscoveredNode 子集;48455b0:`_run_service_rolling` 加 `instance_filter` 子集滚 + 集群健康门按全集判定 canary 受保护;`RolloutCreateIn.instances` 透传;**灰度选实例 UI 随 P4-5**) | service-console | P4 | 可灰度(后端) |
 | P5-3 | 缓存 sha256 校验(**可选**,按 §5 取舍不阻塞、不强制) | service-console + agent | P1 | 启用后校验生效 |
-| P5-4 | 可观测面板(agent /health 扩展、`Rollout` 发布运行记录、发布→投放关联视图) | service-console + agent | P3/P4 | 面板齐全 |
+| **P5-4 ✓** | 可观测面板(agent /health 扩展=plugin_server /health[cache/discovery 概况];Rollout 记录 + 发布→投放关联=RolloutsPage;**镜像漂移检测待后续**)(agent /health 扩展、`Rollout` 发布运行记录、发布→投放关联视图) | service-console + agent | P3/P4 | 面板齐全 |
 | P5-5 | **迁移老节点**:root-JWT→pull-token、adminUrl→本机 agent;生成/下发新 `sync-plugins.config.json` 到各 worker | cnp + 部署 | P1/P2 | 老节点平滑迁入 |
 
 ---
