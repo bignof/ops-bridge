@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from app.config import settings as _hub_settings
 import asyncio
+import logging
 import math
 import uuid
 
@@ -37,6 +38,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 
 from app import store
 from app.auth import require_session
+from app.db_models import Service
 from app.hub.store import RollingConflict
 from app.models import RolloutCreateIn, RolloutDetailOut, RolloutListOut, RolloutOut
 # 复用 rolling.py 的后台任务台账 + 收尾回调 + 跨机协调器(同一份,不另立一套)。
@@ -48,7 +50,65 @@ from app.hub.routers.rolling import (
 )
 
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/rollouts", tags=["投放"])
+
+
+async def _prewarm_service(service_name: str, hub_state, settings) -> None:
+    """restart 投放前的 best-effort「预热」:通知承载该服务的各 agent 把插件回源下载入缓存。
+
+    **为什么只 restart 预热**:restart 模式下 worker 优雅重启时会**从 agent 缓存重新拉插件**——
+    预先让 agent 把插件回源下载入缓存,随后重启就能零等待拉包。pull-redeploy 拉的是**镜像**(不经
+    agent 插件缓存),预热插件无意义,故调用方只在 mode=='restart' 时调本函数(见 `_start_rollout`)。
+
+    **best-effort 铁律**:本函数任何失败 / 超时 / 异常**绝不**冒泡、绝不影响投放——预热纯属加速,
+    预热没热完(或全挂)时 worker 重启会按需回源拉取,无害。故:① 每个 agent 的 call_agent 单独包
+    try/except(含 asyncio.TimeoutError 与任意 Exception),失败只记一条日志、继续下一个 agent;
+    ② 整个函数再包一层兜底 try/except,任何意外(聚合查询 / Service 查询出错等)都只记日志。
+    用短超时(list_instances_timeout,非长的 rolling_cmd_timeout):预热是旁路加速,不该久等。
+
+    serviceCode 解析:console 这边 service_name 是 nacos 服务名,而 agent 的 prewarm 契约要的是
+    **平台侧 serviceCode**(= Service.service_code)。按 `nacos_service_name == service_name` 查
+    Service 行,收集去重其全部 service_code(同一 nacos 名可能跨多 namespace 有多行 → 多个 code,
+    一并发给 agent)。查不到任何映射 → 无从预热,静默 return。
+    """
+    try:
+        # 1. 定位 agents:按 nacos 名聚合 active 发现实例 → 取承载该服务的不重复 agent(与滚动协调器同源)。
+        agg = await asyncio.to_thread(store.aggregate_discovered_by_nacos, "active")
+        group = agg.get(service_name, [])
+        agent_ids: list[str] = []
+        for dn in group:
+            if dn.agent_id not in agent_ids:
+                agent_ids.append(dn.agent_id)
+        if not agent_ids:
+            # 无承载该服务的活跃 agent → 无对象可预热,静默跳过(投放本身不受影响)。
+            return
+
+        # 2. 解析 serviceCodes:nacos_service_name == service_name 的 Service 行,去重收集 service_code。
+        services = await asyncio.to_thread(
+            store.find_rows, Service,
+            filters=[Service.nacos_service_name == service_name])
+        service_codes: list[str] = []
+        for svc in services:
+            if svc.service_code and svc.service_code not in service_codes:
+                service_codes.append(svc.service_code)
+        if not service_codes:
+            # nacos 名映射不到任何 serviceCode → 无从预热(agent 按 serviceCode 取插件清单),静默跳过。
+            return
+
+        # 3. 逐 agent best-effort 发 prewarm;单个 agent 失败/超时只记日志、继续下一个,绝不抛。
+        for agent_id in agent_ids:
+            try:
+                await hub_state.call_agent(
+                    agent_id,
+                    {"type": "prewarm", "requestId": str(uuid.uuid4()), "services": service_codes},
+                    timeout=settings.list_instances_timeout)
+            except Exception as exc:  # noqa: BLE001 —— 含 TimeoutError;best-effort,吞掉继续下一个 agent
+                logger.info(
+                    "预热(prewarm)agent %s 失败(best-effort,忽略,不影响投放): %s", agent_id, exc)
+    except Exception as exc:  # noqa: BLE001 —— 兜底:聚合/Service 查询等任何意外都不得影响投放
+        logger.warning("预热(prewarm)服务 %s 出现意外(best-effort,忽略): %s", service_name, exc)
 
 
 async def _start_rollout(
@@ -104,6 +164,17 @@ async def _start_rollout(
         force=force,
         rolling_task_id=task_id,
     )
+
+    # 2.5 best-effort 预热(仅 restart):投放前通知各 agent 预拉插件缓存,使随后 worker 重启拉包零等待。
+    #     选 (a) 并行后台任务(非 await):预热在 agent 端是幂等的回源下载,worker 重启时若还没热完就
+    #     按需拉,无害;放后台则投放零延迟、且预热失败不可能改变本函数返回/时序(best-effort 铁律)。
+    #     与滚动协调器并行起,同样进 _background + _on_task_done 收尾(避免「task was destroyed」+ 吞异常)。
+    #     pull-redeploy 拉的是镜像非插件,不预热(见 _prewarm_service docstring)。
+    if mode == "restart":
+        warm = asyncio.create_task(
+            _prewarm_service(service_name, main_module.hub_state, _hub_settings))
+        _background.add(warm)
+        warm.add_done_callback(_on_task_done)
 
     # 3. 后台跑跨机顺序滚动协调器,透传 rollout_id(终态由协调器回写两边)+ instance_filter(灰度子集,
     #    空列表/None → None = 全量)。复用 rolling.py 的 _background 集合 + _on_task_done 收尾,

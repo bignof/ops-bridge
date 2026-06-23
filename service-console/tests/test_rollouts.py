@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 from app import store
 from app.auth import issue_token
 from app.db import Database
-from app.db_models import Rollout
+from app.db_models import Rollout, Service
 from app.hub.routers import rolling as rolling_router
 
 # 鉴权改平台 JWT(Rollout 端点从 X-Admin-Token → require_session,供 SPA Bearer 直调)。
@@ -196,6 +196,7 @@ class FakeSettings:
     rolling_shutdown_timeout = 60
     rolling_ready_timeout = 10
     rolling_cmd_timeout = 30
+    list_instances_timeout = 5  # P4-6 预热用的短超时(prewarm 旁路加速,不该久等)
 
 
 def _inst(addr, cid, matched=True, healthy=True):
@@ -649,3 +650,227 @@ def test_rollback_missing_returns_404(hub_client: TestClient) -> None:
 def test_rollback_requires_jwt(hub_client: TestClient) -> None:
     # 鉴权改 JWT:无 Bearer → 401(default-deny)。
     assert hub_client.post("/api/rollouts/x/rollback").status_code == 401
+
+
+# =====================================================================================
+# P4-6 best-effort 预热(prewarm):restart 投放前通知 agent 预拉插件缓存
+# =====================================================================================
+#
+# 契约(agent 侧):console → agent `{type:"prewarm", requestId, services:[serviceCode...]}`。
+# 铁律:预热失败/超时**绝不**影响投放(返回/时序/抢锁顺序不变);只 restart 预热,pull-redeploy 不预热。
+#
+# 单测分两层:① 直调 `_prewarm_service`(配 FakePrewarmHub + mock 聚合/Service 查询)精确断言
+# 发了什么/吞了异常;② 端点层(hub_client + _capture_coordinator 桩掉真协调器)断言 restart 触发预热、
+# pull-redeploy 不触发,且预热不改变 {rolloutId, taskId} 契约。
+
+
+class FakePrewarmHub:
+    """prewarm 专用 hub 桩:记录每次 call_agent 的 (agent_id, message);可选注入异常验证 best-effort 吞错。
+
+    `raise_for`:agent_id → 要抛的异常(模拟该 agent 超时/连接不可用);其余 agent 正常记录回 success。
+    """
+
+    def __init__(self, *, raise_for: dict | None = None):
+        self.calls: list = []
+        self.raise_for = raise_for or {}
+
+    async def call_agent(self, agent_id, message, timeout):
+        self.calls.append((agent_id, message, timeout))
+        if agent_id in self.raise_for:
+            raise self.raise_for[agent_id]
+        return {"type": "prewarm-result", "requestId": message["requestId"], "status": "success", "warmed": 1}
+
+
+def _mk_service(namespace_id: int, service_code: str, nacos_service_name: str | None):
+    # 建一条 Service 行(created_at/updated_at 由 create_row 自动补);供 serviceCode 解析用例使用。
+    return store.create_row(
+        Service,
+        {"namespace_id": namespace_id, "service_code": service_code, "nacos_service_name": nacos_service_name},
+    )
+
+
+def test_prewarm_sends_prewarm_with_service_codes_to_each_agent(client: TestClient, monkeypatch) -> None:
+    # 承载该 nacos 服务的两个 agent;nacos 名映射到一个 serviceCode → 给每个 agent 发 type=prewarm + 该 code。
+    from app.hub.routers import rollouts as rollouts_mod
+
+    _patch_agg(monkeypatch, {"svc-nacos": ["agent-a", "agent-b"]})
+    _mk_service(1, "svc-code", "svc-nacos")
+    hub = FakePrewarmHub()
+
+    asyncio.run(rollouts_mod._prewarm_service("svc-nacos", hub, FakeSettings()))
+
+    # 两个 agent 各被发了一次 prewarm,services 含正确 serviceCode,且用短超时(list_instances_timeout)。
+    assert len(hub.calls) == 2
+    assert {c[0] for c in hub.calls} == {"agent-a", "agent-b"}
+    for _agent, msg, timeout in hub.calls:
+        assert msg["type"] == "prewarm"
+        assert msg["services"] == ["svc-code"]
+        assert "requestId" in msg
+        assert timeout == FakeSettings.list_instances_timeout
+
+
+def test_prewarm_dedupes_multiple_service_codes(client: TestClient, monkeypatch) -> None:
+    # 同 nacos 名跨多 namespace 有多 Service 行 → 收集去重全部 serviceCode 一并发(顺序按 id)。
+    from app.hub.routers import rollouts as rollouts_mod
+
+    _patch_agg(monkeypatch, {"svc-nacos": ["agent-a"]})
+    _mk_service(1, "code-1", "svc-nacos")
+    _mk_service(2, "code-2", "svc-nacos")
+    _mk_service(3, "code-dup", "other-nacos")  # 不同 nacos 名,不应入选
+    hub = FakePrewarmHub()
+
+    asyncio.run(rollouts_mod._prewarm_service("svc-nacos", hub, FakeSettings()))
+
+    assert len(hub.calls) == 1
+    assert hub.calls[0][1]["services"] == ["code-1", "code-2"]
+
+
+def test_prewarm_swallows_call_agent_exception(client: TestClient, monkeypatch) -> None:
+    # best-effort:某 agent call_agent 抛异常(TimeoutError/任意 Exception)→ 不冒泡,继续发下一个 agent。
+    from app.hub.routers import rollouts as rollouts_mod
+
+    _patch_agg(monkeypatch, {"svc-nacos": ["agent-bad", "agent-good"]})
+    _mk_service(1, "svc-code", "svc-nacos")
+    hub = FakePrewarmHub(raise_for={"agent-bad": asyncio.TimeoutError()})
+
+    # 不抛(异常被吞);两个 agent 都被尝试过(失败的也算尝试)。
+    asyncio.run(rollouts_mod._prewarm_service("svc-nacos", hub, FakeSettings()))
+    assert {c[0] for c in hub.calls} == {"agent-bad", "agent-good"}
+
+
+def test_prewarm_no_agent_silently_skips(client: TestClient, monkeypatch) -> None:
+    # 聚合里无该服务(无承载 agent)→ 静默跳过,一次 call_agent 都不发。
+    from app.hub.routers import rollouts as rollouts_mod
+
+    _patch_agg(monkeypatch, {"other": ["agent-a"]})
+    _mk_service(1, "svc-code", "svc-nacos")
+    hub = FakePrewarmHub()
+
+    asyncio.run(rollouts_mod._prewarm_service("svc-nacos", hub, FakeSettings()))
+    assert hub.calls == []
+
+
+def test_prewarm_no_service_code_mapping_silently_skips(client: TestClient, monkeypatch) -> None:
+    # 有承载 agent 但 nacos 名映射不到任何 Service.service_code → 无从预热,静默跳过(不发 prewarm)。
+    from app.hub.routers import rollouts as rollouts_mod
+
+    _patch_agg(monkeypatch, {"svc-nacos": ["agent-a"]})
+    # 不建任何 nacos_service_name == "svc-nacos" 的 Service 行。
+    hub = FakePrewarmHub()
+
+    asyncio.run(rollouts_mod._prewarm_service("svc-nacos", hub, FakeSettings()))
+    assert hub.calls == []
+
+
+def test_prewarm_aggregate_error_is_swallowed(client: TestClient, monkeypatch) -> None:
+    # 兜底层:聚合查询本身抛错 → 整个 _prewarm_service 吞掉(不抛),投放调用方永不受影响。
+    from app.hub.routers import rollouts as rollouts_mod
+    import app.store as store_mod
+
+    def _boom(status="active"):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(store_mod, "aggregate_discovered_by_nacos", _boom)
+    hub = FakePrewarmHub()
+
+    # 不抛异常即通过(兜底 try/except 生效)。
+    asyncio.run(rollouts_mod._prewarm_service("svc-nacos", hub, FakeSettings()))
+    assert hub.calls == []
+
+
+def _capture_prewarm(monkeypatch) -> dict:
+    """把 rollouts 路由引用的 _prewarm_service 换成 async 桩,捕获是否被调 + 入参(service_name)。
+
+    与 _capture_coordinator 同理:rollouts.py 直接定义/调用 _prewarm_service,在
+    `app.hub.routers.rollouts` 模块上 patch 才生效。端点层只验「restart 调、pull-redeploy 不调」这一
+    分流契约,不真发 agent 调用。
+    """
+    import app.hub.routers.rollouts as rollouts_mod
+
+    captured: dict = {"called": False, "service_name": None, "count": 0}
+
+    async def fake_prewarm(service_name, hub_state, settings):
+        captured["called"] = True
+        captured["service_name"] = service_name
+        captured["count"] += 1
+
+    monkeypatch.setattr(rollouts_mod, "_prewarm_service", fake_prewarm)
+    return captured
+
+
+def test_restart_rollout_triggers_prewarm(hub_client: TestClient, monkeypatch) -> None:
+    # restart 投放:触发预热(对该服务),且 {rolloutId, taskId} 契约不变(预热不改返回/时序)。
+    _capture_coordinator(monkeypatch)  # 桩掉真协调器(后台不真跑)
+    captured = _capture_prewarm(monkeypatch)
+    resp = hub_client.post("/api/rollouts", json={"serviceName": "svc-warm"}, headers=ADMIN)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "rolloutId" in body and "taskId" in body
+    # 后台预热任务异步起;给事件循环一拍让其执行到桩。
+    asyncio.run(asyncio.sleep(0.05))
+    assert captured["called"] is True
+    assert captured["service_name"] == "svc-warm"
+
+
+def test_pull_redeploy_rollout_does_not_prewarm(hub_client: TestClient, monkeypatch) -> None:
+    # pull-redeploy 投放:拉的是镜像非插件,**不**预热;投放本身照常(返 ids)。
+    _capture_coordinator(monkeypatch)
+    captured = _capture_prewarm(monkeypatch)
+    resp = hub_client.post(
+        "/api/rollouts",
+        json={"serviceName": "svc-pr-warm", "mode": "pull-redeploy", "image": "reg/app:v2"},
+        headers=ADMIN)
+    assert resp.status_code == 200
+    asyncio.run(asyncio.sleep(0.05))
+    assert captured["called"] is False
+
+
+def test_prewarm_failure_does_not_break_rollout_e2e(hub_client: TestClient, monkeypatch) -> None:
+    # 端到端 best-effort:预热里 call_agent 全抛异常,投放仍正常推进到终态(done),异常不冒泡。
+    import app.main as main_module
+    import app.store as store_mod
+    from app.hub.routers import rolling as rolling_mod  # noqa: F401  (确保协调器真跑)
+
+    state = main_module.hub_state
+
+    # 聚合定位到单 agent(承载该服务);_prewarm_service 与协调器都读 .agent_id。
+    class _FakeDN:
+        def __init__(self, agent_id):
+            self.agent_id = agent_id
+            self.container_id = None
+            self.dir = None
+
+    monkeypatch.setattr(
+        store_mod, "aggregate_discovered_by_nacos",
+        lambda status="active": {"svc-warm-e2e": [_FakeDN("agent-warm")]})
+    # 让 prewarm 的 serviceCode 解析有结果(否则静默跳过,测不到「失败仍不影响」)。
+    _mk_service(1, "svc-warm-code", "svc-warm-e2e")
+
+    async def fake_call_agent(agent_id, message, timeout):
+        if message["type"] == "prewarm":
+            # 预热一律失败 —— 验证 best-effort:绝不影响投放。
+            raise asyncio.TimeoutError()
+        if message["type"] == "list-instances":
+            return {"status": "success", "instances": [
+                {"address": "ha:1", "containerId": "a1", "healthy": True, "matched": True},
+                {"address": "ha:2", "containerId": "a2", "healthy": True, "matched": True},
+            ]}
+        return {"status": "success"}  # graceful-restart
+
+    monkeypatch.setattr(state, "call_agent", fake_call_agent)
+
+    resp = hub_client.post("/api/rollouts", json={"serviceName": "svc-warm-e2e"}, headers=ADMIN)
+    assert resp.status_code == 200  # 预热失败不影响投放发起
+    rollout_id = resp.json()["rolloutId"]
+
+    async def _await_done():
+        for _ in range(100):
+            row = await asyncio.to_thread(store.get_rollout, rollout_id)
+            if row is not None and row.status in ("done", "degraded", "failed"):
+                return row
+            await asyncio.sleep(0.02)
+        return await asyncio.to_thread(store.get_rollout, rollout_id)
+
+    row = asyncio.run(_await_done())
+    # 投放照常完成(预热失败被吞,滚动正常滚完两个实例)。
+    assert row.status == "done"
