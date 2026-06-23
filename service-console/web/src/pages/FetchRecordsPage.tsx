@@ -1,5 +1,6 @@
 import { ProTable, type ProColumns } from '@ant-design/pro-components';
 import * as resources from '../api/resources';
+import { useNamespace } from '../context/NamespaceContext';
 
 // 获取记录行(对齐 P1a `fetch-records` list 契约,全 camelCase)。
 // 列全部用后端 LEFT JOIN 回的可读名(基线 §7):
@@ -91,20 +92,37 @@ const columns: ProColumns<FetchRecordRow>[] = [
  * 映射为后端 `page`/`pageSize`,读统一信封 `{count, rows, …}` 后返回 ProTable 约定结构,
  * **勿全量返回**。B2:筛选(`?namespaceId=` / `?serviceId=`,基线硬要求)经查询表单的
  * namespaceId/serviceId 筛选列平铺透传到服务端。
+ *
+ * P3-10:顶栏命名空间切换器联动 —— 选具体 ns 时按其 id 强制注入 `?namespaceId=`(经 params 的
+ * `globalNamespaceId`,在 request 内覆盖本页命名空间筛选列,以全局为准);选「全部」不注入,回到全集。
  */
 export default function FetchRecordsPage() {
+  // P3-10:全局命名空间(null = 全部 → 不过滤;具体 ns → 按其数值 id 过滤 ?namespaceId=)。
+  const { namespace } = useNamespace();
   return (
     <ProTable<FetchRecordRow>
       rowKey="id"
       columns={columns}
+      // P3-10:全局 ns 经 params 透传(独立键 globalNamespaceId,避免与表单 namespaceId 撞);变更即重拉。
+      params={{ globalNamespaceId: namespace?.id ?? '' }}
       // 服务端分页:current/pageSize → 后端 page/pageSize;其余 params(查询表单产生的
       // namespaceId/serviceId 过滤)平铺透传;读信封后返回 ProTable 约定结构。
       request={async (params) => {
-        const { current, pageSize, ...filter } = params;
+        const { current, pageSize, globalNamespaceId, ...filter } = params as typeof params & {
+          globalNamespaceId?: string | number;
+        };
+        const cleaned: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(filter)) {
+          if (v !== undefined && v !== null && v !== '') cleaned[k] = v;
+        }
+        // 全局命名空间优先:选了具体 ns 则以其 id 强制覆盖本页 namespaceId 筛选列(以全局为准)。
+        if (globalNamespaceId !== undefined && globalNamespaceId !== null && globalNamespaceId !== '') {
+          cleaned.namespaceId = globalNamespaceId;
+        }
         const env = await resources.list<FetchRecordRow>('fetch-records', {
           page: current,
           pageSize,
-          ...filter,
+          ...cleaned,
         });
         return { data: env.rows, total: env.count, success: true };
       }}

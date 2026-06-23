@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, type RenderResult } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import FetchRecordsPage from '../FetchRecordsPage';
+import { NamespaceContext, type SelectedNamespace } from '../../context/NamespaceContext';
 
 // mock 资源层:获取记录页只读,数据访问走 ../../api/resources:
 //  - list('fetch-records', ...) → 列表(服务端分页 + ?namespaceId=/?serviceId= 过滤)
@@ -10,6 +11,17 @@ const list = vi.fn();
 vi.mock('../../api/resources', () => ({
   list: (...a: unknown[]) => list(...a),
 }));
+
+// 获取记录页用 useNamespace(),用受控 NamespaceContext 喂定全局 ns。默认「全部命名空间」(null);
+// 传 namespace 模拟「选了某具体 ns」以验证强制注入 ?namespaceId=。
+const renderPage = (namespace: SelectedNamespace | null = null): RenderResult =>
+  render(
+    <NamespaceContext.Provider
+      value={{ namespace, setNamespace: () => {}, options: [], optionsLoading: false }}
+    >
+      <FetchRecordsPage />
+    </NamespaceContext.Provider>,
+  );
 
 // jsdom 不实现以下 API,ProTable / antd 渲染会调用,补最小 stub 保证用例稳定。
 if (!HTMLElement.prototype.scrollIntoView) {
@@ -102,7 +114,7 @@ describe('FetchRecordsPage', () => {
   });
 
   it('只读列表渲染:列用后端可读名 namespaceCode/serviceCode/pluginCode/version/fetchDate + remark', async () => {
-    render(<FetchRecordsPage />);
+    renderPage();
 
     // 列直接用后端 JOIN 回的可读名(服务列=serviceCode,不是空的 serviceName)。
     expect(await screen.findByText('svc-demo')).toBeInTheDocument();
@@ -121,7 +133,7 @@ describe('FetchRecordsPage', () => {
   });
 
   it('走 resources.list("fetch-records") 且服务端分页:参数含 page/pageSize', async () => {
-    render(<FetchRecordsPage />);
+    renderPage();
     await screen.findByText('svc-demo');
 
     // 关键断言:列表调 list('fetch-records', ...) 且把 ProTable current/pageSize 映射成后端 page/pageSize
@@ -134,7 +146,7 @@ describe('FetchRecordsPage', () => {
   });
 
   it('纯只读:无「添加」按钮、无行内编辑/删除', async () => {
-    render(<FetchRecordsPage />);
+    renderPage();
     await screen.findByText('svc-demo');
 
     // 只读审计表(基线 §7「本页无写操作」):不渲染添加按钮,也无行内编辑/删除。
@@ -146,7 +158,7 @@ describe('FetchRecordsPage', () => {
   // B2(命名空间服务端过滤):基线硬要求。选命名空间筛选项 → 查询 → list('fetch-records',{namespaceId}) 透传后端。
   it('筛选区按命名空间过滤:选筛选项 → list("fetch-records", {namespaceId}) 带后端过滤参数', async () => {
     const user = userEvent.setup();
-    render(<FetchRecordsPage />);
+    renderPage();
     await screen.findByText('svc-demo');
 
     await openSelect(user, 'namespaceId');
@@ -172,7 +184,7 @@ describe('FetchRecordsPage', () => {
   // B2(服务服务端过滤):基线硬要求。选服务筛选项 → 查询 → list('fetch-records',{serviceId}) 透传后端。
   it('筛选区按服务过滤:选筛选项 → list("fetch-records", {serviceId}) 带后端过滤参数', async () => {
     const user = userEvent.setup();
-    render(<FetchRecordsPage />);
+    renderPage();
     await screen.findByText('svc-demo');
 
     await openSelect(user, 'serviceId');
@@ -182,5 +194,28 @@ describe('FetchRecordsPage', () => {
     await waitFor(() => {
       expect(list).toHaveBeenCalledWith('fetch-records', expect.objectContaining({ serviceId: 2 }));
     });
+  });
+
+  // P3-10:顶栏切换器选了具体命名空间 → 强制按其 id 注入 ?namespaceId=(覆盖本页筛选列,以全局为准)。
+  it('全局选了具体命名空间 → 列表 request 强制带 namespaceId(全局过滤)', async () => {
+    renderPage({ id: 5, code: 'ns-five' });
+    // 首屏列表请求即带全局 ns 的 id。
+    await waitFor(() =>
+      expect(list).toHaveBeenCalledWith(
+        'fetch-records',
+        expect.objectContaining({ namespaceId: 5 }),
+      ),
+    );
+  });
+
+  // P3-10:全局「全部命名空间」(null)→ 不注入 namespaceId,本页筛选列照常(回归 B2 不被破坏)。
+  it('全局「全部命名空间」→ 列表 request 不带 namespaceId(本页筛选列仍可用)', async () => {
+    renderPage(null);
+    await waitFor(() => expect(list).toHaveBeenCalledWith('fetch-records', expect.anything()));
+    for (const call of list.mock.calls) {
+      if (call[0] !== 'fetch-records') continue;
+      const p = (call[1] ?? {}) as Record<string, unknown>;
+      expect(p.namespaceId).toBeUndefined();
+    }
   });
 });

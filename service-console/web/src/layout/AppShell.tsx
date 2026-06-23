@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
-import { Avatar, Dropdown, Layout, Menu, Typography, type MenuProps } from 'antd';
+import { Avatar, Dropdown, Layout, Menu, Select, Space, Typography, type MenuProps } from 'antd';
 import {
   ApiOutlined,
   AppstoreOutlined,
@@ -17,6 +17,11 @@ import {
   UserOutlined,
 } from '@ant-design/icons';
 import { useAuth } from '../auth/AuthContext';
+import { useNamespace } from '../context/NamespaceContext';
+
+// 命名空间切换器「全部命名空间」哨兵值(空串):antd Select value 必须是基元,用空串代表「不过滤」。
+// 与 sessionStorage 持久化的 null 语义对应(见 NamespaceContext)。
+const ALL_NS_VALUE = '';
 
 const { Header, Sider, Content } = Layout;
 
@@ -64,6 +69,7 @@ export default function AppShell() {
   const navigate = useNavigate();
   const location = useLocation();
   const { user, logout } = useAuth();
+  const { namespace, setNamespace, options, optionsLoading } = useNamespace();
 
   // 根路径('/')默认高亮命名空间。
   const selectedKey = location.pathname === '/' ? '/namespaces' : location.pathname;
@@ -75,6 +81,29 @@ export default function AppShell() {
 
   const onUserMenuClick: MenuProps['onClick'] = (info) => {
     if (info.key === 'logout') logout();
+  };
+
+  // 命名空间切换器 options:置顶「全部命名空间」(哨兵空串)+ 各命名空间(label=code,value=id 串)。
+  const nsSelectOptions = useMemo(
+    () => [
+      { label: '全部命名空间', value: ALL_NS_VALUE },
+      ...options.map((n) => ({ label: n.code || String(n.id), value: String(n.id) })),
+    ],
+    [options],
+  );
+
+  // 切换器当前值:选了具体命名空间显其 id 串,否则「全部」哨兵。
+  const nsValue = namespace ? String(namespace.id) : ALL_NS_VALUE;
+
+  // 选中变化:空串 → 切回「全部」(setNamespace(null));否则按 id 反查命名空间行,带上 code 一并存。
+  const onNamespaceChange = (value: string) => {
+    if (value === ALL_NS_VALUE) {
+      setNamespace(null);
+      return;
+    }
+    const row = options.find((n) => String(n.id) === value);
+    // 理论上选项均来自 options,必能命中;命不中(脏选项)则保守切回全部,避免存半截脏值。
+    setNamespace(row ? { id: row.id, code: row.code } : null);
   };
 
   return (
@@ -107,10 +136,27 @@ export default function AppShell() {
             borderBottom: '1px solid #f0f0f0',
             display: 'flex',
             alignItems: 'center',
-            justifyContent: 'flex-end',
+            justifyContent: 'space-between',
             paddingInline: 24,
           }}
         >
+          {/* 左侧:命名空间切换器(总览↔下钻闭环的总闸)。选「全部命名空间」= 跨 ns 全集 + 服务聚合;
+              选具体 ns = 各页只剩该 ns 数据。选中持久化(sessionStorage),刷新保活。 */}
+          <Space size={8}>
+            <Typography.Text type="secondary">命名空间:</Typography.Text>
+            <Select<string>
+              // aria-label 给无障碍/测试稳定定位(antd Select 自身无 label 关联)。
+              aria-label="命名空间切换器"
+              showSearch
+              optionFilterProp="label"
+              style={{ minWidth: 220 }}
+              loading={optionsLoading}
+              value={nsValue}
+              options={nsSelectOptions}
+              onChange={onNamespaceChange}
+            />
+          </Space>
+
           <Dropdown menu={{ items: userMenu, onClick: onUserMenuClick }} placement="bottomRight">
             <span style={{ cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 8 }}>
               <Avatar size="small" icon={<UserOutlined />} />

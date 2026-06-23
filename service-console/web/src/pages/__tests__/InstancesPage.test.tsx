@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { render, screen, waitFor, within, type RenderResult } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import InstancesPage from '../InstancesPage';
+import { NamespaceContext, type SelectedNamespace } from '../../context/NamespaceContext';
 
 // mock 资源层:实例页只读,数据访问只走 ../../api/resources.listInstances
 //   listInstances(params) → 实例列表(服务端分页,信封 {count, rows, …};row = 后端 DiscoveredNodeOut camelCase)
@@ -10,6 +11,17 @@ const listInstances = vi.fn();
 vi.mock('../../api/resources', () => ({
   listInstances: (...a: unknown[]) => listInstances(...a),
 }));
+
+// 实例页用 useNamespace(),用受控 NamespaceContext 喂定全局 ns。默认「全部命名空间」(null);
+// 传 namespace 模拟「选了某具体 ns」以验证强制过滤。
+const renderPage = (namespace: SelectedNamespace | null = null): RenderResult =>
+  render(
+    <NamespaceContext.Provider
+      value={{ namespace, setNamespace: () => {}, options: [], optionsLoading: false }}
+    >
+      <InstancesPage />
+    </NamespaceContext.Provider>,
+  );
 
 // jsdom 不实现以下 API,ProTable / antd Select 的虚拟列表/滚动会调用,补最小 stub 保证用例稳定。
 if (!HTMLElement.prototype.scrollIntoView) {
@@ -111,7 +123,7 @@ describe('InstancesPage', () => {
   });
 
   it('渲染实例行:camel 字段映射到列(命名空间/服务/容器/工程/目录/镜像)+ 运行/健康/状态徽章', async () => {
-    render(<InstancesPage />);
+    renderPage();
 
     // 命名空间列 = agentId。
     expect(await screen.findByText('ns-online')).toBeInTheDocument();
@@ -145,7 +157,7 @@ describe('InstancesPage', () => {
   });
 
   it('服务端分页:listInstances 入参含 page/pageSize(勿全量返回)', async () => {
-    render(<InstancesPage />);
+    renderPage();
     await screen.findByText('ns-online');
 
     await waitFor(() => expect(listInstances).toHaveBeenCalled());
@@ -155,7 +167,7 @@ describe('InstancesPage', () => {
   });
 
   it('行操作仅「日志」:无「添加/编辑/删除」,无启动/停止/更新(本期未接)', async () => {
-    render(<InstancesPage />);
+    renderPage();
     await screen.findByText('ns-online');
 
     // 不渲染添加 / 编辑 / 删除。
@@ -171,7 +183,7 @@ describe('InstancesPage', () => {
 
   it('按命名空间筛选:输入 namespace → 查询 → listInstances({namespace}) 带后端过滤参数', async () => {
     const user = userEvent.setup();
-    render(<InstancesPage />);
+    renderPage();
     await screen.findByText('ns-online');
 
     // namespace 筛选是文本输入(agentId 自由串);id = dataIndex 'namespace'。
@@ -191,7 +203,7 @@ describe('InstancesPage', () => {
 
   it('按状态筛选:选 stale → 查询 → listInstances({status:"stale"}) 带后端过滤参数', async () => {
     const user = userEvent.setup();
-    render(<InstancesPage />);
+    renderPage();
     await screen.findByText('ns-online');
 
     // status 筛选下拉(valueEnum:active/stale);选「stale(失联)」。
@@ -206,7 +218,7 @@ describe('InstancesPage', () => {
 
   it('空筛选值不透传:重置后再查询,listInstances 入参不含 namespace/status 空串', async () => {
     const user = userEvent.setup();
-    render(<InstancesPage />);
+    renderPage();
     await screen.findByText('ns-online');
 
     // 先输 namespace 再清空,点查询:不应把 namespace='' 发给后端(后端仅按 truthy 过滤,空串会污染)。
@@ -226,7 +238,7 @@ describe('InstancesPage', () => {
 
   it('空态:后端回 0 行 → 不抛错,渲染空表(无数据行)', async () => {
     listInstances.mockResolvedValue(emptyEnvelope);
-    render(<InstancesPage />);
+    renderPage();
 
     // 列头仍在(表渲染成功),但没有任何实例数据行。
     await waitFor(() => expect(listInstances).toHaveBeenCalled());
@@ -237,7 +249,7 @@ describe('InstancesPage', () => {
 
   it('错误态:请求失败 → 不崩(无数据行),仍调用了 listInstances(全局兜底 toast 由 client 拦截器处理)', async () => {
     listInstances.mockRejectedValue({ response: { status: 500 } });
-    render(<InstancesPage />);
+    renderPage();
 
     await waitFor(() => expect(listInstances).toHaveBeenCalled());
     // 失败时不渲染数据行;页面不抛(ProTable request 失败走 success:false)。
@@ -252,7 +264,7 @@ describe('InstancesPage', () => {
     sessionStorage.setItem('platform_token', 'tok-x');
     try {
       const user = userEvent.setup();
-      render(<InstancesPage />);
+      renderPage();
       await screen.findByText('ns-online');
 
       // 行 1(ns-online)有 dir → 「日志」按钮可点。
@@ -281,10 +293,72 @@ describe('InstancesPage', () => {
       rows: [{ ...instancesEnvelope.rows[1], dir: null }],
       count: 1,
     });
-    render(<InstancesPage />);
+    renderPage();
     const row = (await screen.findByText('ns-prod')).closest('tr')!;
     const logBtn = within(row).getByRole('button', { name: byNormalizedName('日志') });
     // 无 dir → 禁用(tooltip 说明原因)。
     expect(logBtn).toBeDisabled();
+  });
+
+  // ── P3-10:全局命名空间联动 ───────────────────────────────────────────────────
+  it('选了具体命名空间 → 强制以其 code 作 namespace 过滤(覆盖本页筛选列,以全局为准)', async () => {
+    // 受控全局 ns = {id:2, code:'ns-prod'};实例页按 code(=agentId)过滤。
+    renderPage({ id: 2, code: 'ns-prod' });
+    await waitFor(() => expect(listInstances).toHaveBeenCalled());
+
+    // 关键:首屏 request 即带 namespace='ns-prod'(全局强制注入)。
+    await waitFor(() =>
+      expect(listInstances).toHaveBeenCalledWith(expect.objectContaining({ namespace: 'ns-prod' })),
+    );
+  });
+
+  it('「全部命名空间」+ 切「按服务聚合」→ 跨机同名服务聚合(实例数/机器数/健康数)', async () => {
+    // 聚合 fixture:wms-admin 跨双机(2 实例,1 健康)、wms-scan 单机(1 实例,1 健康)、一个无 nacos 匹配。
+    listInstances.mockResolvedValue({
+      count: 4,
+      rows: [
+        { ...instancesEnvelope.rows[0], agentId: 'ns-a', containerName: 'c1', nacosService: 'wms-admin', healthy: true },
+        { ...instancesEnvelope.rows[0], agentId: 'ns-b', containerName: 'c2', nacosService: 'wms-admin', healthy: false },
+        { ...instancesEnvelope.rows[0], agentId: 'ns-a', containerName: 'c3', nacosService: 'wms-scan', healthy: true },
+        { ...instancesEnvelope.rows[1], agentId: 'ns-a', containerName: 'c4', nacosService: null, healthy: null },
+      ],
+      page: 1,
+      pageSize: 200,
+      totalPage: 1,
+    });
+    const user = userEvent.setup();
+    renderPage(null); // 全部命名空间
+
+    // 默认实例明细视图(等首屏列表出来,用唯一容器名 c1 确认渲染,避免 ns-a 多行歧义)。
+    await screen.findByText('c1');
+
+    // 切到「按服务聚合」。
+    await user.click(screen.getByText('按服务聚合'));
+
+    // 聚合表出现 wms-admin 行,跨双机 2 实例。用所在行断言「实例数/机器数/健康数」。
+    const adminCell = await screen.findByText('wms-admin');
+    const adminRow = adminCell.closest('tr')!;
+    // 实例数=2、机器数=2(ns-a + ns-b)→ 该行出现两处「2」;健康数渲染为「1/2」(唯一,可精确断言)。
+    expect(within(adminRow).getAllByText('2').length).toBe(2);
+    expect(within(adminRow).getByText('1/2')).toBeInTheDocument();
+
+    // 同时存在 wms-scan 行(单机 1 实例,健康 1/1)与未匹配 nacos 占位行。
+    expect(screen.getByText('wms-scan')).toBeInTheDocument();
+    expect(screen.getByText('(未匹配 nacos)')).toBeInTheDocument();
+
+    // 聚合视图请求一次性拉 ≤200。
+    await waitFor(() => {
+      const aggCall = listInstances.mock.calls.find(
+        (c) => (c[0] as { pageSize?: number })?.pageSize === 200,
+      );
+      expect(aggCall).toBeTruthy();
+    });
+  });
+
+  it('选了具体命名空间时不显「按服务聚合」切换器(聚合是「全部」总览语义)', async () => {
+    renderPage({ id: 2, code: 'ns-prod' });
+    await waitFor(() => expect(listInstances).toHaveBeenCalled());
+    // 下钻具体 ns 时不提供聚合视图切换。
+    expect(screen.queryByText('按服务聚合')).not.toBeInTheDocument();
   });
 });

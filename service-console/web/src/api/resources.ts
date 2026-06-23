@@ -31,6 +31,32 @@ export async function list<T>(resource: string, params: ListParams = {}): Promis
   return r.data;
 }
 
+// ── 命名空间(namespaces,P1a NamespaceOut 子集)──────────────────────────────────
+// 顶栏命名空间切换器(P3-10)与各页关联选择共用。注意两套过滤口径:
+//  - services / fetch-records 等台账页按 **namespaceId**(数值 id)服务端过滤(?namespaceId=)。
+//  - instances 发现页按 **namespace = agentId**(自由串)过滤,而 agentId == 命名空间 `code`
+//    (见对账页注释「发现侧 agentId 即命名空间 code」)。
+// 故切换器需同时持有 id 与 code,下游各取所需(见 NamespaceContext)。
+
+/** 命名空间行(P1a NamespaceOut 子集,全 camelCase)。`code` 即发现侧 agentId。 */
+export interface NamespaceRow {
+  id: string | number;
+  /** 命名空间编码;== 发现实例的 agentId(instances 页按它过滤)。 */
+  code: string;
+  /** 命名空间别名(可空)。 */
+  name?: string;
+}
+
+/**
+ * 命名空间列表(服务端分页,统一信封):GET /api/namespaces?page=&pageSize=。
+ * 切换器一次性拉 pageSize=200(后端各 list 端点硬卡 le=200,>200 需远程搜索,属后续增强)。
+ */
+export async function listNamespaces<T = NamespaceRow>(
+  params: ListParams = {},
+): Promise<ListEnvelope<T>> {
+  return list<T>('namespaces', params);
+}
+
 /** 详情:GET /api/<resource>/{id}。 */
 export async function get<T>(resource: string, id: string | number): Promise<T> {
   const r = await client.get<T>(`${base(resource)}/${id}`);

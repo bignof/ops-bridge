@@ -61,6 +61,12 @@ export interface CrudTableProps<T extends RowWithId> {
    * 注:后端 409 detail 为英文(如 "service-plugin link already exists"),不直接回显,统一用本中文文案。
    */
   conflictMessage?: string;
+  /**
+   * P3-10:额外服务端过滤参数(透传 ProTable `params`,变更即触发列表重拉,并平铺进 list 请求)。
+   * 顶栏命名空间切换器据此为服务页注入 `{ namespaceId }`(选了具体 ns 时强制过滤;全部 = 不传)。
+   * 空值(undefined/null/空串)在 request 内剔除,不发空参污染后端过滤。
+   */
+  extraParams?: Record<string, unknown>;
 }
 
 /**
@@ -89,6 +95,7 @@ export default function CrudTable<T extends RowWithId>({
   transformValues,
   onCreated,
   conflictMessage = '编码已存在',
+  extraParams,
 }: CrudTableProps<T>) {
   const actionRef = useRef<ActionType>();
   const [messageApi, contextHolder] = message.useMessage();
@@ -206,14 +213,28 @@ export default function CrudTable<T extends RowWithId>({
         actionRef={actionRef}
         rowKey="id"
         columns={allColumns}
+        // P3-10:extraParams(如命名空间切换器注入的 namespaceId)透传 ProTable params,值变更即触发重拉。
+        params={extraParams}
         // 服务端分页:把 ProTable 的 current/pageSize 映射成后端 page/pageSize,
-        // 其余 params(列 search 产生的过滤)平铺透传;读信封后返回 ProTable 约定结构。
+        // 其余 params(列 search 产生的过滤)平铺透传;空值剔除不污染后端;读信封后返回。
         request={async (params) => {
           const { current, pageSize, ...filter } = params;
+          const cleaned: Record<string, unknown> = {};
+          for (const [k, v] of Object.entries(filter)) {
+            if (v !== undefined && v !== null && v !== '') cleaned[k] = v;
+          }
+          // extraParams 显式最后覆盖:选了具体命名空间时全局过滤(如 namespaceId)优先于本页同名筛选列,
+          // 二者不打架(以全局为准)。只覆盖 truthy 值;调用方在「全部」时直接不传 extraParams(prop 为
+          // undefined),故此处无需删键 —— 本页筛选列在「全部」下照常生效。
+          if (extraParams) {
+            for (const [k, v] of Object.entries(extraParams)) {
+              if (v !== undefined && v !== null && v !== '') cleaned[k] = v;
+            }
+          }
           const env = await resources.list<T>(resource, {
             page: current,
             pageSize,
-            ...filter,
+            ...cleaned,
           });
           return { data: env.rows, total: env.count, success: true };
         }}

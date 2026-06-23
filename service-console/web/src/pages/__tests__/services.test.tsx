@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { render, screen, waitFor, within, type RenderResult } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import ServicesPage from '../ServicesPage';
+import { NamespaceContext, type SelectedNamespace } from '../../context/NamespaceContext';
 
 // mock 资源层:服务页所有数据访问都走 ../../api/resources。
 // list 既服务于 ProTable 列表(resource='services'),又服务于表单 namespaceId 关联选择(resource='namespaces')。
@@ -15,6 +16,17 @@ vi.mock('../../api/resources', () => ({
   update: (...a: unknown[]) => update(...a),
   remove: (...a: unknown[]) => remove(...a),
 }));
+
+// 服务页用 useNamespace(),用受控 NamespaceContext 喂定全局 ns。默认「全部命名空间」(null);
+// 传 namespace 模拟「选了某具体 ns」以验证强制注入 ?namespaceId=(extraParams 覆盖)。
+const renderPage = (namespace: SelectedNamespace | null = null): RenderResult =>
+  render(
+    <NamespaceContext.Provider
+      value={{ namespace, setNamespace: () => {}, options: [], optionsLoading: false }}
+    >
+      <ServicesPage />
+    </NamespaceContext.Provider>,
+  );
 
 const byNormalizedName = (text: string) => (name: string) => name.replace(/\s/g, '').includes(text);
 
@@ -94,7 +106,7 @@ describe('ServicesPage', () => {
   });
 
   it('列表渲染(走 resources.list,列用后端可读名 namespaceCode)', async () => {
-    render(<ServicesPage />);
+    renderPage();
     expect(await screen.findByText('svc-demo')).toBeInTheDocument();
     // 命名空间列直接展示后端 JOIN 回的 namespaceCode。
     expect(screen.getByText('ns-demo')).toBeInTheDocument();
@@ -104,7 +116,7 @@ describe('ServicesPage', () => {
   it('点「添加」→ 命名空间关联选择拉 list(namespaces) → 填编码 → 提交 → 调 create', async () => {
     create.mockResolvedValue({ id: 6, serviceCode: 'svc-new' });
     const user = userEvent.setup();
-    render(<ServicesPage />);
+    renderPage();
 
     expect(await screen.findByText('svc-demo')).toBeInTheDocument();
 
@@ -144,7 +156,7 @@ describe('ServicesPage', () => {
   it('创建 500 → CrudTable 通用兜底「操作失败」提示且抽屉不关闭(A2 写失败不静默吞)', async () => {
     create.mockRejectedValue({ response: { status: 500 } });
     const user = userEvent.setup();
-    render(<ServicesPage />);
+    renderPage();
 
     expect(await screen.findByText('svc-demo')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: byNormalizedName('添加') }));
@@ -168,7 +180,7 @@ describe('ServicesPage', () => {
   it('点行内「编辑」→ 关联字段(namespaceId)与文本字段(dir)按行值预填 → 改一字段 → 提交 update 合并 values', async () => {
     update.mockResolvedValue({ id: 5 });
     const user = userEvent.setup();
-    render(<ServicesPage />);
+    renderPage();
 
     // 行加载(后端 list 行须含 namespaceId 供回填关联选择)。
     const cell = await screen.findByText('svc-demo');
@@ -208,7 +220,7 @@ describe('ServicesPage', () => {
   // B2(按命名空间服务端过滤):开查询表单 → 选命名空间筛选项 → 提交 → list('services',{namespaceId}) 透传后端。
   it('筛选区按命名空间过滤:选筛选项 → list("services", {namespaceId}) 带后端过滤参数', async () => {
     const user = userEvent.setup();
-    render(<ServicesPage />);
+    renderPage();
 
     expect(await screen.findByText('svc-demo')).toBeInTheDocument();
 
@@ -223,5 +235,26 @@ describe('ServicesPage', () => {
     await waitFor(() => {
       expect(list).toHaveBeenCalledWith('services', expect.objectContaining({ namespaceId: 1 }));
     });
+  });
+
+  // P3-10:顶栏切换器选了具体命名空间 → 强制按其 id 注入 ?namespaceId=(extraParams 覆盖,以全局为准)。
+  it('全局选了具体命名空间 → 列表 request 强制带 namespaceId(全局过滤)', async () => {
+    renderPage({ id: 7, code: 'ns-seven' });
+    // 首屏列表请求即带全局 ns 的 id。
+    await waitFor(() =>
+      expect(list).toHaveBeenCalledWith('services', expect.objectContaining({ namespaceId: 7 })),
+    );
+  });
+
+  // P3-10:全局「全部命名空间」(null)→ 不注入 namespaceId,本页筛选列照常工作(回归 B2 不被破坏)。
+  it('全局「全部命名空间」→ 列表 request 不带 namespaceId(本页筛选列仍可用)', async () => {
+    renderPage(null);
+    await waitFor(() => expect(list).toHaveBeenCalledWith('services', expect.anything()));
+    // 任一次 services 列表调用都不应带 namespaceId(未选具体 ns、也未用本页筛选)。
+    for (const call of list.mock.calls) {
+      if (call[0] !== 'services') continue;
+      const p = (call[1] ?? {}) as Record<string, unknown>;
+      expect(p.namespaceId).toBeUndefined();
+    }
   });
 });

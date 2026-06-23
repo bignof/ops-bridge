@@ -1,6 +1,7 @@
 import type { ProColumns, ProFormColumnsType } from '@ant-design/pro-components';
 import CrudTable from '../components/CrudTable';
 import * as resources from '../api/resources';
+import { useNamespace } from '../context/NamespaceContext';
 
 // 服务行记录(对齐 P1a 契约,全 camelCase)。
 // - namespaceCode:后端 LEFT JOIN 回的命名空间可读名(列直接用,不客户端拼 id→名)。
@@ -88,9 +89,13 @@ const formFields: ProFormColumnsType<ServiceRow>[] = [
  * - B2 筛选:`searchable` 开查询表单,按 `namespaceId` 服务端过滤(透传后端 ?namespaceId=)。
  * - 表单 `namespaceId` 关联选择,选项来自 `list('namespaces')`;C5 编辑回填靠后端 list 回的 namespaceId/dir/defaultImage。
  * - B3:409 = 命名空间内 service_code 重复 → conflictMessage「该命名空间下服务编码已存在」(非「编码已存在」)。
+ * - P3-10:顶栏命名空间切换器联动 —— 选具体 ns 时按其 id 注入 `?namespaceId=` 服务端过滤(经 extraParams,
+ *   覆盖本页命名空间筛选列,以全局为准);选「全部」则不注入,列表回到全集。
  * - P2 不做:命令下发 / 重启服务 / 命令历史(基线 §2「P2 故意不做」)。
  */
 export default function ServicesPage() {
+  // P3-10:全局命名空间(null = 全部 → 不过滤;具体 ns → 按其数值 id 过滤 ?namespaceId=)。
+  const { namespace } = useNamespace();
   return (
     <CrudTable<ServiceRow>
       resource="services"
@@ -101,6 +106,9 @@ export default function ServicesPage() {
       searchable
       // B3:服务 409 是命名空间内 service_code 重复,文案须贴切(非默认「编码已存在」)。
       conflictMessage="该命名空间下服务编码已存在"
+      // P3-10:全局 ns 注入服务端过滤 —— 仅选了具体 ns 才传(此时覆盖本页筛选列,以全局为准);
+      // 「全部」则不传(prop=undefined),本页命名空间筛选列照常可用,二者不打架。
+      extraParams={namespace ? { namespaceId: namespace.id } : undefined}
     />
   );
 }

@@ -5,6 +5,7 @@ import { App as AntdApp, ConfigProvider, Spin } from 'antd';
 import zhCN from 'antd/locale/zh_CN';
 import 'antd/dist/reset.css';
 import { AuthProvider } from './auth/AuthContext';
+import { NamespaceProvider } from './context/NamespaceContext';
 import RequireAuth from './auth/RequireAuth';
 import LoginPage from './auth/LoginPage';
 import AppShell from './layout/AppShell';
@@ -74,7 +75,11 @@ createRoot(document.getElementById('root')!).render(
     <ConfigProvider locale={zhCN}>
       <AntdApp>
         <AuthProvider>
-          <RouterProvider router={router} />
+          {/* 命名空间切换器(P3-10)的全局选中态:包在路由外层,所有页面 useNamespace() 可读。
+              置于 AuthProvider 内 —— 其首屏拉命名空间选项需鉴权,401 由 client 拦截器统一跳登录。 */}
+          <NamespaceProvider>
+            <RouterProvider router={router} />
+          </NamespaceProvider>
         </AuthProvider>
       </AntdApp>
     </ConfigProvider>
