@@ -100,3 +100,53 @@ def test_evict_cap_zero_means_unlimited(monkeypatch):
         plugin_cache.get_or_fetch(aid, _writer(b"z" * 1000))
     plugin_cache._evict_if_needed()
     assert all(plugin_cache.is_cached(x) for x in ["a", "b", "c"])
+
+
+# --------------------------------------------------------------------------- #
+# stats（只读概况，供 plugin_server /health）
+# --------------------------------------------------------------------------- #
+
+
+def test_stats_empty_cache():
+    s = plugin_cache.stats()
+    assert s == {"count": 0, "bytes": 0, "maxBytes": 10_000}
+
+
+def test_stats_counts_tgz_entries_and_bytes(monkeypatch):
+    monkeypatch.setattr(plugin_cache.config, "PLUGIN_CACHE_MAX_BYTES", 0)  # 写入期间不淘汰
+    plugin_cache.get_or_fetch("a", _writer(b"x" * 100))
+    plugin_cache.get_or_fetch("b", _writer(b"y" * 50))
+    # 非 .tgz 文件不计入
+    import os as _os
+    with open(_os.path.join(plugin_cache.cache_dir(), "note.txt"), "wb") as f:
+        f.write(b"ignore-me")
+
+    s = plugin_cache.stats()
+    assert s["count"] == 2
+    assert s["bytes"] == 150
+    assert s["maxBytes"] == 0
+
+
+def test_stats_listdir_oserror_returns_zero(monkeypatch):
+    # 目录不可读 → best-effort 回 count/bytes=0，不抛。
+    monkeypatch.setattr(plugin_cache.os, "listdir", lambda d: (_ for _ in ()).throw(OSError("no perm")))
+    s = plugin_cache.stats()
+    assert s == {"count": 0, "bytes": 0, "maxBytes": 10_000}
+
+
+def test_stats_getsize_oserror_skips_entry(monkeypatch):
+    # 单个条目在扫描期被删（getsize 抛 OSError）→ 跳过该条目，不抛、不计入。
+    plugin_cache.get_or_fetch("a", _writer(b"x" * 100))
+    plugin_cache.get_or_fetch("b", _writer(b"y" * 100))
+
+    real_getsize = plugin_cache.os.path.getsize
+
+    def flaky_getsize(path):
+        if path.endswith("a.tgz"):
+            raise OSError("vanished")
+        return real_getsize(path)
+
+    monkeypatch.setattr(plugin_cache.os.path, "getsize", flaky_getsize)
+    s = plugin_cache.stats()
+    assert s["count"] == 1  # 仅 b 计入
+    assert s["bytes"] == 100

@@ -9,6 +9,7 @@ from config import AGENT_ID, AGENT_KEY, AGENT_VERSION, HEARTBEAT_INTERVAL, WS_UR
 from core.discovery_reporter import start_discovery_reporter
 from core.handlers import HANDLERS, dispatch, send_message
 from core.log_sessions import start_log_session, stop_log_session
+from core.prewarm import handle_prewarm
 from core.rolling import handle_graceful_redeploy, handle_graceful_restart, handle_list_instances
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,9 @@ def _on_message(ws, message):
         elif msg_type == 'graceful-redeploy':
             # 在独立线程中执行，避免阻塞 WebSocket 接收循环（与 graceful-restart 同为独立 message type）
             threading.Thread(target=handle_graceful_redeploy, args=(ws, data), daemon=True).start()
+        elif msg_type == 'prewarm':
+            # 预热插件缓存（P4-6）：独立 message type，独立线程跑，best-effort（失败只回 failed，不影响别的）。
+            threading.Thread(target=handle_prewarm, args=(ws, data), daemon=True).start()
         elif msg_type == 'ping':
             send_message(ws, {'type': 'pong', 'timestamp': time.time()})
     except Exception as e:

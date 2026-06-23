@@ -33,10 +33,32 @@ class _PluginHandler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         if parsed.path == "/plugins":
             self._handle_plugins(parse_qs(parsed.query))
+        elif parsed.path == "/health":
+            self._handle_health()
         elif parsed.path.startswith(_DOWNLOAD_PREFIX):
             self._handle_download(parsed.path[len(_DOWNLOAD_PREFIX):])
         else:
             self._send_error(404, "not found")
+
+    def _handle_health(self) -> None:
+        """GET /health（P5-4）：agent 自身的本机状态快照，给运维/排障用。
+
+        纯只读、无副作用，不鉴权（与 /plugins 同：127.0.0.1 worker-facing，本就内网）。
+        **本地便利，非权威**——agent 状态本来经 WS register(capabilities) + discovery-report 流向
+        console，这个 /health 不替代那条链路，只是给本机一个不依赖 console 的即时快照。
+        """
+        payload = {
+            "configured": plugin_distribution.is_configured(),
+            "pluginNamespace": config.PLUGIN_NAMESPACE,
+            "cache": plugin_cache.stats(),
+            # discovery 低成本带「是否启用 + 周期」（只读 config）；上次上报时间需给 discovery_reporter
+            # 加模块级状态，属复杂依赖，按 brief 省略，不为它引入耦合。
+            "discovery": {
+                "enabled": config.DISCOVERY_INTERVAL > 0,
+                "intervalSec": config.DISCOVERY_INTERVAL,
+            },
+        }
+        self._send_json(200, payload)
 
     def _handle_plugins(self, query: dict) -> None:
         # 只取 service；worker 传入的 namespace 一律忽略（agent 恒用自己配置的本 ns）。

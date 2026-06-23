@@ -103,6 +103,30 @@ def get_or_fetch(attachment_id, fetcher: Callable[[str], None]) -> str:
     return final
 
 
+def stats() -> dict:
+    """本机插件缓存只读概况:{count: .tgz 条目数, bytes: 总占用字节, maxBytes: 容量上限}。
+
+    供 plugin_server /health 展示,纯只读、无副作用(不触发淘汰、不改 mtime)。
+    目录不存在 / 扫描失败 → 返回 count=0/bytes=0(best-effort,不抛,不硬造)。
+    """
+    cap = config.PLUGIN_CACHE_MAX_BYTES
+    count = 0
+    total = 0
+    try:
+        d = cache_dir()
+        for name in os.listdir(d):
+            if not name.endswith('.tgz'):
+                continue
+            try:
+                total += os.path.getsize(os.path.join(d, name))
+                count += 1
+            except OSError:
+                continue
+    except OSError:
+        return {"count": 0, "bytes": 0, "maxBytes": cap}
+    return {"count": count, "bytes": total, "maxBytes": cap}
+
+
 def _evict_if_needed() -> None:
     cap = config.PLUGIN_CACHE_MAX_BYTES
     if cap is None or cap <= 0:

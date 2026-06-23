@@ -211,6 +211,45 @@ def test_download_miss_invokes_fetcher_then_serves(monkeypatch, tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# /health（本机状态快照，只读）
+# --------------------------------------------------------------------------- #
+
+
+def test_health_returns_snapshot_fields(monkeypatch):
+    m = _imp(monkeypatch)
+    monkeypatch.setattr(m.config, "PLUGIN_NAMESPACE", "ns-a")
+    monkeypatch.setattr(m.config, "DISCOVERY_INTERVAL", 30)
+    monkeypatch.setattr(m.plugin_distribution, "is_configured", lambda: True)
+    monkeypatch.setattr(m.plugin_cache, "stats", lambda: {"count": 3, "bytes": 4096, "maxBytes": 2048})
+
+    h, responses, sent = _handler(m, "/health")
+    h.do_GET()
+
+    assert responses == [200]
+    assert ("Content-Type", "application/json") in sent
+    body = _json_body(h)
+    assert body["configured"] is True
+    assert body["pluginNamespace"] == "ns-a"
+    assert body["cache"] == {"count": 3, "bytes": 4096, "maxBytes": 2048}
+    assert body["discovery"] == {"enabled": True, "intervalSec": 30}
+
+
+def test_health_discovery_disabled_when_interval_non_positive(monkeypatch):
+    m = _imp(monkeypatch)
+    monkeypatch.setattr(m.config, "DISCOVERY_INTERVAL", 0)
+    monkeypatch.setattr(m.plugin_distribution, "is_configured", lambda: False)
+    monkeypatch.setattr(m.plugin_cache, "stats", lambda: {"count": 0, "bytes": 0, "maxBytes": 0})
+
+    h, responses, _ = _handler(m, "/health")
+    h.do_GET()
+
+    assert responses == [200]
+    body = _json_body(h)
+    assert body["configured"] is False  # 未配置时字段仍在（只读快照，不 503）
+    assert body["discovery"] == {"enabled": False, "intervalSec": 0}
+
+
+# --------------------------------------------------------------------------- #
 # server 启停
 # --------------------------------------------------------------------------- #
 

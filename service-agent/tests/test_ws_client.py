@@ -154,6 +154,40 @@ def test_on_message_routes_rolling(monkeypatch: pytest.MonkeyPatch) -> None:
     assert calls[2][1]["image"] == "registry.example.com/app:1"
 
 
+def test_on_message_routes_prewarm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """prewarm 作为独立 message type，正确分发到 handle_prewarm（独立线程）。"""
+    module = _import_ws_client(monkeypatch)
+    calls: list[dict] = []
+
+    # 同 rolling：ws_client 通过 `from core.prewarm import handle_prewarm` 绑定本地名，
+    # monkeypatch 必须打在 ws_client 模块上。
+    monkeypatch.setattr(module, "handle_prewarm", lambda ws, data: calls.append(data))
+
+    class ImmediateThread:
+        def __init__(self, target, args, daemon):
+            self.target = target
+            self.args = args
+
+        def start(self) -> None:
+            self.target(*self.args)
+
+    monkeypatch.setattr(module.threading, "Thread", ImmediateThread)
+
+    module._on_message(None, '{"type":"prewarm","requestId":"p1","services":["svc-a","svc-b"]}')
+
+    assert len(calls) == 1
+    assert calls[0]["requestId"] == "p1"
+    assert calls[0]["services"] == ["svc-a", "svc-b"]
+
+
+def test_on_message_capabilities_excludes_prewarm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """不变式：prewarm 是独立 message type，不进 HANDLERS（capabilities 不应含它）。"""
+    module = _import_ws_client(monkeypatch)
+    from core.handlers import HANDLERS
+
+    assert "prewarm" not in HANDLERS
+
+
 def test_start_heartbeat_sends_periodic_messages(monkeypatch: pytest.MonkeyPatch) -> None:
     module = _import_ws_client(monkeypatch)
     sent_messages: list[dict] = []
