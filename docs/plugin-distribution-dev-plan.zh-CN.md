@@ -72,9 +72,9 @@ P4 的 publish→自动滚动 依赖 §4.1 协调器(同批,不可早于它)
 
 | ID | 任务 | 仓库 / 模块 | 前置 | 验收 |
 | --- | --- | --- | --- | --- |
-| P2-1 | 改 worker 的 `sync-plugins.config.json`(**部署侧运行时文件,不在 cnp 仓**,评审 L-8):`adminUrl`→本机 agent、`apiPath`=`/plugins`、去 `adminToken`、**保留 `namespace` 字段**(agent 忽略其值)。P0-2 pin 的是 cnp 仓 `sync-plugins.js` + `sync-plugins.config.json.example` | cnp(`.js` + `.example`)+ 部署模板 | P1 | 真 worker 从本机 agent 装插件成功 |
-| P2-2 | **(条件)** worker 彻底无 ns:改 `sync-plugins.js` **mode2 gate**(去 `&& NAMESPACE` + 按需省略 URL)——**必改非可选**(评审 L3) | cnp(`docker/nocobase/sync-plugins.js`) | P1 | 不带 ns 仍能同步 |
-| P2-3 | **验收补 M4**:(a) agent 可达返回空 → 不清空既有 `storage/plugins` + warning;(b) 单插件 download 失败 → 固化「隔离继续 vs 拦截启动」(建议首装必需插件缺失则 init 失败) | cnp + 验收用例 | P1 | 两类部分失败行为符合预期 |
+| **P2-1 ◐** | worker `sync-plugins.config.json`(**部署侧运行时文件**):`adminUrl`→本机 agent、`apiPath`=`/plugins`、去 `adminToken`。**cnp 仓 `.example` 已加 agent 模式示例**;部署侧实际配置随 P5-5 下发 | cnp `.example` + 部署模板 | P1 | 真 worker 从本机 agent 取清单成功(2026-06-24)✓ |
+| **P2-2 ✓** | worker 无 ns:`sync-plugins.js` **mode2 gate** 去 `&& NAMESPACE`(改 `ADMIN_URL && SERVICE`;namespace 有则透传无则省)。**已实现 + 真机验证**(cnp `feat/service-agent` commit `308538139b`,未推) | cnp(`docker/nocobase/sync-plugins.js`) | P1 | **达成**:node1 真重启无 ns 配置仍从本机 agent 取清单(url 无 `namespace=`) |
+| **P2-3 ✓** | **补 M4**:(a) 空清单/拉取失败 → 保留本地(脚本原有);(b) **首装失败 fail-closed 阻断启动**(processPlugin 标 isNew + main `exit(1)` + entrypoint `\|\| exit 1`);版本更新失败仍隔离继续 | cnp(`sync-plugins.js`+`docker-entrypoint.sh`) | P1 | **达成**:三轮 e2e(首装/跳过/坏url exit1)+ 真机跳过(2026-06-24) |
 
 **P2 验收**:worker 装插件成功;agent 挂走 last-good 不白屏;空清单不误清。
 
@@ -123,7 +123,7 @@ P4 的 publish→自动滚动 依赖 §4.1 协调器(同批,不可早于它)
 | **P5-2 ✓(后端)** | 灰度发布(只滚部分实例 / 按 DiscoveredNode 子集;48455b0:`_run_service_rolling` 加 `instance_filter` 子集滚 + 集群健康门按全集判定 canary 受保护;`RolloutCreateIn.instances` 透传;**灰度选实例 UI 随 P4-5**) | service-console | P4 | 可灰度(后端) |
 | P5-3 | 缓存 sha256 校验(**可选**,按 §5 取舍不阻塞、不强制) | service-console + agent | P1 | 启用后校验生效 |
 | **P5-4 ✓** | 可观测面板(agent /health 扩展=plugin_server /health[cache/discovery 概况];Rollout 记录 + 发布→投放关联=RolloutsPage;**镜像漂移检测待后续**)(agent /health 扩展、`Rollout` 发布运行记录、发布→投放关联视图) | service-console + agent | P3/P4 | 面板齐全 |
-| P5-5 | **迁移老节点**:root-JWT→pull-token、adminUrl→本机 agent;生成/下发新 `sync-plugins.config.json` 到各 worker | cnp + 部署 | P1/P2 | 老节点平滑迁入 |
+| **P5-5 ◐** | **迁移老节点**:root-JWT→pull-token、adminUrl→本机 agent;生成/下发新 `sync-plugins.config.json` 到各 worker。**recipe 已床上真机验证**(2026-06-24:node1 真重启经本机 agent 取清单、版本跳过、健康恢复 + 重注册 Nacos);**真实生产节点迁移待授权执行** | cnp + 部署 | P1/P2 | recipe 验证✓;生产迁移待执行 |
 
 ---
 

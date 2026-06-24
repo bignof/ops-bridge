@@ -1,8 +1,10 @@
 # P2 / P5-5 书面方案 —— worker 改配置 + 老节点迁移(cnp + 部署侧)
 
-> 状态:**方案待评审**(2026-06-24)。本文件只出方案,**不改 cnp 代码、不动部署**。
-> 前置 P1 已在 rolltest 床联调验收通过(见 [`plugin-distribution-dev-plan.zh-CN.md`](plugin-distribution-dev-plan.zh-CN.md) 「P1 验收」行)。
-> 落点:P2-1/P5-5 是**部署侧运行时文件**;P2-2/P2-3 改 **cnp 仓** `docker/nocobase/sync-plugins.js`。
+> 状态(2026-06-24 更新):**P2 已实现 + 床上真机验证;P5-5 recipe 已床上验证,生产迁移待授权**。
+> - P2 代码已落 cnp `feat/service-agent` commit `308538139b`(scoped,**未推**):`sync-plugins.js`(gate 去 `&& NAMESPACE` + 首装失败 fail-closed)+ `docker-entrypoint.sh`(`|| exit 1`)+ `.example`(agent 模式示例)。
+> - 验证:①P2 三轮 e2e(node1 容器内,首装/版本跳过/坏url exit1 全过);②P5-5 真机:node1 真重启走真 entrypoint→真配置(无 ns)→新 gate→本机 agent→版本跳过→健康恢复(随后已还原 node1 到迁移前以避免最小 tgz 在共享卷的隐患)。
+> - 前置 P1 已在 rolltest 床联调验收通过(见 [`plugin-distribution-dev-plan.zh-CN.md`](plugin-distribution-dev-plan.zh-CN.md) 「P1 验收」行)。
+> - 落点:P2-1/P5-5 是**部署侧运行时文件**;P2-2/P2-3 改 **cnp 仓** `docker/nocobase/sync-plugins.js`。**真实生产迁移(P5-5 第 5 节)仍待授权执行**。
 
 ## 0. 现状(已读 cnp 代码,作为改动基线)
 
