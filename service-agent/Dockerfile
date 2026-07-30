@@ -20,6 +20,10 @@ COPY agent.py config.py ./
 COPY core/ core/
 COPY services/ services/
 
+# result 出站队列账本默认落挂载卷（compose 均挂 /data），容器重建/镜像升级不丢未确认回执;
+# 部署可用环境变量 OUTBOX_PATH 覆盖
+ENV OUTBOX_PATH=/data/.service-agent/outbox.json
+
 EXPOSE 18081
 
 # 启动命令

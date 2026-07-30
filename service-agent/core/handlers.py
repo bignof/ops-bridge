@@ -11,6 +11,7 @@ import threading
 import time
 from typing import TypedDict, cast
 
+from core import outbox
 from services.compose import find_compose_file, read_compose_file, restore_compose_file, run_compose, update_image_in_compose
 
 logger = logging.getLogger(__name__)
@@ -127,9 +128,15 @@ def send_message(ws, message_dict):
             logger.error(f"Send error: {e}")
 
 
+def _send_result(ws, message_dict):
+    """result 必达:先记账 outbox(断连丢失可补投,hub result_ack 清账),再立即经当前 ws 发送。"""
+    outbox.remember(message_dict)
+    send_message(ws, message_dict)
+
+
 def send_error(ws, request_id, error_msg):
     logger.warning(f"Command failed: request_id={request_id}, error={error_msg}")
-    send_message(ws, {
+    _send_result(ws, {
         'type': 'result',
         'requestId': request_id,
         'status': 'failed',
@@ -138,7 +145,7 @@ def send_error(ws, request_id, error_msg):
 
 
 def _reply(ws, request_id, success, output, action, project_dir):
-    send_message(ws, {
+    _send_result(ws, {
         'type': 'result',
         'requestId': request_id,
         'status': 'success' if success else 'failed',

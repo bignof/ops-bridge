@@ -38,6 +38,34 @@ def test_send_message_and_send_error_handle_edge_cases(caplog: pytest.LogCapture
     assert "Command failed: request_id=req-1, error=boom" in caplog.text
 
 
+def test_results_are_remembered_in_outbox_until_acked(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """result 必达:发送前记账 outbox,hub result_ack 前保持未确认(断连丢失可补投)。"""
+    from core import outbox
+
+    ws = FakeWebSocket()
+    handlers.send_error(ws, "req-e", "boom")
+    assert outbox.pending_count() == 1  # 失败 result 已记账
+
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "run_compose", lambda *args: (True, "restart ok"))
+    handlers.handle_restart(ws, {}, "req-r", str(tmp_path))
+    assert outbox.pending_count() == 2  # 成功 result 也记账
+    assert _decode_messages(ws)[-1]["status"] == "success"  # 同时仍立即经当前 ws 发送
+
+    # ws 发送失败(连接刚死)时 result 不丢——仍在 outbox 等补投
+    dead = FakeWebSocket(fail=True)
+    handlers.send_error(dead, "req-dead", "gone")
+    assert outbox.pending_count() == 3
+
+    outbox.ack("req-r")
+    assert outbox.pending_count() == 2
+
+    # ack(processing)不记账
+    before = outbox.pending_count()
+    handlers.send_message(ws, {"type": "ack", "requestId": "req-x", "status": "processing"})
+    assert outbox.pending_count() == before
+
+
 def test_validate_base_and_dispatch_errors(monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level("INFO")
     ws = FakeWebSocket()

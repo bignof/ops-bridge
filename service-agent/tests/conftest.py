@@ -16,3 +16,13 @@ def free_tcp_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+@pytest.fixture(autouse=True)
+def isolated_outbox_state(tmp_path):
+    """outbox 是模块级单例:每个测试重定向持久化到临时目录,防跨测试污染与工作区落盘。"""
+    from core import outbox
+
+    outbox.configure(str(tmp_path / "outbox-autouse.json"))
+    yield
+    outbox.clear_sender()

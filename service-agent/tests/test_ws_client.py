@@ -103,6 +103,7 @@ def test_start_heartbeat_sends_periodic_messages(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr(module.threading, "Thread", ImmediateThread)
     monkeypatch.setattr(module, "send_message", fake_send_message)
+    monkeypatch.setattr(module.outbox, "flush", lambda **kw: None)  # 心跳补投由专门用例覆盖
     monkeypatch.setattr(module.time, "time", lambda: next(timestamps))
     monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
 
@@ -110,6 +111,58 @@ def test_start_heartbeat_sends_periodic_messages(monkeypatch: pytest.MonkeyPatch
 
     assert sent_messages == [{"type": "heartbeat", "ts": 11.0}]
     assert module.get_connection_state()["last_heartbeat_ts"] == 10.0
+
+
+def test_result_ack_clears_outbox_and_open_close_wire_sender(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _import_ws_client(monkeypatch)
+    from core import outbox
+
+    acked: list[str] = []
+    senders: list[object] = []
+    flush_calls: list[dict] = []
+
+    monkeypatch.setattr(module.outbox, "ack", lambda rid: acked.append(rid))
+    monkeypatch.setattr(module.outbox, "set_sender", lambda fn: senders.append(fn))
+    monkeypatch.setattr(module.outbox, "clear_sender", lambda: senders.append(None))
+    monkeypatch.setattr(module.outbox, "flush", lambda **kw: flush_calls.append(kw))
+    monkeypatch.setattr(module, "_start_heartbeat", lambda ws: None)
+
+    ws = SimpleNamespace(keep_running=True)
+    module._on_open(ws)
+    assert len(senders) == 1 and senders[0] is not None  # 重连即换当前活跃发送通道
+    assert flush_calls and flush_calls[0].get("force") is True  # 重连立即全量补投
+
+    module._on_message(ws, '{"type": "result_ack", "requestId": "req-9"}')
+    assert acked == ["req-9"]
+
+    module._on_close(ws, 1000, "bye")
+    assert senders[-1] is None  # 断线清 sender,补投等重连
+
+
+def test_heartbeat_flushes_outbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _import_ws_client(monkeypatch)
+    flush_calls: list[dict] = []
+
+    class ImmediateThread:
+        def __init__(self, target, daemon):
+            self.target = target
+
+        def start(self) -> None:
+            self.target()
+
+    ws = SimpleNamespace(keep_running=True)
+
+    def fake_send_message(target_ws, payload):
+        target_ws.keep_running = False
+
+    monkeypatch.setattr(module.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(module, "send_message", fake_send_message)
+    monkeypatch.setattr(module.outbox, "flush", lambda **kw: flush_calls.append(kw))
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+
+    module._start_heartbeat(ws)
+
+    assert len(flush_calls) == 1  # 每个心跳周期补投一次(按退避)
 
 
 def test_connect_builds_websocket_app_and_runs_forever(monkeypatch: pytest.MonkeyPatch) -> None:
