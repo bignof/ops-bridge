@@ -154,7 +154,34 @@ def test_handle_update_success_path(monkeypatch: pytest.MonkeyPatch, tmp_path) -
     assert decoded[0]["type"] == "ack"
     assert decoded[-1]["status"] == "success"
     assert "Updated image in services: api" in decoded[-1]["output"]
+    assert decoded[-1]["message"] == f"Action 'update' succeeded in {tmp_path}."  # message 措辞与成败一致
     assert compose_calls == [["pull"], ["down"], ["up", "-d"]]
+
+
+def test_handle_update_strips_image_whitespace(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """UI 粘贴带首尾空格的镜像曾致 docker invalid reference format——写入 compose 前必须剪净。"""
+    ws = FakeWebSocket()
+    seen_images: list[str] = []
+
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "read_compose_file", lambda compose_file: "services: {}\n")
+
+    def fake_update(compose_file, image):
+        seen_images.append(image)
+        return ["api"]
+
+    monkeypatch.setattr(handlers, "update_image_in_compose", fake_update)
+    monkeypatch.setattr(handlers, "run_compose", lambda *args: (True, "ok"))
+
+    handlers.handle_update(ws, {"image": "  repo/app:9  "}, "req-strip", str(tmp_path))
+
+    assert seen_images == ["repo/app:9"]
+    assert _decode_messages(ws)[-1]["status"] == "success"
+
+    # 全空白视同未填
+    ws2 = FakeWebSocket()
+    handlers.handle_update(ws2, {"image": "   "}, "req-blank", str(tmp_path))
+    assert _decode_messages(ws2)[0]["error"] == "Action 'update' requires the 'image' field"
 
 
 def test_handle_update_stops_before_up_when_down_fails(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
@@ -207,6 +234,7 @@ def test_handle_update_restores_when_pull_fails(monkeypatch: pytest.MonkeyPatch,
 
     decoded = _decode_messages(ws)
     assert decoded[-1]["status"] == "failed"
+    assert decoded[-1]["message"] == f"Action 'update' failed in {tmp_path}."  # 失败不再写 finished
     assert compose_calls == [["pull"]]
     assert restore_calls == [("compose.yml", "services: {}\n")]
 

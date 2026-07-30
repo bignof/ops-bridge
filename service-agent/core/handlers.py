@@ -150,7 +150,8 @@ def _reply(ws, request_id, success, output, action, project_dir):
         'requestId': request_id,
         'status': 'success' if success else 'failed',
         'output': output,
-        'message': f"Action '{action}' finished in {project_dir}.",
+        # message 会直接展示在 hub 命令流水的「结果」列，措辞必须与成败一致（曾恒写 finished 误导排障）
+        'message': f"Action '{action}' {'succeeded' if success else 'failed'} in {project_dir}.",
     })
     (logger.info if success else logger.warning)(
         f"Action '{action}' {'succeeded' if success else 'failed'} in {project_dir}"
@@ -199,7 +200,9 @@ def handle_update(ws, data, request_id, project_dir):
     update: 修改 compose 文件中的 image 字段，然后执行
     docker compose pull -> docker compose down -> docker compose up -d
     """
-    image = data.get('image')
+    # 首尾空白防御性剪净：hub 侧已归一化，但老版本 hub / 手工 WS 调用仍可能带入
+    # （尾随空格会让 docker 判 invalid reference format 秒败）
+    image = (data.get('image') or '').strip()
     if not image:
         send_error(ws, request_id, "Action 'update' requires the 'image' field")
         return
