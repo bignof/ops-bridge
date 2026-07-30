@@ -760,6 +760,11 @@ class HubState:
             if record is None:
                 return None
 
+            # 终态幂等:agent outbox 至少一次投递会重发 result(断连补投),已终态的命令
+            # 不再改写、不再追加事件——否则 hub 重启后补投会把事件序列写成 created/ack/result/result
+            if record.status in ("success", "failed"):
+                return command_to_dict(record)
+
             record.status = status
             record.output = output
             record.message = message

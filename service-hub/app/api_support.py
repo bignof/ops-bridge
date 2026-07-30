@@ -252,6 +252,13 @@ async def _handle_agent_message(agent_id: str, payload: dict[str, Any]) -> None:
                 message=payload.get("message"),
                 error=payload.get("error"),
             )
+            # 回执确认:agent outbox 收到 result_ack 才清账停止补投(含重复补投,幂等由 mark_result 保证)
+            connection = await main_module.hub_state.get_connection(agent_id)
+            if connection is not None:
+                try:
+                    await connection.send_json({"type": "result_ack", "requestId": request_id})
+                except Exception:
+                    logger.warning("Failed to send result_ack to agent %s (agent will resend)", agent_id)
         return
 
     if msg_type == "logs_started":

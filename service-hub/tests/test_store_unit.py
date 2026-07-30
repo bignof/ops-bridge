@@ -197,3 +197,28 @@ def test_command_timestamps_are_serialized_in_china_timezone(tmp_path: Path) -> 
     assert command["updated_at"].utcoffset() == timedelta(hours=8)
 
     database.engine.dispose()
+
+
+def test_mark_result_is_idempotent_after_terminal_state(tmp_path: Path) -> None:
+    """agent outbox 至少一次投递会补投重复 result:已终态不得改写状态、不得追加事件。"""
+    state, database = _create_state(tmp_path)
+    asyncio.run(state.initialize())
+    asyncio.run(
+        state.store_command(
+            "agent-a",
+            {"type": "command", "requestId": "req-dup", "action": "restart", "dir": "/srv"},
+        )
+    )
+    asyncio.run(state.mark_ack("req-dup"))
+    asyncio.run(state.mark_result("req-dup", "success", output="done"))
+
+    # 断连补投的重复 result(status 相同)与迟到的冲突 result(status 不同)都不覆盖终态
+    asyncio.run(state.mark_result("req-dup", "success", output="done"))
+    asyncio.run(state.mark_result("req-dup", "failed", error="late"))
+
+    record = asyncio.run(state.get_command("req-dup"))
+    assert record is not None
+    assert record["status"] == "success"
+    assert record["output"] == "done"
+    events = asyncio.run(state.list_command_events("req-dup"))
+    assert [event.get("eventType", event.get("event_type")) for event in events] == ["created", "ack", "result"]
