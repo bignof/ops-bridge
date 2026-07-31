@@ -421,6 +421,89 @@ def test_dispatch_logs_when_command_waits_for_project_lock(monkeypatch: pytest.M
     assert "Command released project lock: request_id=req-2" in caplog.text
 
 
+def test_handle_restart_graceful_waits_for_health_before_success(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    ws = FakeWebSocket()
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "run_compose", lambda *args: (True, "restart ok"))
+    monkeypatch.setattr(handlers, "resolve_container_port_mapping", lambda compose_file: 13099)
+    monkeypatch.setattr(handlers, "wait_healthy", lambda port: (True, "healthy"))
+
+    handlers.handle_restart(ws, {"graceful": True}, "req-1", str(tmp_path))
+
+    decoded = _decode_messages(ws)
+    assert decoded[-1]["status"] == "success"
+    assert "healthcheck" in decoded[-1]["output"]
+
+
+def test_handle_restart_graceful_fails_when_unhealthy(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    ws = FakeWebSocket()
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "run_compose", lambda *args: (True, "restart ok"))
+    monkeypatch.setattr(handlers, "resolve_container_port_mapping", lambda compose_file: 13099)
+    monkeypatch.setattr(handlers, "wait_healthy", lambda port: (False, "healthcheck timed out after 120s"))
+
+    handlers.handle_restart(ws, {"graceful": True}, "req-2", str(tmp_path))
+
+    decoded = _decode_messages(ws)
+    assert decoded[-1]["status"] == "failed"
+    assert "timed out" in decoded[-1]["output"]
+
+
+def test_handle_restart_graceful_fails_when_port_not_resolvable(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    ws = FakeWebSocket()
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "run_compose", lambda *args: (True, "restart ok"))
+    monkeypatch.setattr(handlers, "resolve_container_port_mapping", lambda compose_file: None)
+
+    handlers.handle_restart(ws, {"graceful": True}, "req-3", str(tmp_path))
+
+    assert _decode_messages(ws)[-1]["status"] == "failed"
+
+
+def test_handle_restart_non_graceful_unaffected(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """graceful 未传时不应该调用健康检查——回归现有行为。"""
+    ws = FakeWebSocket()
+    called = []
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "run_compose", lambda *args: (True, "restart ok"))
+    monkeypatch.setattr(handlers, "wait_healthy", lambda port: called.append(port) or (True, "healthy"))
+
+    handlers.handle_restart(ws, {}, "req-4", str(tmp_path))
+
+    assert _decode_messages(ws)[-1]["status"] == "success"
+    assert called == []
+
+
+def test_handle_update_graceful_waits_for_health_before_success(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    ws = FakeWebSocket()
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "read_compose_file", lambda compose_file: "services: {}\n")
+    monkeypatch.setattr(handlers, "update_image_in_compose", lambda *args: ["api"])
+    monkeypatch.setattr(handlers, "run_compose", lambda project_dir, args: (True, f"{args} ok"))
+    monkeypatch.setattr(handlers, "resolve_container_port_mapping", lambda compose_file: 13099)
+    monkeypatch.setattr(handlers, "wait_healthy", lambda port: (True, "healthy"))
+
+    handlers.handle_update(ws, {"image": "repo/app:9", "graceful": True}, "req-5", str(tmp_path))
+
+    decoded = _decode_messages(ws)
+    assert decoded[-1]["status"] == "success"
+    assert "healthcheck" in decoded[-1]["output"]
+
+
+def test_handle_update_graceful_fails_when_unhealthy(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    ws = FakeWebSocket()
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "read_compose_file", lambda compose_file: "services: {}\n")
+    monkeypatch.setattr(handlers, "update_image_in_compose", lambda *args: ["api"])
+    monkeypatch.setattr(handlers, "run_compose", lambda project_dir, args: (True, f"{args} ok"))
+    monkeypatch.setattr(handlers, "resolve_container_port_mapping", lambda compose_file: 13099)
+    monkeypatch.setattr(handlers, "wait_healthy", lambda port: (False, "healthcheck timed out after 120s"))
+
+    handlers.handle_update(ws, {"image": "repo/app:9", "graceful": True}, "req-6", str(tmp_path))
+
+    assert _decode_messages(ws)[-1]["status"] == "failed"
+
+
 def test_handle_drain_missing_compose_file(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     ws = FakeWebSocket()
     monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: None)

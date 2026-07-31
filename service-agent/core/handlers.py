@@ -178,6 +178,15 @@ def _recover_previous_compose(project_dir, compose_file, original_compose, outpu
     return ok
 
 
+def _graceful_healthcheck(compose_file):
+    """graceful 模式下 docker 命令成功后调用一次。返回 (healthy, output_lines)。"""
+    port = resolve_container_port_mapping(compose_file)
+    if port is None:
+        return False, ["[error] No host port mapped to container port 80; cannot verify health."]
+    healthy, health_message = wait_healthy(port)
+    return healthy, [f"=== healthcheck ===\n{health_message}"]
+
+
 # ─────────────────────────────────────────────
 # 公共参数校验
 # ─────────────────────────────────────────────
@@ -270,7 +279,13 @@ def handle_update(ws, data, request_id, project_dir):
         send_error(ws, request_id, str(e))
         return
 
-    _reply(ws, request_id, True, '\n'.join(all_output), 'update', project_dir)
+    ok = True
+    if data.get('graceful'):
+        healthy, extra_lines = _graceful_healthcheck(compose_file)
+        all_output.extend(extra_lines)
+        ok = healthy
+
+    _reply(ws, request_id, ok, '\n'.join(all_output), 'update', project_dir)
 
 
 def handle_drain(ws, data, request_id, project_dir):
@@ -312,7 +327,13 @@ def handle_restart(ws, data, request_id, project_dir):
         send_error(ws, request_id, str(e))
         return
 
-    _reply(ws, request_id, ok, f"=== docker compose restart ===\n{out}", 'restart', project_dir)
+    output_lines = [f"=== docker compose restart ===\n{out}"]
+    if ok and data.get('graceful'):
+        healthy, extra_lines = _graceful_healthcheck(compose_file)
+        output_lines.extend(extra_lines)
+        ok = healthy
+
+    _reply(ws, request_id, ok, '\n'.join(output_lines), 'restart', project_dir)
 
 
 # ─────────────────────────────────────────────
