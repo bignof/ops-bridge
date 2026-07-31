@@ -83,6 +83,17 @@ def test_on_message_dispatches_commands_and_ping(monkeypatch: pytest.MonkeyPatch
     assert state["last_message_ts"] == 456.0
 
 
+def test_on_message_dispatches_watch_targets(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _import_ws_client(monkeypatch)
+    received: list[object] = []
+    monkeypatch.setattr(module, "set_watch_targets", lambda targets: received.append(targets))
+
+    ws = SimpleNamespace()
+    module._on_message(ws, '{"type": "watch_targets", "targets": [{"deploymentId": 1, "dir": "/data/a"}]}')
+
+    assert received == [[{"deploymentId": 1, "dir": "/data/a"}]]
+
+
 def test_start_heartbeat_sends_periodic_messages(monkeypatch: pytest.MonkeyPatch) -> None:
     module = _import_ws_client(monkeypatch)
     sent_messages: list[dict] = []

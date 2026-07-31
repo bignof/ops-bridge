@@ -9,6 +9,7 @@ from config import AGENT_ID, AGENT_KEY, HEARTBEAT_INTERVAL, OUTBOX_PATH, WS_URL
 from core import outbox
 from core.handlers import dispatch, send_message
 from core.log_sessions import start_log_session, stop_log_session
+from core.status_reporter import set_watch_targets
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,8 @@ def _on_message(ws, message):
             outbox.ack(data.get('requestId'))
         elif msg_type == 'ping':
             send_message(ws, {'type': 'pong', 'timestamp': time.time()})
+        elif msg_type == 'watch_targets':
+            set_watch_targets(data.get('targets'))
     except Exception as e:
         logger.error(f"Error processing message: {e}")
 
