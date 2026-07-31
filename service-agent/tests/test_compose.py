@@ -120,3 +120,56 @@ def test_open_compose_process_uses_cached_command(monkeypatch: pytest.MonkeyPatc
     assert process.stdout is None
     assert calls == [(["docker", "compose", "logs", "-f", "--tail", "10", "api"], "/tmp/app")]
     compose._compose_cmd = None
+
+
+def test_resolve_container_port_mapping_short_syntax(tmp_path: Path) -> None:
+    compose_file = tmp_path / "docker-compose.yaml"
+    compose_file.write_text(
+        yaml.dump(
+            {"services": {"app": {"image": "repo/app:1.0", "ports": ["13099:80", "10389:10389"]}}},
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    assert compose.resolve_container_port_mapping(str(compose_file)) == 13099
+
+
+def test_resolve_container_port_mapping_three_part_syntax(tmp_path: Path) -> None:
+    compose_file = tmp_path / "docker-compose.yaml"
+    compose_file.write_text(
+        yaml.dump({"services": {"app": {"ports": ["127.0.0.1:13099:80"]}}}, allow_unicode=True),
+        encoding="utf-8",
+    )
+    assert compose.resolve_container_port_mapping(str(compose_file)) == 13099
+
+
+def test_resolve_container_port_mapping_tcp_suffix(tmp_path: Path) -> None:
+    compose_file = tmp_path / "docker-compose.yaml"
+    compose_file.write_text(
+        yaml.dump({"services": {"app": {"ports": ["13099:80/tcp"]}}}, allow_unicode=True),
+        encoding="utf-8",
+    )
+    assert compose.resolve_container_port_mapping(str(compose_file)) == 13099
+
+
+def test_resolve_container_port_mapping_returns_none_when_absent(tmp_path: Path) -> None:
+    compose_file = tmp_path / "docker-compose.yaml"
+    compose_file.write_text(
+        yaml.dump({"services": {"app": {"ports": ["10389:10389"]}}}, allow_unicode=True), encoding="utf-8"
+    )
+    assert compose.resolve_container_port_mapping(str(compose_file)) is None
+
+
+def test_resolve_container_port_mapping_returns_none_without_ports(tmp_path: Path) -> None:
+    compose_file = tmp_path / "docker-compose.yaml"
+    compose_file.write_text(
+        yaml.dump({"services": {"app": {"image": "repo/app:1.0"}}}, allow_unicode=True), encoding="utf-8"
+    )
+    assert compose.resolve_container_port_mapping(str(compose_file)) is None
+
+
+def test_resolve_container_port_mapping_ignores_random_host_port_entries(tmp_path: Path) -> None:
+    """只写容器端口(如 '80')没有宿主机端口——docker 会随机分配，静态解析拿不到，必须跳过而不是误报。"""
+    compose_file = tmp_path / "docker-compose.yaml"
+    compose_file.write_text(yaml.dump({"services": {"app": {"ports": ["80"]}}}, allow_unicode=True), encoding="utf-8")
+    assert compose.resolve_container_port_mapping(str(compose_file)) is None

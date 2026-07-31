@@ -76,6 +76,33 @@ def update_image_in_compose(compose_file, new_image):
     return updated
 
 
+def resolve_container_port_mapping(compose_file, container_port='80'):
+    """
+    在 compose 文件里查找映射到指定容器端口的宿主机端口。
+    只支持短语法字符串（'host:container'、'ip:host:container'，可带 '/tcp' 后缀），
+    找不到匹配、格式不支持（如只写容器端口没写宿主机端口）时返回 None——
+    调用方必须把 None 当失败处理，不允许静默降级。
+    """
+    content = yaml.safe_load(read_compose_file(compose_file)) or {}
+    for svc_cfg in (content.get('services') or {}).values():
+        if not isinstance(svc_cfg, dict):
+            continue
+        for entry in (svc_cfg.get('ports') or []):
+            if not isinstance(entry, str):
+                continue
+            parts = entry.split(':')
+            if len(parts) < 2:
+                continue
+            container_part = parts[-1].split('/')[0]
+            if container_part != str(container_port):
+                continue
+            try:
+                return int(parts[-2])
+            except ValueError:
+                continue
+    return None
+
+
 def run_compose(project_dir, args):
     """在 project_dir 下执行 compose 子命令，返回 (success: bool, output: str)。"""
     cmd = _get_compose_cmd() + args
