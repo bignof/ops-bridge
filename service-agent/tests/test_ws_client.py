@@ -46,6 +46,18 @@ def test_connection_state_and_open_close_error(monkeypatch: pytest.MonkeyPatch) 
     assert heartbeat_calls == [ws]
 
 
+def test_on_open_starts_status_reporting(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _import_ws_client(monkeypatch)
+    monkeypatch.setattr(module, "_start_heartbeat", lambda ws: None)
+    calls: list[object] = []
+    monkeypatch.setattr(module, "start_status_reporting", lambda ws: calls.append(ws))
+
+    ws = SimpleNamespace(keep_running=True)
+    module._on_open(ws)
+
+    assert calls == [ws]
+
+
 def test_on_message_dispatches_commands_and_ping(monkeypatch: pytest.MonkeyPatch) -> None:
     module = _import_ws_client(monkeypatch)
     dispatch_calls: list[tuple[object, dict]] = []

@@ -9,7 +9,7 @@ from config import AGENT_ID, AGENT_KEY, HEARTBEAT_INTERVAL, OUTBOX_PATH, WS_URL
 from core import outbox
 from core.handlers import dispatch, send_message
 from core.log_sessions import start_log_session, stop_log_session
-from core.status_reporter import set_watch_targets
+from core.status_reporter import set_watch_targets, start_status_reporting
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,7 @@ def _on_open(ws):
     outbox.set_sender(lambda message: ws.send(json.dumps(message)))
     outbox.flush(force=True)
     _start_heartbeat(ws)
+    start_status_reporting(ws)
 
 
 def _on_message(ws, message):
