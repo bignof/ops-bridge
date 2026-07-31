@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -173,3 +174,92 @@ def test_resolve_container_port_mapping_ignores_random_host_port_entries(tmp_pat
     compose_file = tmp_path / "docker-compose.yaml"
     compose_file.write_text(yaml.dump({"services": {"app": {"ports": ["80"]}}}, allow_unicode=True), encoding="utf-8")
     assert compose.resolve_container_port_mapping(str(compose_file)) is None
+
+
+def test_collect_service_statuses_single_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    compose._compose_cmd = ["docker", "compose"]  # 跳过探测调用，否则会被下面的 fake_run 判成意外命令
+    ps_line = json.dumps(
+        {"ID": "abc123", "Image": "nginx:1", "State": "running", "Name": "app1-test", "Service": "app"}
+    )
+
+    def fake_run(cmd, **kwargs):
+        if cmd[-3:] == ["ps", "--format", "json"]:
+            return SimpleNamespace(returncode=0, stdout=ps_line + "\n", stderr="")
+        if cmd[:2] == ["docker", "inspect"]:
+            return SimpleNamespace(returncode=0, stdout="2026-07-31T08:20:19.123456Z\n", stderr="")
+        raise AssertionError(f"unexpected cmd: {cmd}")
+
+    monkeypatch.setattr(compose.subprocess, "run", fake_run)
+
+    services = compose.collect_service_statuses("/data/app1-test")
+    compose._compose_cmd = None
+
+    assert services == [
+        {
+            "name": "app",
+            "image": "nginx:1",
+            "state": "running",
+            "startedAt": "2026-07-31T08:20:19.123456Z",
+            "containerName": "app1-test",
+            "containerId": "abc123",
+            "raw": json.loads(ps_line),
+        }
+    ]
+
+
+def test_collect_service_statuses_multi_service_ndjson(monkeypatch: pytest.MonkeyPatch) -> None:
+    """docker compose ps --format json 是一行一个 JSON 对象(NDJSON)，不是 JSON 数组——多 service 逐行输出。"""
+    compose._compose_cmd = ["docker", "compose"]  # 跳过探测调用，否则会被下面的 fake_run 判成意外命令
+    line1 = json.dumps({"ID": "c1", "Image": "img-a:1", "State": "running", "Name": "svc-a-1", "Service": "a"})
+    line2 = json.dumps({"ID": "c2", "Image": "img-b:1", "State": "exited", "Name": "svc-b-1", "Service": "b"})
+
+    def fake_run(cmd, **kwargs):
+        if cmd[-3:] == ["ps", "--format", "json"]:
+            return SimpleNamespace(returncode=0, stdout=f"{line1}\n{line2}\n", stderr="")
+        if cmd[:2] == ["docker", "inspect"]:
+            return SimpleNamespace(returncode=0, stdout="2026-01-01T00:00:00Z\n", stderr="")
+        raise AssertionError(f"unexpected cmd: {cmd}")
+
+    monkeypatch.setattr(compose.subprocess, "run", fake_run)
+
+    services = compose.collect_service_statuses("/data/multi")
+    compose._compose_cmd = None
+
+    assert [s["name"] for s in services] == ["a", "b"]
+    assert [s["image"] for s in services] == ["img-a:1", "img-b:1"]
+
+
+def test_collect_service_statuses_compose_ps_fails_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    compose._compose_cmd = ["docker", "compose"]  # 跳过探测调用，否则会被下面的 fake_run 判成意外命令
+
+    def fake_run(cmd, **kwargs):
+        return SimpleNamespace(returncode=1, stdout="", stderr="no such directory")
+
+    monkeypatch.setattr(compose.subprocess, "run", fake_run)
+
+    result = compose.collect_service_statuses("/data/missing")
+    compose._compose_cmd = None
+
+    assert result == []
+
+
+def test_collect_service_statuses_inspect_failure_leaves_started_at_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    compose._compose_cmd = ["docker", "compose"]  # 跳过探测调用，否则会被下面的 fake_run 判成意外命令
+    ps_line = json.dumps(
+        {"ID": "abc123", "Image": "nginx:1", "State": "running", "Name": "app1-test", "Service": "app"}
+    )
+
+    def fake_run(cmd, **kwargs):
+        if cmd[-3:] == ["ps", "--format", "json"]:
+            return SimpleNamespace(returncode=0, stdout=ps_line + "\n", stderr="")
+        if cmd[:2] == ["docker", "inspect"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="no such container")
+        raise AssertionError(f"unexpected cmd: {cmd}")
+
+    monkeypatch.setattr(compose.subprocess, "run", fake_run)
+
+    services = compose.collect_service_statuses("/data/app1-test")
+    compose._compose_cmd = None
+
+    assert services[0]["startedAt"] is None
+    assert services[0]["image"] == "nginx:1"  # 其它字段不受 inspect 失败影响

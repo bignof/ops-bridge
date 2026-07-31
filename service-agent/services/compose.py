@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import subprocess
@@ -74,6 +75,60 @@ def update_image_in_compose(compose_file, new_image):
             yaml.safe_dump(content, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
 
     return updated
+
+
+def collect_service_statuses(compose_dir):
+    """
+    在 compose_dir 下采集所有 service 的真实运行状态：
+    docker compose ps --format json（每行一个 service 的 JSON，NDJSON）+
+    对每个拿到的容器 ID 补一次 docker inspect 拿精确 StartedAt（compose ps 本身不给机器可比较的时间戳，
+    只有 RunningFor/Status 这类人话字符串）。
+    compose ps 本身失败（目录没有 compose 文件/容器未创建）返回空列表，调用方按"这轮跳过"处理。
+    单个容器 inspect 失败只影响该 service 的 startedAt（置 None），不影响其它字段、不影响其它 service。
+    """
+    cmd = _get_compose_cmd() + ['ps', '--format', 'json']
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=compose_dir)
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+
+    services = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        container_id = entry.get('ID')
+        started_at = None
+        if container_id:
+            try:
+                inspect_result = subprocess.run(
+                    ['docker', 'inspect', '--format', '{{.State.StartedAt}}', container_id],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if inspect_result.returncode == 0:
+                    started_at = inspect_result.stdout.strip() or None
+            except Exception:
+                started_at = None
+        services.append(
+            {
+                'name': entry.get('Service'),
+                'image': entry.get('Image'),
+                'state': entry.get('State'),
+                'startedAt': started_at,
+                'containerName': entry.get('Name'),
+                'containerId': container_id,
+                'raw': entry,
+            }
+        )
+    return services
 
 
 def resolve_container_port_mapping(compose_file, container_port='80'):
