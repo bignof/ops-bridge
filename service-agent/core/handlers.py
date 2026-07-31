@@ -12,7 +12,15 @@ import time
 from typing import TypedDict, cast
 
 from core import outbox
-from services.compose import find_compose_file, read_compose_file, restore_compose_file, run_compose, update_image_in_compose
+from services.compose import (
+    find_compose_file,
+    read_compose_file,
+    restore_compose_file,
+    run_compose,
+    resolve_container_port_mapping,
+    update_image_in_compose,
+)
+from services.app_http import drain, wait_healthy
 
 logger = logging.getLogger(__name__)
 
@@ -265,6 +273,25 @@ def handle_update(ws, data, request_id, project_dir):
     _reply(ws, request_id, True, '\n'.join(all_output), 'update', project_dir)
 
 
+def handle_drain(ws, data, request_id, project_dir):
+    """drain: 调用本机 NocoBase 应用的 /api/k8s/shutdown，让它体面地准备好被重启。"""
+    compose_file = find_compose_file(project_dir)
+    if not compose_file:
+        send_error(ws, request_id, f"No docker-compose.yaml/yml found in {project_dir}")
+        return
+
+    port = resolve_container_port_mapping(compose_file)
+    if port is None:
+        send_error(ws, request_id, f"No host port mapped to container port 80 in {compose_file}")
+        return
+
+    logger.info(f"drain: dir={project_dir}, port={port}")
+    send_message(ws, {'type': 'ack', 'requestId': request_id, 'status': 'processing'})
+
+    ok, message = drain(port, token=data.get('shutdownToken'))
+    _reply(ws, request_id, ok, message, 'drain', project_dir)
+
+
 def handle_restart(ws, data, request_id, project_dir):
     """restart: docker compose restart"""
     compose_file = find_compose_file(project_dir)
@@ -295,6 +322,7 @@ def handle_restart(ws, data, request_id, project_dir):
 HANDLERS = {
     'update':  handle_update,
     'restart': handle_restart,
+    'drain':   handle_drain,
 }
 
 

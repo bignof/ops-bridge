@@ -419,3 +419,64 @@ def test_dispatch_logs_when_command_waits_for_project_lock(monkeypatch: pytest.M
     assert "Command queued on project lock: request_id=req-2" in caplog.text
     assert "Command acquired project lock: request_id=req-1" in caplog.text
     assert "Command released project lock: request_id=req-2" in caplog.text
+
+
+def test_handle_drain_missing_compose_file(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    ws = FakeWebSocket()
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: None)
+
+    handlers.handle_drain(ws, {}, "req-1", str(tmp_path))
+
+    assert "No docker-compose.yaml/yml found" in _decode_messages(ws)[0]["error"]
+
+
+def test_handle_drain_port_not_resolvable(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    ws = FakeWebSocket()
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "resolve_container_port_mapping", lambda compose_file: None)
+
+    handlers.handle_drain(ws, {}, "req-2", str(tmp_path))
+
+    decoded = _decode_messages(ws)
+    assert decoded[-1]["status"] == "failed"
+    assert "container port 80" in decoded[-1]["error"]
+
+
+def test_handle_drain_success_forwards_token(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    ws = FakeWebSocket()
+    drain_calls = []
+
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "resolve_container_port_mapping", lambda compose_file: 13099)
+    monkeypatch.setattr(handlers, "drain", lambda port, token=None: drain_calls.append((port, token)) or (True, "drained"))
+
+    handlers.handle_drain(ws, {"shutdownToken": "secret"}, "req-3", str(tmp_path))
+
+    decoded = _decode_messages(ws)
+    assert decoded[0]["type"] == "ack"
+    assert decoded[-1]["status"] == "success"
+    assert drain_calls == [(13099, "secret")]
+
+
+def test_handle_drain_failure_reported(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    ws = FakeWebSocket()
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "resolve_container_port_mapping", lambda compose_file: 13099)
+    monkeypatch.setattr(handlers, "drain", lambda port, token=None: (False, "forbidden"))
+
+    handlers.handle_drain(ws, {}, "req-4", str(tmp_path))
+
+    decoded = _decode_messages(ws)
+    assert decoded[-1]["status"] == "failed"
+    assert "forbidden" in decoded[-1]["output"]
+
+
+def test_dispatch_routes_drain_action(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    ws = FakeWebSocket()
+    monkeypatch.setattr(handlers, "find_compose_file", lambda project_dir: "compose.yml")
+    monkeypatch.setattr(handlers, "resolve_container_port_mapping", lambda compose_file: 13099)
+    monkeypatch.setattr(handlers, "drain", lambda port, token=None: (True, "drained"))
+
+    handlers.dispatch(ws, {"requestId": "req-5", "action": "drain", "dir": str(tmp_path)})
+
+    assert _decode_messages(ws)[-1]["status"] == "success"
