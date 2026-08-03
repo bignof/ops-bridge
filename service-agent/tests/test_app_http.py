@@ -20,7 +20,7 @@ def test_drain_success(monkeypatch: pytest.MonkeyPatch) -> None:
     ok, message = app_http.drain(13099, token="secret")
 
     assert ok is True
-    assert captured["url"] == "http://127.0.0.1:13099/api/k8s/shutdown"
+    assert captured["url"] == "http://host.docker.internal:13099/api/k8s/shutdown"
     assert captured["headers"] == {"X-Shutdown-Token": "secret"}
 
 
@@ -82,6 +82,20 @@ def test_wait_healthy_succeeds_immediately(monkeypatch: pytest.MonkeyPatch) -> N
     ok, message = app_http.wait_healthy(13099, timeout=1, interval=0.01)
 
     assert ok is True
+
+
+def test_wait_healthy_uses_docker_internal_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+
+    def fake_get(url, timeout):
+        captured["url"] = url
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(app_http.requests, "get", fake_get)
+
+    app_http.wait_healthy(13099, timeout=1, interval=0.01)
+
+    assert captured["url"] == "http://host.docker.internal:13099/api/health/ready"
 
 
 def test_wait_healthy_times_out(monkeypatch: pytest.MonkeyPatch) -> None:

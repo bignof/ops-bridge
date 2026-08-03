@@ -15,11 +15,15 @@ services:
       HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL:-30}
       HEALTH_HOST: ${HEALTH_HOST:-0.0.0.0}
       HEALTH_PORT: ${HEALTH_PORT:-18081}
+      APP_HOST: ${APP_HOST:-host.docker.internal}
       # result 出站队列账本:落在挂载卷内,容器重建/镜像升级不丢未确认回执
       OUTBOX_PATH: ${OUTBOX_PATH:-/data/.service-agent/outbox.json}
     volumes:
       - ${HOST_DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
       - ${MANAGED_PROJECTS_ROOT:-/data}:/data
+    extra_hosts:
+      # drain/健康检查经此连宿主机端口映射；agent 跟被管容器各在独立 bridge 网络命名空间，127.0.0.1 互不可达
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test:
         [

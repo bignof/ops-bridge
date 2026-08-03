@@ -27,6 +27,9 @@ STATUS_REPORT_INTERVAL = int(os.getenv('STATUS_REPORT_INTERVAL', '120'))
 OUTBOX_PATH        = os.getenv('OUTBOX_PATH', 'outbox.json')
 HEALTH_HOST        = os.getenv('HEALTH_HOST', '0.0.0.0')
 HEALTH_PORT        = int(os.getenv('HEALTH_PORT', '18081'))
+# agent 自己也是容器，跟被管的业务容器各在独立的 bridge 网络命名空间，127.0.0.1 谁也连不到谁；
+# host.docker.internal 需要 compose 里配 extra_hosts: host-gateway 才解析得到，见 docker-compose.yml
+APP_HOST           = os.getenv('APP_HOST', 'host.docker.internal')
 
 logging.basicConfig(
     level=logging.INFO,
