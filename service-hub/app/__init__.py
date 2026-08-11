@@ -1,1 +1,0 @@
-"""service-hub application package."""

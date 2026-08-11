@@ -1,5 +1,7 @@
 # 一期验收清单
 
+> **归档说明（2026-08）**：本文基于已移除的 `service-hub` 原型（Python/FastAPI）撰写，仅作历史存档；文中 `service-hub/` 相关路径与脚本已随目录删除失效（实现见 Git 历史）。hub 侧现由 NocoBase 插件 `@orchisky/plugin-hub` 承担，见 [架构说明](ARCHITECTURE.md)。
+
 本文档用于给一期收尾提供统一口径，避免“功能看起来差不多”和“已经可以正式收口”之间出现理解偏差。
 
 ## 验收目标

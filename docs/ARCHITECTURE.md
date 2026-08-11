@@ -2,23 +2,25 @@
 
 ## 目标
 
-这套系统解决的是“平台侧统一下发运维动作，内网主机安全执行并回传状态”的问题。当前仓库将控制面和执行面合并管理，但运行时仍保持解耦。
+这套系统解决的是“平台侧统一下发运维动作，内网主机安全执行并回传状态”的问题。控制面与执行面分仓维护、运行时解耦。
 
 ## 组件划分
 
-### `service-hub`
+### 控制面：NocoBase 插件 `@orchisky/plugin-hub`（外部仓库）
 
-- 对外提供 HTTP API 和 WebSocket 接入点
-- 管理 Agent 注册、鉴权、在线状态和命令历史
-- 维护命令状态流转：`queued`、`processing`、`success`、`failed`
-- 负责持久化、审计和未来的平台扩展能力
+代码在 `nocobase-pro` 仓库的 `packages/plugins/@orchisky/plugin-hub`。
 
-### `service-agent`
+- 提供 agent 的 WebSocket 接入点（`/ws/agent/<code>`）、鉴权与在线注册表
+- 管理 namespace / service / agent / deployment 台账与命令下发、状态流转
+- agent 连接建立时及 deployment 增删改（事务提交后）向 agent 推送覆盖式 `watch_targets` 巡检清单
+- 接收 `status_report` 上报，落库 reported* 字段，驱动离线/劣化告警
+
+### 执行面：`service-agent`（本仓库）
 
 - 部署在目标服务器
-- 通过 WebSocket 常连到 `service-hub`
-- 按目录粒度串行执行 `update` / `restart`
-- 基于宿主机 Docker Compose 完成服务切换
+- 通过 WebSocket 常连 plugin-hub
+- 按目录粒度串行执行 `update` / `restart`（支持 graceful）
+- 维护 hub 推送的 watch_targets 清单，独立巡检线程周期采集 `docker compose ps` 真实状态并上报
 
 ## 交互关系
 
@@ -26,8 +28,8 @@
 平台 / 第三方系统
         │ HTTP API
         ▼
-service-hub
-        │ WebSocket
+NocoBase（@orchisky/plugin-hub）
+        │ WebSocket（命令下发 / watch_targets 推送 / status_report 上报）
         ▼
 service-agent
         │ docker compose
@@ -35,21 +37,12 @@ service-agent
 目标主机业务容器
 ```
 
-## Monorepo 组织原则
+## 协议要点
 
-- 根目录承载共享规则、公共文档、统一 CI
-- 服务内部保留各自运行入口、测试、Docker 构建和细化文档
-- 只有真正稳定且被两边共同依赖的内容，才考虑上提为共享模块
+- `watch_targets` 为覆盖式全量清单（`{deploymentId, dir}`），agent 侧整份替换、不做增量合并
+- agent 离线时错过的清单推送不补偿，依赖重连时 hub 的连接建立全量推送兜底
+- 命令结果走 ack/result + result_ack 的至少一次投递，agent 侧 outbox 补投
 
-## 当前不急于抽公共包的原因
+## 历史
 
-虽然 Hub 和 Agent 共享一部分消息语义，但目前还没有形成足够稳定的协议层。现阶段更适合先统一文档、测试入口和命名规范，等消息模型稳定后，再考虑引入类似 `packages/shared-contracts` 的共享目录。
-
-## 后续建议的共享层
-
-等二期开始后，可以考虑补一个轻量共享层，优先提炼：
-
-- WebSocket 消息模型
-- 命令状态枚举和错误码
-- 鉴权 / agent 注册相关的数据结构
-- 联调脚本和集成测试夹具
+本仓库曾以 monorepo 形式同时维护 `service-hub`（Python/FastAPI 控制面原型）与 `service-agent`；hub 侧能力迁入 NocoBase 插件后，`service-hub` 已于 2026-08 移除，实现见 Git 历史。`docs/PHASE1_*` 为该时期的存档文档。

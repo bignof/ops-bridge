@@ -227,7 +227,7 @@ GET /health
 
 - `status`: `ok` 或 `degraded`
 - `agentId`: 当前 agent 标识
-- `connected`: 当前是否仍与 service-hub 保持连接
+- `connected`: 当前是否仍与 hub（NocoBase plugin-hub）保持连接
 - `lastConnectTs` / `lastDisconnectTs` / `lastHeartbeatTs` / `lastMessageTs`：ISO 8601 中国时间（`+08:00`）
 - `lastError`: 最近一次连接错误
 - `commandExecution.activeCommands`: 当前正在执行的目录锁任务数
@@ -260,7 +260,7 @@ service-agent/
 ```bash
 pip install -r requirements-dev.txt
 
-$env:WS_URL="ws://YOUR_SERVICE_HUB_IP:PORT/ws/agent"
+$env:WS_URL="ws://YOUR_HUB_HOST:PORT/ws/agent"
 $env:AGENT_ID="local-dev"
 $env:AGENT_KEY="hub-issued-agent-key"
 
