@@ -16,8 +16,13 @@ services:
       HEALTH_HOST: ${HEALTH_HOST:-0.0.0.0}
       HEALTH_PORT: ${HEALTH_PORT:-18081}
       APP_HOST: ${APP_HOST:-host.docker.internal}
+      AGENT_LOCAL_SECRET: ${AGENT_LOCAL_SECRET:-}
       # result 出站队列账本:落在挂载卷内,容器重建/镜像升级不丢未确认回执
       OUTBOX_PATH: ${OUTBOX_PATH:-/data/.service-agent/outbox.json}
+    ports:
+      # admin(worker) 经 host.docker.internal 访问本机 agent 的 /queryPlugin。发布到宿主（内网可接受）；
+      # 端点自身靠 AGENT_LOCAL_SECRET 头收敛，不绑 127.0.0.1（会打断 host-gateway 路径）。
+      - "18081:18081"
     volumes:
       - ${HOST_DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
       - ${MANAGED_PROJECTS_ROOT:-/data}:/data
