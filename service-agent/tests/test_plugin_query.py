@@ -59,3 +59,19 @@ def test_request_returns_none_when_sender_raises():
     pq.set_sender(boom)
     assert pq.request('svc', timeout=1) is None
     assert pq._pending == {}
+
+
+def test_on_message_routes_plugin_query_result_to_resolve(monkeypatch):
+    import importlib
+    import sys
+    for name in ['config', 'core.plugin_query', 'core.ws_client']:
+        sys.modules.pop(name, None)
+    monkeypatch.setenv('WS_URL', 'ws://localhost:8080/ws/agent')
+    monkeypatch.setenv('AGENT_KEY', 'k')
+    pq = importlib.import_module('core.plugin_query')
+    wsc = importlib.import_module('core.ws_client')
+    captured = {}
+    monkeypatch.setattr(pq, 'resolve', lambda rid, plugins: captured.update(rid=rid, plugins=plugins))
+    import json
+    wsc._on_message(None, json.dumps({'type': 'plugin_query_result', 'requestId': 'r9', 'plugins': [{'a': 1}]}))
+    assert captured == {'rid': 'r9', 'plugins': [{'a': 1}]}

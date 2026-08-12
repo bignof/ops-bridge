@@ -6,7 +6,7 @@ import time
 import websocket
 
 from config import AGENT_ID, AGENT_KEY, HEARTBEAT_INTERVAL, OUTBOX_PATH, WS_URL
-from core import outbox
+from core import outbox, plugin_query
 from core.handlers import dispatch, send_message
 from core.log_sessions import start_log_session, stop_log_session
 from core.status_reporter import set_watch_targets, start_status_reporting
@@ -47,6 +47,7 @@ def _on_open(ws):
     # 出站队列切到本条新连接并立即全量补投——上一条连接死亡窗口内丢失的 result 由此送达。
     # sender 必须用会抛错的裸 ws.send:吞异常的 send_message 会让 flush 把失败发送也当成功计预算
     outbox.set_sender(lambda message: ws.send(json.dumps(message)))
+    plugin_query.set_sender(lambda message: ws.send(json.dumps(message)))
     outbox.flush(force=True)
     _start_heartbeat(ws)
     start_status_reporting(ws)
@@ -71,6 +72,8 @@ def _on_message(ws, message):
             send_message(ws, {'type': 'pong', 'timestamp': time.time()})
         elif msg_type == 'watch_targets':
             set_watch_targets(data.get('targets'))
+        elif msg_type == 'plugin_query_result':
+            plugin_query.resolve(data.get('requestId'), data.get('plugins', []))
     except Exception as e:
         logger.error(f"Error processing message: {e}")
 
