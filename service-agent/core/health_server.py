@@ -4,11 +4,14 @@ import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from config import AGENT_ID, CHINA_TZ, HEALTH_HOST, HEALTH_PORT
+from config import AGENT_ID, AGENT_LOCAL_SECRET, CHINA_TZ, HEALTH_HOST, HEALTH_PORT
+from core import plugin_query
 from core.handlers import get_command_execution_state
 from core.ws_client import get_connection_state
 
 logger = logging.getLogger(__name__)
+
+QUERY_PLUGIN_TIMEOUT = 8.0  # 必须 < 15s（sync-plugins.js:201 硬编码客户端超时上限）
 
 
 def _format_timestamp(value):
@@ -19,6 +22,8 @@ def _format_timestamp(value):
 
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path.startswith('/queryPlugin'):
+            return self._handle_query_plugin()
         if self.path != '/health':
             self.send_response(404)
             self.end_headers()
@@ -54,6 +59,29 @@ class _HealthHandler(BaseHTTPRequestHandler):
 
         body = json.dumps(payload).encode('utf-8')
         self.send_response(200 if healthy else 503)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_query_plugin(self):
+        from urllib.parse import urlparse, parse_qs
+        if AGENT_LOCAL_SECRET and self.headers.get('X-Agent-Secret') != AGENT_LOCAL_SECRET:
+            self.send_response(401)
+            self.end_headers()
+            return
+        if not get_connection_state().get('connected'):
+            self.send_response(503)   # 未连 hub：让 sync-plugins.js 回退本地版本
+            self.end_headers()
+            return
+        service = (parse_qs(urlparse(self.path).query).get('service') or [''])[0]
+        items = plugin_query.request(service, QUERY_PLUGIN_TIMEOUT)
+        if items is None:
+            self.send_response(504)
+            self.end_headers()
+            return
+        body = json.dumps(items).encode('utf-8')   # 顶层纯数组（request 已解包）
+        self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()

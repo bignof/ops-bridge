@@ -146,3 +146,53 @@ def test_start_health_server_creates_background_thread(monkeypatch: pytest.Monke
     assert isinstance(server, FakeServer)
     assert server_calls == [(("127.0.0.1", 18081), module._HealthHandler)]
     assert thread_calls[0][1] is True
+
+
+def _make_qp_handler(module, path, connected, secret_header=None, request_return=None):
+    module.get_connection_state = lambda: {'connected': connected}
+    module.plugin_query.request = lambda service, timeout: request_return
+    handler = module._HealthHandler.__new__(module._HealthHandler)
+    handler.path = path
+    handler.headers = {'X-Agent-Secret': secret_header} if secret_header is not None else {}
+    handler.wfile = io.BytesIO()
+    responses, headers = [], []
+    handler.send_response = lambda code: responses.append(code)
+    handler.send_header = lambda k, v: headers.append((k, v))
+    handler.end_headers = lambda: None
+    return handler, responses
+
+
+def test_query_plugin_rejects_wrong_secret(monkeypatch):
+    monkeypatch.setenv('AGENT_LOCAL_SECRET', 'topsecret')
+    module = _import_health_server(monkeypatch)
+    h, responses = _make_qp_handler(module, '/queryPlugin?service=x', True, secret_header='wrong')
+    h.do_GET()
+    assert responses == [401]
+
+
+def test_query_plugin_503_when_disconnected(monkeypatch):
+    monkeypatch.setenv('AGENT_LOCAL_SECRET', 'topsecret')
+    module = _import_health_server(monkeypatch)
+    h, responses = _make_qp_handler(module, '/queryPlugin?service=x', False, secret_header='topsecret')
+    h.do_GET()
+    assert responses == [503]
+
+
+def test_query_plugin_504_on_timeout(monkeypatch):
+    monkeypatch.setenv('AGENT_LOCAL_SECRET', 'topsecret')
+    module = _import_health_server(monkeypatch)
+    h, responses = _make_qp_handler(module, '/queryPlugin?service=x', True, secret_header='topsecret', request_return=None)
+    h.do_GET()
+    assert responses == [504]
+
+
+def test_query_plugin_200_returns_bare_array(monkeypatch):
+    monkeypatch.setenv('AGENT_LOCAL_SECRET', 'topsecret')
+    module = _import_health_server(monkeypatch)
+    items = [{'pluginName': 'p', 'version': '1', 'url': 'u'}]
+    h, responses = _make_qp_handler(module, '/queryPlugin?service=x', True, secret_header='topsecret', request_return=items)
+    h.do_GET()
+    assert responses == [200]
+    body = json.loads(h.wfile.getvalue().decode('utf-8'))
+    assert isinstance(body, list)                 # 顶层是纯数组，不含 type/requestId 包装
+    assert body == items

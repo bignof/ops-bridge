@@ -30,6 +30,9 @@ HEALTH_PORT        = int(os.getenv('HEALTH_PORT', '18081'))
 # agent 自己也是容器，跟被管的业务容器各在独立的 bridge 网络命名空间，127.0.0.1 谁也连不到谁；
 # host.docker.internal 需要 compose 里配 extra_hosts: host-gateway 才解析得到，见 docker-compose.yml
 APP_HOST           = os.getenv('APP_HOST', 'host.docker.internal')
+# admin(worker) 调本机 agent /queryPlugin 的共享 secret（odk init 每机随机生成、渲染进本 .env 与 admin 请求头）。
+# 防同网段其它主机裸调该端点；非空时强制校验。
+AGENT_LOCAL_SECRET = os.getenv('AGENT_LOCAL_SECRET', '')
 
 logging.basicConfig(
     level=logging.INFO,
