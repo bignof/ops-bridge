@@ -61,6 +61,31 @@ def test_request_returns_none_when_sender_raises():
     assert pq._pending == {}
 
 
+def test_request_timeout_not_blocked_by_slow_sender():
+    # 评审 M2：裸 ws.send 无 socket 超时，半开连接可阻塞远超 timeout——send 不得占用调用方预算
+    pq = _fresh()
+    pq.set_sender(lambda m: time.sleep(5))
+    start = time.monotonic()
+    assert pq.request('svc', timeout=0.3) is None
+    assert time.monotonic() - start < 2      # 不被慢 send 拖住
+    assert pq._pending == {}
+
+
+def test_on_close_clears_plugin_query_sender(monkeypatch):
+    # 评审 M1：_on_close 必须与 _on_open 对称，同时清 outbox 与 plugin_query 的 sender
+    import importlib
+    import sys
+    for name in ['config', 'core.plugin_query', 'core.ws_client']:
+        sys.modules.pop(name, None)
+    monkeypatch.setenv('WS_URL', 'ws://localhost:8080/ws/agent')
+    monkeypatch.setenv('AGENT_KEY', 'k')
+    pq = importlib.import_module('core.plugin_query')
+    wsc = importlib.import_module('core.ws_client')
+    pq.set_sender(lambda m: None)
+    wsc._on_close(None, 1000, 'bye')
+    assert pq._sender is None
+
+
 def test_on_message_routes_plugin_query_result_to_resolve(monkeypatch):
     import importlib
     import sys

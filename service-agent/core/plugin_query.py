@@ -40,11 +40,16 @@ def request(service: str, timeout: float):
         event = threading.Event()
         _pending[request_id] = {'event': event, 'result': None}
     try:
-        try:
-            sender({'type': 'plugin_query', 'requestId': request_id, 'service': service})
-        except Exception as e:
-            logger.warning(f"plugin_query send failed: {e}")
-            return None
+        def _send():
+            try:
+                sender({'type': 'plugin_query', 'requestId': request_id, 'service': service})
+            except Exception as e:
+                logger.warning(f"plugin_query send failed: {e}")
+                event.set()  # 早失败早唤醒（result 仍为 None → 上游按超时/失败处理）
+
+        # 评审 M2：裸 ws.send 全程无 socket 超时（半开连接可阻塞到 OS TCP 重传上限，远超 timeout），
+        # 放 daemon 线程执行，让下面的 event.wait(timeout) 真正约束调用方总耗时
+        threading.Thread(target=_send, daemon=True).start()
         if not event.wait(timeout):
             logger.warning(f"plugin_query timeout: service={service}, requestId={request_id}")
             return None

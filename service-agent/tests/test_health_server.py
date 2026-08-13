@@ -196,3 +196,21 @@ def test_query_plugin_200_returns_bare_array(monkeypatch):
     body = json.loads(h.wfile.getvalue().decode('utf-8'))
     assert isinstance(body, list)                 # 顶层是纯数组，不含 type/requestId 包装
     assert body == items
+
+
+def test_query_plugin_403_when_secret_unconfigured(monkeypatch):
+    # 评审 H1：secret 未配置必须 fail-closed（403），不得放行任意请求
+    monkeypatch.delenv('AGENT_LOCAL_SECRET', raising=False)
+    module = _import_health_server(monkeypatch)
+    h, responses = _make_qp_handler(module, '/queryPlugin?service=x', True, secret_header=None)
+    h.do_GET()
+    assert responses == [403]
+
+
+def test_query_plugin_400_when_service_missing(monkeypatch):
+    # 评审 L3：缺 service 参数应 400（与 hubSync:queryPlugin 的必填校验对齐），不得静默 200 []
+    monkeypatch.setenv('AGENT_LOCAL_SECRET', 'topsecret')
+    module = _import_health_server(monkeypatch)
+    h, responses = _make_qp_handler(module, '/queryPlugin', True, secret_header='topsecret')
+    h.do_GET()
+    assert responses == [400]

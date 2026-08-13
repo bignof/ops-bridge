@@ -1,3 +1,4 @@
+import hmac
 import json
 import logging
 import threading
@@ -66,15 +67,28 @@ class _HealthHandler(BaseHTTPRequestHandler):
 
     def _handle_query_plugin(self):
         from urllib.parse import urlparse, parse_qs
-        if AGENT_LOCAL_SECRET and self.headers.get('X-Agent-Secret') != AGENT_LOCAL_SECRET:
+        if not AGENT_LOCAL_SECRET:
+            # 评审 H1：secret 未配置 fail-closed（403），绝不放行——端点发布在宿主全网卡，
+            # 空 secret 放行等于把该 namespace 插件清单匿名公开给同网段
+            logger.warning('queryPlugin 拒绝请求：AGENT_LOCAL_SECRET 未配置')
+            self.send_response(403)
+            self.end_headers()
+            return
+        supplied = self.headers.get('X-Agent-Secret') or ''
+        # 评审 M4：恒时比较（与 hub 侧 safeEqualHex 对齐），防逐字节短路的时序侧信道
+        if not hmac.compare_digest(supplied.encode('utf-8'), AGENT_LOCAL_SECRET.encode('utf-8')):
             self.send_response(401)
+            self.end_headers()
+            return
+        service = (parse_qs(urlparse(self.path).query).get('service') or [''])[0]
+        if not service:
+            self.send_response(400)   # 评审 L3：与 hubSync:queryPlugin 的必填校验对齐，不折叠成 200 []
             self.end_headers()
             return
         if not get_connection_state().get('connected'):
             self.send_response(503)   # 未连 hub：让 sync-plugins.js 回退本地版本
             self.end_headers()
             return
-        service = (parse_qs(urlparse(self.path).query).get('service') or [''])[0]
         items = plugin_query.request(service, QUERY_PLUGIN_TIMEOUT)
         if items is None:
             self.send_response(504)
@@ -92,6 +106,9 @@ class _HealthHandler(BaseHTTPRequestHandler):
 
 
 def start_health_server():
+    if not AGENT_LOCAL_SECRET:
+        logger.warning('AGENT_LOCAL_SECRET 未配置：/queryPlugin 将拒绝所有请求（403）。'
+                       '如需 admin 经本机 agent 拉插件，请在 .env 配置该值并同步进 admin 的 sync-plugins 配置')
     server = ThreadingHTTPServer((HEALTH_HOST, HEALTH_PORT), _HealthHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

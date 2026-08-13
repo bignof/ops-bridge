@@ -86,6 +86,7 @@ def _on_error(ws, error):
 def _on_close(ws, close_status_code, close_msg):
     _update_state(connected=False, last_disconnect_ts=time.time())
     outbox.clear_sender()  # 补投暂停,等重连的 _on_open 换新通道
+    plugin_query.clear_sender()  # 与 _on_open 的成对注册对称,断连期间 request() 走 sender-is-None 快速失败
     logger.warning(f"Connection closed: {close_status_code} {close_msg}")
 
 
