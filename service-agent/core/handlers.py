@@ -269,7 +269,9 @@ def handle_update(ws, data, request_id, project_dir):
 
         all_output.append(f"[info] Updated image in services: {', '.join(updated_services)}")
 
-        ok, out = run_compose(project_dir, ['pull'])
+        # --quiet:非 TTY 下 compose pull 每层每秒刷一行 plain progress,大镜像一次 pull 几十万字符,
+        # 全无排障价值还把 result 撑爆(2026-08-17 事故的日志主力);错误输出不受影响照常返回
+        ok, out = run_compose(project_dir, ['pull', '--quiet'])
         all_output.append(f"=== docker compose pull ===\n{out}")
         if not ok:
             restore_compose_file(compose_file, original_compose)

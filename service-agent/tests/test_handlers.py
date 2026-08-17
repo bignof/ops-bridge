@@ -174,7 +174,7 @@ def test_handle_update_success_path(monkeypatch: pytest.MonkeyPatch, tmp_path) -
 
     def fake_run(project_dir, args):
         compose_calls.append(args)
-        if args == ["pull"]:
+        if args == ["pull", "--quiet"]:
             return True, "pull ok"
         if args == ["down"]:
             return True, "down ok"
@@ -189,7 +189,7 @@ def test_handle_update_success_path(monkeypatch: pytest.MonkeyPatch, tmp_path) -
     assert decoded[-1]["status"] == "success"
     assert "Updated image in services: api" in decoded[-1]["output"]
     assert decoded[-1]["message"] == f"Action 'update' succeeded in {tmp_path}."  # message 措辞与成败一致
-    assert compose_calls == [["pull"], ["down"], ["up", "-d"]]
+    assert compose_calls == [["pull", "--quiet"], ["down"], ["up", "-d"]]
 
 
 def test_handle_update_strips_image_whitespace(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
@@ -230,7 +230,7 @@ def test_handle_update_stops_before_up_when_down_fails(monkeypatch: pytest.Monke
 
     def fake_run(project_dir, args):
         compose_calls.append(args)
-        if args == ["pull"]:
+        if args == ["pull", "--quiet"]:
             return True, "pull ok"
         if args == ["down"]:
             return False, "down failed"
@@ -244,7 +244,7 @@ def test_handle_update_stops_before_up_when_down_fails(monkeypatch: pytest.Monke
     assert decoded[-1]["status"] == "failed"
     assert "Restored compose file" in decoded[-1]["output"]
     assert "recovery: docker compose up -d" in decoded[-1]["output"]
-    assert compose_calls == [["pull"], ["down"], ["up", "-d"]]
+    assert compose_calls == [["pull", "--quiet"], ["down"], ["up", "-d"]]
     assert restore_calls == [("compose.yml", "services: {}\n")]
 
 
@@ -269,7 +269,7 @@ def test_handle_update_restores_when_pull_fails(monkeypatch: pytest.MonkeyPatch,
     decoded = _decode_messages(ws)
     assert decoded[-1]["status"] == "failed"
     assert decoded[-1]["message"] == f"Action 'update' failed in {tmp_path}."  # 失败不再写 finished
-    assert compose_calls == [["pull"]]
+    assert compose_calls == [["pull", "--quiet"]]
     assert restore_calls == [("compose.yml", "services: {}\n")]
 
 
@@ -285,7 +285,7 @@ def test_handle_update_restores_after_up_failure(monkeypatch: pytest.MonkeyPatch
 
     def fake_run(project_dir, args):
         compose_calls.append(args)
-        if args == ["pull"]:
+        if args == ["pull", "--quiet"]:
             return True, "pull ok"
         if args == ["down"]:
             return True, "down ok"
@@ -300,7 +300,7 @@ def test_handle_update_restores_after_up_failure(monkeypatch: pytest.MonkeyPatch
     decoded = _decode_messages(ws)
     assert decoded[-1]["status"] == "failed"
     assert "Recovery failed" not in decoded[-1]["output"]
-    assert compose_calls == [["pull"], ["down"], ["up", "-d"], ["up", "-d"]]
+    assert compose_calls == [["pull", "--quiet"], ["down"], ["up", "-d"], ["up", "-d"]]
     assert restore_calls == [("compose.yml", "services: {}\n")]
 
 
