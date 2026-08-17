@@ -38,6 +38,40 @@ def test_send_message_and_send_error_handle_edge_cases(caplog: pytest.LogCapture
     assert "Command failed: request_id=req-1, error=boom" in caplog.text
 
 
+def test_clamp_text_short_passthrough() -> None:
+    assert handlers._clamp_text("short") == "short"
+    assert handlers._clamp_text(None) is None
+
+
+def test_clamp_text_truncates_by_bytes_keeping_head_and_tail() -> None:
+    text = "HEAD-开始\n" + "x" * 300_000 + "\nTAIL-结尾错误行"
+    out = handlers._clamp_text(text)
+    assert len(out.encode("utf-8")) <= handlers.RESULT_TEXT_MAX_BYTES
+    assert out.startswith("HEAD-")
+    assert out.endswith("TAIL-结尾错误行")
+    assert "截断" in out
+
+
+def test_clamp_text_multibyte_boundary_stays_within_limit() -> None:
+    out = handlers._clamp_text("⠿" * 100_000)  # compose 进度符,3 字节/个
+    assert len(out.encode("utf-8")) <= handlers.RESULT_TEXT_MAX_BYTES
+
+
+def test_reply_and_send_error_clamp_oversized_text() -> None:
+    """update 拉大镜像的全量 compose 输出曾超 hub 命令表 TEXT 列(64KB),回写 Data too long →
+    hub 不 ack → 本 agent 无限补投(2026-08-17 事故)。发送前截到 60000 字节内,老 hub 也安全。"""
+    ws = FakeWebSocket()
+    handlers._reply(ws, "req-big", True, "y" * 300_000, "update", "/data/app")
+    sent = _decode_messages(ws)[-1]
+    assert sent["status"] == "success"
+    assert len(sent["output"].encode("utf-8")) <= handlers.RESULT_TEXT_MAX_BYTES
+
+    ws2 = FakeWebSocket()
+    handlers.send_error(ws2, "req-big-err", "e" * 300_000)
+    err = _decode_messages(ws2)[-1]
+    assert len(err["error"].encode("utf-8")) <= handlers.RESULT_TEXT_MAX_BYTES
+
+
 def test_results_are_remembered_in_outbox_until_acked(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     """result 必达:发送前记账 outbox,hub result_ack 前保持未确认(断连丢失可补投)。"""
     from core import outbox

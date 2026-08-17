@@ -26,6 +26,14 @@ def test_remember_persists_and_reloads(tmp_path):
     assert data["req-1"]["message"]["output"] == "ok"
 
 
+def test_remember_and_ack_ignore_missing_request_id():
+    """协议防御:缺 requestId 的 result 不记账(无法被 ack 清账,记了就是永久悬账);ack(None) 忽略不抛。"""
+    outbox.remember({"type": "result", "status": "success"})
+    assert outbox.pending_count() == 0
+    outbox.ack(None)
+    assert outbox.pending_count() == 0
+
+
 def test_ack_removes_and_persists(tmp_path):
     outbox.remember({"type": "result", "requestId": "req-1", "status": "success"})
     outbox.remember({"type": "result", "requestId": "req-2", "status": "failed"})

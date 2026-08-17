@@ -126,6 +126,32 @@ def get_command_execution_state():
 # 工具函数
 # ─────────────────────────────────────────────
 
+# result 文本字段（output/error）出站前的截断上限（UTF-8 字节）。
+# hub 命令表的 output/error 在老版本里是 MySQL TEXT（65535 字节），超限回写报 Data too long →
+# hub 按「落库失败不 ack」协议不确认 → 本 agent 无限补投（2026-08-17 事故）。60000 留出余量，
+# 对未升级 LONGTEXT 的老 hub 也安全；update 拉镜像的 compose progress 行本就没有排障价值。
+RESULT_TEXT_MAX_BYTES = int(os.getenv('RESULT_TEXT_MAX_BYTES', '60000'))
+
+
+def _clamp_text(s, max_bytes=None):
+    """按 UTF-8 字节截断：超限保头 1/4、尾 3/4（compose 报错都在尾部），中间插截断标记。
+    切在多字节字符中间的残缺序列直接丢弃（errors='ignore'），总字节只会更小。非 str 原样透传。"""
+    if max_bytes is None:
+        max_bytes = RESULT_TEXT_MAX_BYTES
+    if not isinstance(s, str):
+        return s
+    raw = s.encode('utf-8')
+    if len(raw) <= max_bytes:
+        return s
+    marker = f"\n…[截断:原始 {len(raw)} 字节,超出上限 {max_bytes},保留头尾]…\n"
+    budget = max_bytes - len(marker.encode('utf-8'))
+    head_n = budget // 4
+    tail_n = budget - head_n
+    head = raw[:head_n].decode('utf-8', errors='ignore')
+    tail = raw[-tail_n:].decode('utf-8', errors='ignore')
+    return head + marker + tail
+
+
 def send_message(ws, message_dict):
     import json
     if ws:
@@ -148,7 +174,7 @@ def send_error(ws, request_id, error_msg):
         'type': 'result',
         'requestId': request_id,
         'status': 'failed',
-        'error': error_msg,
+        'error': _clamp_text(error_msg),
     })
 
 
@@ -157,7 +183,7 @@ def _reply(ws, request_id, success, output, action, project_dir):
         'type': 'result',
         'requestId': request_id,
         'status': 'success' if success else 'failed',
-        'output': output,
+        'output': _clamp_text(output),
         # message 会直接展示在 hub 命令流水的「结果」列，措辞必须与成败一致（曾恒写 finished 误导排障）
         'message': f"Action '{action}' {'succeeded' if success else 'failed'} in {project_dir}.",
     })
