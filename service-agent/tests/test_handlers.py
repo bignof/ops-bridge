@@ -597,3 +597,24 @@ def test_dispatch_routes_drain_action(monkeypatch: pytest.MonkeyPatch, tmp_path)
     handlers.dispatch(ws, {"requestId": "req-5", "action": "drain", "dir": str(tmp_path)})
 
     assert _decode_messages(ws)[-1]["status"] == "success"
+
+
+def test_send_message_returns_true_on_success_and_false_on_failure() -> None:
+    from core import handlers
+
+    class OkWs:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        def send(self, payload: str) -> None:
+            self.sent.append(payload)
+
+    class BadWs:
+        def send(self, payload: str) -> None:
+            raise RuntimeError("socket closed")
+
+    ok = OkWs()
+    assert handlers.send_message(ok, {"type": "pong"}) is True
+    assert ok.sent == ['{"type": "pong"}']
+    assert handlers.send_message(BadWs(), {"type": "pong"}) is False
+    assert handlers.send_message(None, {"type": "pong"}) is False

@@ -298,3 +298,34 @@ def test_stream_logs_breaks_cleanly_when_stdout_returns_empty_like_values(monkey
         "stopped": False,
         "chunks": 0,
     }
+
+
+def test_stop_all_terminates_every_registered_session() -> None:
+    p1, p2 = FakeProcess(""), FakeProcess("")
+    log_sessions._register_process("s1", p1)
+    log_sessions._register_process("s2", p2)
+
+    stopped = log_sessions.stop_all()
+
+    assert stopped == 2
+    assert p1.terminated and p2.terminated
+    assert log_sessions._sessions == {}
+
+
+def test_stream_logs_stops_when_send_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """hub 断连后 send 失败：循环必须退出并终止子进程，不能读到 EOF 才停（泄漏修复）。"""
+    process = FakeProcess("line1\nline2\nline3\n")
+    monkeypatch.setattr(log_sessions, "open_compose_process", lambda *a, **k: process)
+    calls = {"n": 0}
+
+    def flaky_send(ws, message):
+        calls["n"] += 1
+        return calls["n"] <= 1  # logs_started 成功，第一条 chunk 起失败
+
+    monkeypatch.setattr(log_sessions, "send_message", flaky_send)
+
+    log_sessions._stream_logs(FakeWebSocket(), session_id="s", project_dir="/x", tail=10, timestamps=False)
+
+    assert calls["n"] == 2  # logs_started + 第一条 chunk；没读到 EOF、没发 logs_finished
+    assert process.terminated
+    assert "s" not in log_sessions._sessions

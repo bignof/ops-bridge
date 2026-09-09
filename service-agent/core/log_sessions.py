@@ -75,6 +75,17 @@ def stop_log_session(data: dict[str, Any]) -> None:
     _stop_process(process)
 
 
+def stop_all() -> int:
+    """hub 连接断开时清场：停掉全部会话子进程。返回停掉的数量。"""
+    with _sessions_guard:
+        items = list(_sessions.items())
+        _sessions.clear()
+    for session_id, state in items:
+        logger.info("Stopping log session on disconnect: session_id=%s", session_id)
+        _stop_process(state["process"])
+    return len(items)
+
+
 def _stream_logs(ws, *, session_id: str, project_dir: str, tail: int, timestamps: bool) -> None:
     args = ["logs", "-f", "--tail", str(tail)]
     if timestamps:
@@ -108,14 +119,18 @@ def _stream_logs(ws, *, session_id: str, project_dir: str, tail: int, timestamps
             if not chunk:
                 break
             chunks_sent += 1
-            send_message(
+            if not send_message(
                 ws,
                 {
                     "type": "logs_chunk",
                     "sessionId": session_id,
                     "chunk": chunk,
                 },
-            )
+            ):
+                # hub 已断：终止子进程并清会话，避免 compose logs -f 挂到进程结束
+                _stop_process(process)
+                _pop_session(session_id)
+                return
 
         process.wait(timeout=5)
     except Exception as exc:

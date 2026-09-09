@@ -8,7 +8,7 @@ import websocket
 from config import AGENT_ID, AGENT_KEY, HEARTBEAT_INTERVAL, OUTBOX_PATH, WS_URL
 from core import outbox, plugin_query
 from core.handlers import dispatch, send_message
-from core.log_sessions import start_log_session, stop_log_session
+from core.log_sessions import start_log_session, stop_log_session, stop_all as stop_all_log_sessions
 from core.status_reporter import set_watch_targets, start_status_reporting
 
 logger = logging.getLogger(__name__)
@@ -87,6 +87,9 @@ def _on_close(ws, close_status_code, close_msg):
     _update_state(connected=False, last_disconnect_ts=time.time())
     outbox.clear_sender()  # 补投暂停,等重连的 _on_open 换新通道
     plugin_query.clear_sender()  # 与 _on_open 的成对注册对称,断连期间 request() 走 sender-is-None 快速失败
+    stopped = stop_all_log_sessions()  # 泄漏修复：hub 断了，compose logs -f 子进程不能再挂着
+    if stopped:
+        logger.info(f"Stopped {stopped} log session(s) on disconnect")
     logger.warning(f"Connection closed: {close_status_code} {close_msg}")
 
 

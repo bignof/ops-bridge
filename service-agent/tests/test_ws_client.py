@@ -271,3 +271,13 @@ def test_connect_handles_real_websocket_round_trip(monkeypatch: pytest.MonkeyPat
     assert client_thread.is_alive() is False
     assert observed["pong"] == {"type": "pong", "timestamp": observed["pong"]["timestamp"]}
     assert observed["command"] == {"type": "command", "requestId": "req-real"}
+
+
+def test_on_close_stops_log_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _import_ws_client(monkeypatch)
+    calls: list[str] = []
+    monkeypatch.setattr(module, "stop_all_log_sessions", lambda: calls.append("logs") or 0)
+
+    module._on_close(SimpleNamespace(keep_running=False), 1006, "gone")
+
+    assert calls == ["logs"]

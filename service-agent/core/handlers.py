@@ -153,13 +153,17 @@ def _clamp_text(s, max_bytes=None):
 
 
 def send_message(ws, message_dict):
+    """经当前 ws 发一帧。返回是否发送成功：跟随循环 / 上传线程据此判断连接已死并自行退出。"""
     import json
-    if ws:
-        try:
-            ws.send(json.dumps(message_dict))
-            logger.debug(f"Sent: {message_dict.get('type')}")
-        except Exception as e:
-            logger.error(f"Send error: {e}")
+    if not ws:
+        return False
+    try:
+        ws.send(json.dumps(message_dict))
+        logger.debug(f"Sent: {message_dict.get('type')}")
+        return True
+    except Exception as e:
+        logger.error(f"Send error: {e}")
+        return False
 
 
 def _send_result(ws, message_dict):
