@@ -30,6 +30,9 @@ service-agent（容器）
 - 通过 WebSocket 与控制台保持长连接，自动断线重连
 - 支持 `update` 和 `restart` 两类平台命令
 - 支持 `logs_start` / `logs_stop` 日志流会话，用于实时查看 `docker compose logs -f --tail N`
+- 支持 `logfile_list` / `logfile_fetch` / `logfile_follow` 日志文件协议：列出部署目录下的日志文件、把某个文件 gzip 上传到中枢归档、实时跟随子目录里最新的日志文件
+- 支持 `compose_discover` / `compose_inspect`：只读扫描 compose 项目并汇报服务 / 容器名 / 镜像 / 端口
+- 与中枢断连时自动停掉全部日志会话与进行中的上传
 - 统一使用 `docker compose`（v2 插件）执行 Compose 命令
 - 命令在独立线程中执行，不阻塞心跳和其他消息处理
 - 相同 `dir` 的命令严格串行，不同目录的命令可并行执行
@@ -55,6 +58,8 @@ service-agent（容器）
 | `HEARTBEAT_INTERVAL`  | 心跳间隔（秒），默认 `30`     | `30`                                                 |
 | `HEALTH_PORT`         | 容器内健康检查端口            | `18081`                                              |
 | `SERVICE_AGENT_IMAGE` | 运行时拉取的镜像地址          | `registry.example.com/orchidea/service-agent:latest` |
+| `HUB_HTTP_URL`        | 中枢 HTTP 基址（日志归档上传用），留空按 `WS_URL` 推导 | `https://hub.example.com`                            |
+| `PROJECTS_ROOT`       | compose 项目发现的扫描根（容器内路径），默认 `/data`   | `/data`                                              |
 
 ### 2. 部署
 
@@ -214,6 +219,37 @@ INFO - Health server listening on http://0.0.0.0:18081/health
 
 - 当前日志能力是单向流式输出，不包含交互式 shell
 - Agent 会直接执行 `docker compose logs -f --tail N`，当 Hub 断开该流时会终止对应进程
+
+### 服务端 → Agent（日志文件协议 logfile_*）
+
+路径安全：`dir` 必须是含 compose 文件的目录；日志根 = `dir/<logDir 或 logs>`，realpath 后必须在 `dir` 之内；`file` / `subdir` 相对日志根，越界一律 `forbidden`；只认 `*.log` 与 `*.log.N`。
+
+| 帧 | 方向 | 字段 |
+| --- | --- | --- |
+| `logfile_list` | ↓ | `requestId`, `dir`, `logDir?` |
+| `logfile_list_result` | ↑ | `requestId`, `root`, `files: [{path,size,mtime}]`, `error?` |
+| `logfile_fetch` | ↓ | `requestId`, `archiveId`, `dir`, `logDir?`, `file`, `uploadPath`, `uploadToken`, `uploadExpiresAt` |
+| `logfile_fetch_result` | ↑ | `requestId`, `archiveId`, `ok`, `sizeRaw?`, `sizeSent?`, `error?`（旁路通知，状态真源是 HTTP 上传） |
+| `logfile_follow` | ↓ | `sessionId`, `dir`, `logDir?`, `subdir`, `tail?`(默认 200，≤500), `filter?` |
+| `logfile_started` | ↑ | `sessionId`, `file`, `fileSize` |
+| `logfile_entries` | ↑ | `sessionId`, `seq`, `file`, `startOffset`, `endOffset`, `entries: [{offset,text,timestamp,level}]`, `dropped` |
+| `logfile_rotated` | ↑ | `sessionId`, `from`, `to` |
+| `logfile_finished` | ↑ | `sessionId`, `reason`（`unfollow` / `file_gone` / `error`） |
+| `logfile_error` | ↑ | `sessionId`, `error: {code,message}` |
+| `logfile_unfollow` | ↓ | `sessionId` |
+
+`filter`：`{ levels?: string[], keyword?: string, regex?: boolean, since?: 'YYYY-MM-DD HH:mm:ss', until?: ... }`；以「条目」（首行 + 堆栈续行）为单位匹配，follow 忽略 since/until。上传：agent 边 gzip 边 `POST <HUB_HTTP_URL 或 WS_URL 推导><uploadPath>`，头 `Content-Type: application/gzip`、`X-Hub-Upload-Token`、`X-Hub-Raw-Size`、`X-Hub-File-Mtime`。限制：跟随会话同时最多 3 条、上传同时 1 个，超出回 `busy`；每秒超过 2000 条的条目直接丢并在 `dropped` 报数。与 hub 断连时全部跟随会话、进行中的上传与旧的 `logs_*` 会话一律停止。
+
+### 服务端 → Agent（compose 发现）
+
+| 帧 | 方向 | 字段 |
+| --- | --- | --- |
+| `compose_discover` | ↓ | `requestId` |
+| `compose_discover_result` | ↑ | `requestId`, `root`, `projects: [{dir, composeFile, services, error?}]`, `truncated`, `error?` |
+| `compose_inspect` | ↓ | `requestId`, `dir` |
+| `compose_inspect_result` | ↑ | `requestId`, `dir`, `composeFile`, `services: [{name, containerName, image, ports}]`, `error?` |
+
+发现只扫 `PROJECTS_ROOT` 向下 3 层、跳过 `.` 开头目录与 `node_modules`、找到项目不再下钻、最多 200 个；两者都只读文件、不执行 docker。错误码：`not_found` / `invalid` / `io_error`。
 
 ## 健康检查
 

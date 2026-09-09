@@ -281,3 +281,53 @@ def test_on_close_stops_log_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
     module._on_close(SimpleNamespace(keep_running=False), 1006, "gone")
 
     assert calls == ["logs"]
+
+
+@pytest.mark.parametrize(
+    "msg_type,target,threaded",
+    [
+        ("logfile_list", "handle_logfile_list", True),
+        ("logfile_fetch", "start_logfile_fetch", False),
+        ("logfile_follow", "start_logfile_follow", False),
+        ("logfile_unfollow", "stop_logfile_follow", False),
+        ("compose_discover", "handle_compose_discover", True),
+        ("compose_inspect", "handle_compose_inspect", True),
+    ],
+)
+def test_on_message_routes_logfile_and_compose_frames(monkeypatch: pytest.MonkeyPatch, msg_type, target, threaded) -> None:
+    module = _import_ws_client(monkeypatch)
+    calls: list[tuple] = []
+    started: list[object] = []
+
+    class FakeThread:
+        def __init__(self, target=None, args=(), daemon=None, name=None) -> None:
+            self._target, self._args = target, args
+
+        def start(self) -> None:
+            started.append(self)
+            self._target(*self._args)
+
+    monkeypatch.setattr(module.threading, "Thread", FakeThread)
+    if msg_type == "logfile_unfollow":
+        monkeypatch.setattr(module, target, lambda data: calls.append(("nows", data)))
+    else:
+        monkeypatch.setattr(module, target, lambda ws, data: calls.append((ws, data)))
+    ws = SimpleNamespace(keep_running=True)
+    payload = {"type": msg_type, "requestId": "r", "sessionId": "s"}
+
+    module._on_message(ws, json.dumps(payload))
+
+    assert len(calls) == 1 and calls[0][1] == payload
+    assert (len(started) == 1) is threaded
+
+
+def test_on_close_stops_follow_and_aborts_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _import_ws_client(monkeypatch)
+    calls: list[str] = []
+    monkeypatch.setattr(module, "stop_all_log_sessions", lambda: calls.append("logs") or 0)
+    monkeypatch.setattr(module, "stop_all_follow", lambda: calls.append("follow") or 0)
+    monkeypatch.setattr(module, "abort_all_fetch", lambda: calls.append("fetch"))
+
+    module._on_close(SimpleNamespace(keep_running=False), 1006, "gone")
+
+    assert calls == ["logs", "follow", "fetch"]

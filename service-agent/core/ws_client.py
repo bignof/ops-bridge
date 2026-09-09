@@ -9,6 +9,10 @@ from config import AGENT_ID, AGENT_KEY, HEARTBEAT_INTERVAL, OUTBOX_PATH, WS_URL
 from core import outbox, plugin_query
 from core.handlers import dispatch, send_message
 from core.log_sessions import start_log_session, stop_log_session, stop_all as stop_all_log_sessions
+from core.compose_inspect import handle_discover as handle_compose_discover, handle_inspect as handle_compose_inspect
+from core.log_fetch import abort_all as abort_all_fetch, start_fetch as start_logfile_fetch
+from core.log_follow import start_follow as start_logfile_follow, stop_all as stop_all_follow, stop_follow as stop_logfile_follow
+from core.log_paths import handle_list as handle_logfile_list
 from core.status_reporter import set_watch_targets, start_status_reporting
 
 logger = logging.getLogger(__name__)
@@ -65,6 +69,18 @@ def _on_message(ws, message):
             start_log_session(ws, data)
         elif msg_type == 'logs_stop':
             stop_log_session(data)
+        elif msg_type == 'logfile_list':
+            threading.Thread(target=handle_logfile_list, args=(ws, data), daemon=True).start()
+        elif msg_type == 'logfile_fetch':
+            start_logfile_fetch(ws, data)  # 自起线程
+        elif msg_type == 'logfile_follow':
+            start_logfile_follow(ws, data)  # 自起线程
+        elif msg_type == 'logfile_unfollow':
+            stop_logfile_follow(data)
+        elif msg_type == 'compose_discover':
+            threading.Thread(target=handle_compose_discover, args=(ws, data), daemon=True).start()
+        elif msg_type == 'compose_inspect':
+            threading.Thread(target=handle_compose_inspect, args=(ws, data), daemon=True).start()
         elif msg_type == 'result_ack':
             # hub 已确认 result 落库:出站队列清账,停止补投
             outbox.ack(data.get('requestId'))
@@ -90,6 +106,10 @@ def _on_close(ws, close_status_code, close_msg):
     stopped = stop_all_log_sessions()  # 泄漏修复：hub 断了，compose logs -f 子进程不能再挂着
     if stopped:
         logger.info(f"Stopped {stopped} log session(s) on disconnect")
+    followed = stop_all_follow()
+    if followed:
+        logger.info(f"Stopped {followed} follow session(s) on disconnect")
+    abort_all_fetch()
     logger.warning(f"Connection closed: {close_status_code} {close_msg}")
 
 
