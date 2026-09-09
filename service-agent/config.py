@@ -33,6 +33,10 @@ APP_HOST           = os.getenv('APP_HOST', 'host.docker.internal')
 # admin(worker) 调本机 agent /queryPlugin 的共享 secret（odk init 每机随机生成、渲染进本 .env 与 admin 请求头）。
 # 防同网段其它主机裸调该端点；非空时强制校验。
 AGENT_LOCAL_SECRET = os.getenv('AGENT_LOCAL_SECRET', '')
+# hub 的 HTTP 基址（日志归档上传用）。留空则由 WS_URL 推导：ws→http、wss→https、去掉 /ws/agent 及其后内容。
+HUB_HTTP_URL       = os.getenv('HUB_HTTP_URL', '').strip().rstrip('/')
+# compose 项目发现的扫描根（容器内路径；docker-compose.yml 把宿主机 MANAGED_PROJECTS_ROOT 挂到 /data）
+PROJECTS_ROOT      = os.getenv('PROJECTS_ROOT', '/data')
 
 logging.basicConfig(
     level=logging.INFO,

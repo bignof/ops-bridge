@@ -63,3 +63,24 @@ def test_china_time_formatter_respects_datefmt(monkeypatch: pytest.MonkeyPatch) 
     record.created = datetime(2026, 3, 13, 7, 30, 0, tzinfo=config.timezone.utc).timestamp()
 
     assert formatter.formatTime(record, "%Y-%m-%d %H:%M:%S") == "2026-03-13 15:30:00"
+
+
+def test_hub_http_url_and_projects_root_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib
+    import sys
+
+    monkeypatch.setenv("WS_URL", "ws://hub.example/ws/agent")
+    monkeypatch.setenv("AGENT_KEY", "k")
+    monkeypatch.delenv("HUB_HTTP_URL", raising=False)
+    monkeypatch.delenv("PROJECTS_ROOT", raising=False)
+    sys.modules.pop("config", None)
+    cfg = importlib.import_module("config")
+    assert cfg.HUB_HTTP_URL == ""
+    assert cfg.PROJECTS_ROOT == "/data"
+
+    monkeypatch.setenv("HUB_HTTP_URL", "https://hub.example")
+    monkeypatch.setenv("PROJECTS_ROOT", "/srv")
+    sys.modules.pop("config", None)
+    cfg2 = importlib.import_module("config")
+    assert cfg2.HUB_HTTP_URL == "https://hub.example"
+    assert cfg2.PROJECTS_ROOT == "/srv"
