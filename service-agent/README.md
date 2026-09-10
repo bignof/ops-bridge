@@ -60,6 +60,14 @@ service-agent（容器）
 | `SERVICE_AGENT_IMAGE` | 运行时拉取的镜像地址          | `registry.example.com/orchidea/service-agent:latest` |
 | `HUB_HTTP_URL`        | 中枢 HTTP 基址（日志归档上传用），留空按 `WS_URL` 推导 | `https://hub.example.com`                            |
 | `PROJECTS_ROOT`       | compose 项目发现的扫描根（容器内路径），默认 `/data`   | `/data`                                              |
+| `APP_HOST`            | 回到宿主机的地址，默认 `host.docker.internal`；`drain` 与健康检查经它 + compose 解析出的映射端口访问被管应用 | `host.docker.internal` |
+
+> ⚠️ **`APP_HOST` 与 `extra_hosts` 必须配套**：agent 自己是容器，与被管的业务容器各在独立 bridge 网络命名空间，
+> `127.0.0.1` 只是各自的回环、互相连不到，因此只能走「宿主机地址 + 端口映射」访问对方。默认值
+> `host.docker.internal` 在 Linux 上不会自动解析，本仓 `docker-compose.yml` 已配
+> `extra_hosts: ["host.docker.internal:host-gateway"]` 补上；**自行编写编排时漏掉这行，`drain` 会报
+> `Connection refused`，优雅重启链路整条失效**（2026-09-10 rolltest 实测）。
+> 不便用 `extra_hosts` 时改配 `APP_HOST`：裸机进程填 `127.0.0.1`，容器内填宿主机内网 IP。
 
 ### 2. 部署
 
