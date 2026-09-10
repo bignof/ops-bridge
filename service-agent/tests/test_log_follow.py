@@ -306,3 +306,55 @@ def test_max_follow_sessions_allows_multi_instance_host() -> None:
     from core.log_constants import MAX_FOLLOW_SESSIONS
 
     assert MAX_FOLLOW_SESSIONS == 8
+
+
+def test_poll_caps_bytes_read_per_tick(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """单轮读入封顶：一次写入远超上限时分多轮消化，不把整段增量一次性读进内存。"""
+    monkeypatch.setattr(log_constants, "FOLLOW_READ_MAX_BYTES", 64)
+    proj, main = _project(tmp_path)
+    f = main / "orchidea_2026-09-09.log"
+    _write(f, _line(0))
+    ws = FakeWs()
+    s = _session(ws, proj, tail=0)
+    assert s.start() is True
+
+    big = "".join(_line(i) for i in range(1, 40))  # 远超 64 字节
+    _append(f, big)
+    before = s._offset
+    s.tick(now=100.0)
+    assert s._offset - before == 64  # 这一轮只吃了上限那么多
+
+    for i in range(60):  # 后续轮次继续追，直到读完
+        s.tick(now=101.0 + i)
+        if s._offset >= f.stat().st_size:
+            break
+    assert s._offset == f.stat().st_size
+
+    s.tick(now=200.0 + log_constants.FLUSH_SEC + 0.01)
+    got = [e["text"] for m in ws.messages if m["type"] == "logfile_entries" for e in m["entries"]]
+    assert len(got) == 39  # 一条不少，只是分了几轮
+
+
+def test_unterminated_line_is_force_split_at_cap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """没有换行符的超长内容被强制断行发出，缓冲不会无限增长（8 路一起撞上会把 agent 撑爆）。"""
+    monkeypatch.setattr(log_constants, "FOLLOW_LINE_MAX_BYTES", 32)
+    proj, main = _project(tmp_path)
+    f = main / "orchidea_2026-09-09.log"
+    _write(f, _line(0))
+    ws = FakeWs()
+    s = _session(ws, proj, tail=0)
+    assert s.start() is True
+
+    _append(f, "X" * 200)  # 200 字节、一个换行都没有
+    s.tick(now=100.0)
+    s.tick(now=100.0 + log_constants.FLUSH_SEC + 0.01)
+
+    assert len(s._buffer) <= 32  # 缓冲被封住了
+    texts = [e["text"] for m in ws.messages if m["type"] == "logfile_entries" for e in m["entries"]]
+    assert texts and all(len(t) <= 32 for t in texts)
+    assert sum(len(t) for t in texts) + len(s._buffer) == 200  # 内容一个字节都没丢
+
+
+def test_read_and_line_caps_are_sane() -> None:
+    assert log_constants.FOLLOW_READ_MAX_BYTES > 0
+    assert log_constants.FOLLOW_LINE_MAX_BYTES > 0

@@ -12,6 +12,10 @@ MAX_FOLLOW_SESSIONS = 8         # 同时最多几条跟随会话（与中枢 LOG
 TAIL_DEFAULT = 200              # 起手回放条数缺省
 TAIL_MAX = 500                  # 起手回放条数上限
 TAIL_LOOKBACK_BYTES = 8 * 1024 * 1024  # 起手回放最多向前读多少字节
+FOLLOW_READ_MAX_BYTES = 1024 * 1024    # 单轮轮询最多读入多少增量字节（剩余留到下一轮）
+FOLLOW_LINE_MAX_BYTES = 1024 * 1024    # 未闭合行的缓冲上限，超限强制断行发出
+FOLLOW_READ_MAX_BYTES = 1024 * 1024    # 单轮轮询最多读入多少增量字节（剩余留到下一轮）
+FOLLOW_LINE_MAX_BYTES = 1024 * 1024    # 未闭合行的缓冲上限，超限强制断行发出
 
 # 拉取上传
 MAX_FETCH_CONCURRENCY = 1

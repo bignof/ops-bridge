@@ -149,9 +149,14 @@ class FollowSession:
             self._offset, self._buffer = 0, b""
             size = os.path.getsize(self._file)
         if size > self._offset:
+            # 单轮读入封顶：容器一次 flush 出几百 MB（超大 JSON、误打的二进制）时，
+            # 原来会把整段增量一次性读进内存，8 路会话一起撞上足以把 agent 撑到 OOM，
+            # 而 agent 一死，该机所有服务的日志会话同时断。剩余部分下一轮（0.25s 后）接着读，
+            # 不丢数据——文件还在，offset 会追上去。
+            want = min(size - self._offset, log_constants.FOLLOW_READ_MAX_BYTES)
             with open(self._file, "rb") as fh:
                 fh.seek(self._offset)
-                data = fh.read(size - self._offset)
+                data = fh.read(want)
             self._consume(data, now)
 
     def _consume(self, data: bytes, now: float) -> None:
@@ -159,12 +164,20 @@ class FollowSession:
         data = self._buffer + data
         self._offset += len(data) - len(self._buffer)
         nl = data.rfind(b"\n")
-        if nl < 0:
-            self._buffer = data
-            return
-        complete, self._buffer = data[: nl + 1], data[nl + 1 :]
-        for entry in assemble_bytes(complete, start_offset):
-            self._admit(entry, now)
+        if nl >= 0:
+            complete, data = data[: nl + 1], data[nl + 1 :]
+            for entry in assemble_bytes(complete, start_offset):
+                self._admit(entry, now)
+            start_offset += len(complete)
+        # 剩下的是还没写完的半行，长度不受任何约束——应用把超大 JSON 或二进制一次性写出来时，
+        # 它会一直攒在缓冲里直到出现下一个换行符。超限就强制断行发出去：
+        # 一行被拆成几条只是显示上难看，把 agent 拖到 OOM 则是全机日志一起断。
+        while len(data) > log_constants.FOLLOW_LINE_MAX_BYTES:
+            chunk, data = data[: log_constants.FOLLOW_LINE_MAX_BYTES], data[log_constants.FOLLOW_LINE_MAX_BYTES :]
+            for entry in assemble_bytes(chunk, start_offset):
+                self._admit(entry, now)
+            start_offset += len(chunk)
+        self._buffer = data
 
     def _admit(self, entry: dict, now: float) -> None:
         assert self._flt is not None and self._bucket is not None
