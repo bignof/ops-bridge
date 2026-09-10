@@ -235,7 +235,7 @@ INFO - Health server listening on http://0.0.0.0:18081/health
 | 帧 | 方向 | 字段 |
 | --- | --- | --- |
 | `logfile_list` | ↓ | `requestId`, `dir`, `logDir?` |
-| `logfile_list_result` | ↑ | `requestId`, `root`, `files: [{path,size,mtime}]`, `error?` |
+| `logfile_list_result` | ↑ | `requestId`, `root`, `files: [{path,size,mtime}]`, `error?`（`mtime` 为带时区偏移的 ISO 8601，如 `2026-09-05T17:30:15+08:00`；`logfile_fetch` 上传的 `X-Hub-File-Mtime` 同此格式） |
 | `logfile_fetch` | ↓ | `requestId`, `archiveId`, `dir`, `logDir?`, `file`, `uploadPath`, `uploadToken`, `uploadExpiresAt` |
 | `logfile_fetch_result` | ↑ | `requestId`, `archiveId`, `ok`, `sizeRaw?`, `sizeSent?`, `error?`（旁路通知，状态真源是 HTTP 上传） |
 | `logfile_follow` | ↓ | `sessionId`, `dir`, `logDir?`, `subdir`, `tail?`(默认 200，≤500), `filter?` |

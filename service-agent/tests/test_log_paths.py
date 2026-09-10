@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -97,6 +98,18 @@ def test_list_log_files_depth_sort_and_whitelist(tmp_path: Path) -> None:
     ]
     assert files[0]["size"] == new.stat().st_size  # Windows text mode writes CRLF; compare real byte size
     assert files[0]["mtime"] == log_paths.format_mtime(1_700_000_100)
+
+
+def test_format_mtime_carries_timezone_offset() -> None:
+    """必须带时区偏移，且任何时区的解析方都能还原成同一绝对时刻。
+
+    回归：曾用 time.localtime() 输出无时区标记的串。agent 容器多为 UTC、中枢与业务容器多为 CST，
+    中枢 new Date() 按自己的时区解读，导致界面上「快照时间」与日志正文时间整体差 8 小时。
+    """
+    s = log_paths.format_mtime(1_700_000_100)
+    assert s == "2023-11-15T06:15:00+08:00"
+    assert datetime.fromisoformat(s).timestamp() == 1_700_000_100
+    assert s[-6] in "+-"  # 结尾是 ±HH:MM 偏移，不是裸时间
 
 
 def test_resolve_subdir_and_file(tmp_path: Path) -> None:

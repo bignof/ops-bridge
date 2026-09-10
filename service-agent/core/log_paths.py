@@ -10,8 +10,9 @@ from __future__ import annotations
 import logging
 import os
 import re
-import time
+from datetime import datetime
 
+from config import CHINA_TZ
 from core.handlers import send_message
 from core.log_constants import LIST_MAX_DEPTH, LIST_MAX_FILES
 from services.compose import find_compose_file
@@ -90,7 +91,13 @@ def resolve_log_file(root: str, rel: str | None) -> str:
 
 
 def format_mtime(ts: float) -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+    """带时区偏移的 ISO 8601（如 2026-09-05T17:30:15+08:00）。
+
+    绝不能输出无时区标记的本地时间：agent 容器常是 UTC，而中枢与被管应用容器多为 CST，
+    中枢 new Date() 会按自己的时区解读这串字符，整表时间平移 8 小时——界面上会出现
+    「快照 09:30」与正文最后一行「17:30」并排显示。写法对齐 health_server._format_timestamp。
+    """
+    return datetime.fromtimestamp(ts, CHINA_TZ).isoformat(timespec="seconds")
 
 
 def list_log_files(root: str) -> list[dict]:

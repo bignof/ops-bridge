@@ -1,4 +1,5 @@
 import gzip
+from datetime import datetime
 import json
 import threading
 from pathlib import Path
@@ -87,7 +88,9 @@ def test_run_fetch_success_sends_headers_and_result(monkeypatch: pytest.MonkeyPa
     assert seen["headers"]["Content-Type"] == "application/gzip"
     assert seen["headers"]["X-Hub-Upload-Token"] == "tok"
     assert seen["headers"]["X-Hub-Raw-Size"] == str(f.stat().st_size)
-    assert len(seen["headers"]["X-Hub-File-Mtime"]) == 19
+    mtime_hdr = seen["headers"]["X-Hub-File-Mtime"]
+    assert mtime_hdr[-6] in "+-"  # 带时区偏移，中枢才不会按自己的时区解读而整体平移
+    assert datetime.fromisoformat(mtime_hdr).timestamp() == pytest.approx(f.stat().st_mtime, abs=1)
     assert seen["timeout"] == (10, 600)
     assert gzip.decompress(seen["body"]) == f.read_bytes()
     result = ws.messages[-1]
