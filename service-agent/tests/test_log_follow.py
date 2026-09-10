@@ -259,13 +259,18 @@ def test_start_follow_registry_limits_idempotency_and_stop(tmp_path: Path, monke
     log_follow.start_follow(ws, {"sessionId": "a", **base})  # 幂等：只重发 started
     assert len(started_threads) == 1 and ws.messages[-1]["type"] == "logfile_started"
 
-    for sid in ("b", "c"):
+    # 占满到上限（含已有的 a），下一个才该被拒。跟着常量走，改上限时这里不用动。
+    limit = log_constants.MAX_FOLLOW_SESSIONS
+    fillers = [f"f{i}" for i in range(limit - 1)]
+    for sid in fillers:
         log_follow.start_follow(ws, {"sessionId": sid, **base})
-    log_follow.start_follow(ws, {"sessionId": "d", **base})
+    assert len(log_follow._sessions) == limit
+
+    log_follow.start_follow(ws, {"sessionId": "over", **base})
     assert ws.messages[-1] == {
         "type": "logfile_error",
-        "sessionId": "d",
-        "error": {"code": "busy", "message": "too many follow sessions (max 3)"},
+        "sessionId": "over",
+        "error": {"code": "busy", "message": f"too many follow sessions (max {limit})"},
     }
 
     log_follow.start_follow(ws, {"dir": str(proj)})  # 缺 sessionId：忽略
@@ -274,10 +279,10 @@ def test_start_follow_registry_limits_idempotency_and_stop(tmp_path: Path, monke
     log_follow.start_follow(ws, {"sessionId": "e", "dir": str(proj), "subdir": "nope", "tail": 0})  # start 失败：不登记
     assert "e" not in log_follow._sessions
 
-    log_follow.stop_follow({"sessionId": "b"})
-    assert log_follow._sessions["b"].stopped
+    log_follow.stop_follow({"sessionId": fillers[0]})
+    assert log_follow._sessions[fillers[0]].stopped
     log_follow.stop_follow({"sessionId": "zzz"})  # 未知：忽略
-    assert log_follow.stop_all() == 3
+    assert log_follow.stop_all() == limit
     assert not log_follow._sessions
 
 
@@ -294,3 +299,10 @@ def test_run_loop_sends_finished_on_unfollow(tmp_path: Path, monkeypatch: pytest
 
     assert ws.messages[-1] == {"type": "logfile_finished", "sessionId": "s1", "reason": "unfollow"}
     assert "s1" not in log_follow._sessions
+
+
+def test_max_follow_sessions_allows_multi_instance_host() -> None:
+    """单机多实例要能同时跟随；与中枢 LOG_STREAM_PER_AGENT 保持一致。"""
+    from core.log_constants import MAX_FOLLOW_SESSIONS
+
+    assert MAX_FOLLOW_SESSIONS == 8
