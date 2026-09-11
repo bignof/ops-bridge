@@ -183,7 +183,90 @@ def test_handle_list_io_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     def boom(root):
         raise OSError("disk")
 
-    monkeypatch.setattr(log_paths, "list_log_files", boom)
+    monkeypatch.setattr(log_paths, "list_log_overview", boom)
     ws = FakeWs()
     log_paths.handle_list(ws, {"requestId": "r3", "dir": str(proj)})
     assert json.loads(ws.messages[-1])["error"]["code"] == "io_error"
+
+
+def _many(dirpath: Path, prefix: str, n: int, base_ts: int) -> None:
+    dirpath.mkdir(parents=True, exist_ok=True)
+    for i in range(n):
+        f = dirpath / f"{prefix}-{i:04d}.log"
+        f.write_text("x\n")
+        os.utime(f, (base_ts + i, base_ts + i))
+
+
+def test_overview_gives_every_dir_a_share(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """xxl-job 一次任务一个文件、永远最新；全局取最新 N 个会把 main/ 挤出清单（2026-09-11 现场）。"""
+    monkeypatch.setattr(log_paths, "LIST_PAGE_SIZE", 5)
+    monkeypatch.setattr(log_paths, "LIST_MAX_FILES", 8)
+    proj = _project(tmp_path)
+    root = proj / "logs"
+    _many(root / "main", "orchidea", 3, 1_700_000_000)      # 老的按天日志
+    _many(root / "xxljob", "job", 30, 1_700_100_000)        # 更新、更多
+
+    files, dirs = log_paths.list_log_overview(str(root))
+
+    assert [(d["dir"], d["total"], len(d["files"])) for d in dirs] == [("main", 3, 3), ("xxljob", 30, 5)]
+    assert dirs[1]["files"][0]["path"] == "xxljob/job-0029.log"  # 组内 mtime 倒序
+    paths = [f["path"] for f in files]
+    assert sum(p.startswith("main/") for p in paths) == 3        # main 一个都没被挤掉
+    assert len(paths) == 8
+
+
+def test_overview_root_level_files_use_empty_dir(tmp_path: Path) -> None:
+    proj = _project(tmp_path)
+    root = proj / "logs"
+    root.mkdir()
+    (root / "app.log").write_text("x\n")
+    (root / "empty").mkdir()                                    # 没有日志的目录不出现
+    _, dirs = log_paths.list_log_overview(str(root))
+    assert [d["dir"] for d in dirs] == [""]
+
+
+def test_list_log_page_slices_one_dir(tmp_path: Path) -> None:
+    proj = _project(tmp_path)
+    root = proj / "logs"
+    _many(root / "xxljob", "job", 30, 1_700_100_000)
+    _many(root / "xxljob" / "sub", "deep", 2, 1_800_000_000)   # 子目录不算进本目录
+
+    page = log_paths.list_log_page(str(root), "xxljob/", 5, 5)
+    assert page["dir"] == "xxljob" and page["total"] == 30 and page["offset"] == 5
+    assert [f["path"] for f in page["files"]] == [f"xxljob/job-{i:04d}.log" for i in (24, 23, 22, 21, 20)]
+    assert log_paths.list_log_page(str(root), "xxljob", 100, 5)["files"] == []
+
+    with pytest.raises(log_paths.LogPathError) as ei:
+        log_paths.list_log_page(str(root), "../x", 0, 5)
+    assert ei.value.code == "forbidden"
+    with pytest.raises(log_paths.LogPathError) as ei2:
+        log_paths.list_log_page(str(root), "nope", 0, 5)
+    assert ei2.value.code == "not_found"
+
+
+def test_handle_list_overview_and_page_frames(tmp_path: Path) -> None:
+    proj = _project(tmp_path)
+    root = proj / "logs"
+    _many(root / "main", "orchidea", 3, 1_700_000_000)
+    _many(root / "xxljob", "job", 30, 1_700_100_000)
+    ws = FakeWs()
+
+    log_paths.handle_list(ws, {"requestId": "o1", "dir": str(proj)})
+    ov = json.loads(ws.messages[-1])
+    assert [d["dir"] for d in ov["dirs"]] == ["main", "xxljob"] and ov["dirs"][1]["total"] == 30
+    assert "total" not in ov  # 概览帧不带单目录字段
+
+    log_paths.handle_list(ws, {"requestId": "p1", "dir": str(proj), "subdir": "xxljob", "offset": 20, "limit": 20})
+    pg = json.loads(ws.messages[-1])
+    assert pg["dir"] == "xxljob" and pg["total"] == 30 and pg["offset"] == 20 and len(pg["files"]) == 10
+    assert "dirs" not in pg
+
+    # 非法 / 越界参数回落：offset 非数字按 0，limit 超上限按上限、非数字按默认
+    log_paths.handle_list(ws, {"requestId": "p2", "dir": str(proj), "subdir": "xxljob", "offset": "x", "limit": 10**6})
+    assert len(json.loads(ws.messages[-1])["files"]) == 30
+    log_paths.handle_list(ws, {"requestId": "p3", "dir": str(proj), "subdir": "xxljob", "limit": "?"})
+    p3 = json.loads(ws.messages[-1])
+    assert p3["offset"] == 0 and len(p3["files"]) == log_paths.LIST_PAGE_SIZE
+
+    log_paths.handle_list(ws, {"requestId": "p4", "dir": str(proj), "subdir": "../../etc"})
+    assert json.loads(ws.messages[-1])["error"]["code"] == "forbidden"

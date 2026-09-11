@@ -14,7 +14,7 @@ from datetime import datetime
 
 from config import CHINA_TZ
 from core.handlers import send_message
-from core.log_constants import LIST_MAX_DEPTH, LIST_MAX_FILES
+from core.log_constants import LIST_MAX_DEPTH, LIST_MAX_FILES, LIST_PAGE_MAX, LIST_PAGE_SIZE
 from services.compose import find_compose_file
 
 logger = logging.getLogger(__name__)
@@ -100,25 +100,88 @@ def format_mtime(ts: float) -> str:
     return datetime.fromtimestamp(ts, CHINA_TZ).isoformat(timespec="seconds")
 
 
-def list_log_files(root: str) -> list[dict]:
-    """递归 ≤ LIST_MAX_DEPTH 层、白名单文件、mtime 倒序、最多 LIST_MAX_FILES 项。"""
-    root = os.path.realpath(root)
+def _rel(path: str, root: str) -> str:
+    rel = os.path.relpath(path, root).replace(os.sep, "/")
+    return "" if rel == "." else rel
+
+
+def _scan_dir(dirpath: str, root: str) -> list[tuple[float, str, dict]]:
+    """单个目录（不递归）里的白名单日志文件，mtime 倒序；同 mtime 按路径倒序，保证分页翻页稳定。"""
+    found: list[tuple[float, str, dict]] = []
+    with os.scandir(dirpath) as it:
+        for entry in it:
+            if not is_log_filename(entry.name) or entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                continue
+            st = entry.stat(follow_symlinks=False)
+            rel = _rel(entry.path, root)
+            found.append((st.st_mtime, rel, {"path": rel, "size": st.st_size, "mtime": format_mtime(st.st_mtime)}))
+    found.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return found
+
+
+def _walk_dirs(root: str) -> list[str]:
+    """日志根及其下 ≤ LIST_MAX_DEPTH 层的目录（跳过隐藏目录，不跟软链）。"""
     root_depth = root.rstrip(os.sep).count(os.sep)
-    found: list[tuple[float, dict]] = []
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+    out: list[str] = []
+    for dirpath, dirnames, _ in os.walk(root, followlinks=False):
         depth = dirpath.rstrip(os.sep).count(os.sep) - root_depth
         dirnames[:] = [] if depth >= LIST_MAX_DEPTH else [d for d in dirnames if not d.startswith(".")]
-        for name in filenames:
-            if not is_log_filename(name):
-                continue
-            full = os.path.join(dirpath, name)
-            if os.path.islink(full) or not os.path.isfile(full):
-                continue
-            st = os.stat(full)
-            rel = os.path.relpath(full, root).replace(os.sep, "/")
-            found.append((st.st_mtime, {"path": rel, "size": st.st_size, "mtime": format_mtime(st.st_mtime)}))
-    found.sort(key=lambda item: (item[0], item[1]["path"]), reverse=True)
-    return [item[1] for item in found[:LIST_MAX_FILES]]
+        out.append(dirpath)
+    return out
+
+
+def list_log_overview(root: str) -> tuple[list[dict], list[dict]]:
+    """按目录分组的清单：(平铺清单, 目录分组)。
+
+    目录分组 = 每个含日志的目录一项 {dir, total, files}，files 只给首屏 LIST_PAGE_SIZE 条，
+    更多的由调用方按目录单独分页（见 list_log_page）。
+
+    不能再「全局按 mtime 取最新 N 个」：xxl-job 一次任务一个文件，它们永远是最新的，
+    会把 main/ 这类按天滚动的业务日志整个挤出清单——2026-09-11 现场 500 个名额里 499 个是
+    xxljob/job-*.log，main/ 下三十多天的日志只剩一个。
+
+    平铺清单留给只认 files 的老中枢：各目录首屏合并后按 mtime 倒序、最多 LIST_MAX_FILES 项，
+    按目录取首屏再合并，保证每个目录都分得到名额。
+    """
+    root = os.path.realpath(root)
+    dirs: list[dict] = []
+    flat: list[tuple[float, str, dict]] = []
+    for dirpath in _walk_dirs(root):
+        found = _scan_dir(dirpath, root)
+        if not found:
+            continue
+        head = found[:LIST_PAGE_SIZE]
+        dirs.append({"dir": _rel(dirpath, root), "total": len(found), "files": [item[2] for item in head]})
+        flat.extend(head)
+    dirs.sort(key=lambda d: d["dir"])
+    flat.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [item[2] for item in flat[:LIST_MAX_FILES]], dirs
+
+
+def list_log_files(root: str) -> list[dict]:
+    """平铺清单（老协议口径），见 list_log_overview。"""
+    return list_log_overview(root)[0]
+
+
+def list_log_page(root: str, subdir: str, offset: int, limit: int) -> dict:
+    """单个目录（不递归）的一页：{dir, total, offset, files}，mtime 倒序。"""
+    root = os.path.realpath(root)
+    target = resolve_subdir(root, subdir)
+    found = _scan_dir(target, root)
+    return {
+        "dir": _rel(target, root),
+        "total": len(found),
+        "offset": offset,
+        "files": [item[2] for item in found[offset : offset + limit]],
+    }
+
+
+def _int_param(value, default: int, lo: int, hi: int) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(n, hi))
 
 
 def newest_log_file(dirpath: str) -> str | None:
@@ -143,7 +206,14 @@ def handle_list(ws, data: dict) -> None:
     try:
         root = resolve_log_root(data.get("dir"), data.get("logDir"))
         frame["root"] = root
-        frame["files"] = list_log_files(root)
+        subdir = data.get("subdir")
+        if isinstance(subdir, str):
+            # 单目录分页：只列这一个目录，按 offset/limit 切页
+            offset = _int_param(data.get("offset"), 0, 0, 10**9)
+            limit = _int_param(data.get("limit"), LIST_PAGE_SIZE, 1, LIST_PAGE_MAX)
+            frame.update(list_log_page(root, subdir, offset, limit))
+        else:
+            frame["files"], frame["dirs"] = list_log_overview(root)
     except LogPathError as exc:
         logger.warning("logfile_list rejected: request_id=%s code=%s %s", request_id, exc.code, exc.message)
         frame["error"] = error_payload(exc)

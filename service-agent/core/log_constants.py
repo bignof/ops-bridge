@@ -27,6 +27,8 @@ FETCH_READ_TIMEOUT_SEC = 600
 # 列文件
 LIST_MAX_DEPTH = 2
 LIST_MAX_FILES = 500
+LIST_PAGE_SIZE = 20            # 按目录分组列文件时每个目录的首屏条数（与中枢 LOG_LIST_PAGE_SIZE 同值）
+LIST_PAGE_MAX = 200            # 单目录分页请求的条数上限
 
 # compose 发现
 DISCOVER_MAX_DEPTH = 3
