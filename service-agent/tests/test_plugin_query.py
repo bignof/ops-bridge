@@ -30,7 +30,7 @@ def test_request_resolve_roundtrip_and_cleanup():
             break
         time.sleep(0.01)
     rid = sent[0]['requestId']
-    assert sent[0] == {'type': 'plugin_query', 'requestId': rid, 'service': 'done-admin'}
+    assert sent[0] == {'type': 'plugin_query', 'requestId': rid, 'service': 'done-admin', 'manifestVersion': 2}
     pq.resolve(rid, [{'pluginName': 'p', 'version': '1', 'url': 'u'}])
     t.join(timeout=2)
     assert box['r'] == [{'pluginName': 'p', 'version': '1', 'url': 'u'}]

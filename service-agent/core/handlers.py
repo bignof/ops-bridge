@@ -368,6 +368,25 @@ def handle_restart(ws, data, request_id, project_dir):
     _reply(ws, request_id, ok, '\n'.join(output_lines), 'restart', project_dir)
 
 
+def handle_plugin_operation(ws, data, request_id, project_dir):
+    from services.plugins import execute_plugin_operation
+    from services.plugin_files import PluginFileError
+    import json
+    send_message(ws, {'type': 'ack', 'requestId': request_id, 'status': 'processing'})
+    try:
+        payload = data.get('plugin', {})
+        if not isinstance(payload, dict):
+            raise PluginFileError('invalid', '插件操作参数非法')
+        result, services = execute_plugin_operation(project_dir, data['action'], payload, request_id)
+        _send_result(ws, {
+            'type': 'result', 'requestId': request_id, 'status': 'success',
+            'message': result['message'], 'output': json.dumps(result, ensure_ascii=False),
+            'pluginReport': {'services': services},
+        })
+    except (PluginFileError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        send_error(ws, request_id, str(exc)[:600])
+
+
 # ─────────────────────────────────────────────
 # 注册表：新增 action 只需在这里添加一行
 # ─────────────────────────────────────────────
@@ -376,6 +395,9 @@ HANDLERS = {
     'update':  handle_update,
     'restart': handle_restart,
     'drain':   handle_drain,
+    'plugin_scan': handle_plugin_operation,
+    'plugin_remove': handle_plugin_operation,
+    'plugin_restore': handle_plugin_operation,
 }
 
 
@@ -427,6 +449,9 @@ def dispatch(ws, data):
             handler(ws, data, request_id, project_dir)
     finally:
         _finish_project_command(project_key)
+        if action in ('restart', 'update', 'plugin_remove', 'plugin_restore'):
+            from core.status_reporter import request_report
+            request_report()
         logger.info(
             "Command released project lock: request_id=%s, action=%s, dir=%s",
             request_id,

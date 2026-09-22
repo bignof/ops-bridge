@@ -42,7 +42,7 @@ def request(service: str, timeout: float):
     try:
         def _send():
             try:
-                sender({'type': 'plugin_query', 'requestId': request_id, 'service': service})
+                sender({'type': 'plugin_query', 'requestId': request_id, 'service': service, 'manifestVersion': 2})
             except Exception as e:
                 logger.warning(f"plugin_query send failed: {e}")
                 event.set()  # 早失败早唤醒（result 仍为 None → 上游按超时/失败处理）

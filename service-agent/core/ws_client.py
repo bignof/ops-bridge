@@ -13,7 +13,7 @@ from core.compose_inspect import handle_discover as handle_compose_discover, han
 from core.log_fetch import abort_all as abort_all_fetch, start_fetch as start_logfile_fetch
 from core.log_follow import start_follow as start_logfile_follow, stop_all as stop_all_follow, stop_follow as stop_logfile_follow
 from core.log_paths import handle_list as handle_logfile_list
-from core.status_reporter import set_watch_targets, start_status_reporting
+from core.status_reporter import set_watch_targets, start_status_reporting, stop_status_reporting, request_report
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +88,7 @@ def _on_message(ws, message):
             send_message(ws, {'type': 'pong', 'timestamp': time.time()})
         elif msg_type == 'watch_targets':
             set_watch_targets(data.get('targets'))
+            request_report()
         elif msg_type == 'plugin_query_result':
             plugin_query.resolve(data.get('requestId'), data.get('plugins', []))
     except Exception as e:
@@ -100,6 +101,7 @@ def _on_error(ws, error):
 
 
 def _on_close(ws, close_status_code, close_msg):
+    stop_status_reporting(ws)
     _update_state(connected=False, last_disconnect_ts=time.time())
     outbox.clear_sender()  # 补投暂停,等重连的 _on_open 换新通道
     plugin_query.clear_sender()  # 与 _on_open 的成对注册对称,断连期间 request() 走 sender-is-None 快速失败

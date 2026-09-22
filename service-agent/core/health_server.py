@@ -22,6 +22,32 @@ def _format_timestamp(value):
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        if self.path != '/pluginSyncChanged':
+            self.send_response(404)
+            self.end_headers()
+            return
+        supplied = self.headers.get('X-Agent-Secret') or ''
+        if not AGENT_LOCAL_SECRET or not hmac.compare_digest(supplied.encode(), AGENT_LOCAL_SECRET.encode()):
+            self.send_response(401 if AGENT_LOCAL_SECRET else 403)
+            self.end_headers()
+            return
+        try:
+            length = int(self.headers.get('Content-Length') or '0')
+            if length <= 0 or length > 4096:
+                raise ValueError('invalid length')
+            payload = json.loads(self.rfile.read(length))
+            service = payload.get('service')
+            if not isinstance(service, str) or not service or len(service) > 255:
+                raise ValueError('invalid service')
+        except (ValueError, TypeError, AttributeError):
+            self.send_response(400)
+            self.end_headers()
+            return
+        from core.status_reporter import request_report
+        self.send_response(202 if request_report(service) else 503)
+        self.end_headers()
+
     def do_GET(self):
         if self.path.startswith('/queryPlugin'):
             return self._handle_query_plugin()
