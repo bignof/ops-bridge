@@ -2,6 +2,7 @@
 import contextlib
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -19,6 +20,7 @@ _active = 0
 _starting = False
 _runtime = None
 _boot_id = str(uuid.uuid4())
+logger = logging.getLogger(__name__)
 
 
 def docker(*args, timeout=60):
@@ -181,6 +183,8 @@ def report(ws):
 
 def on_connected(ws):
     report(ws)
+    if recover_launch():
+        return
     job = job_state()
     # Agent 在等待服务任务/启动执行器之前被重建：恢复同一任务，不让 waiting 永久悬挂。
     if job.get('status') == 'waiting' and not _starting:
@@ -193,6 +197,44 @@ def on_connected(ws):
         except Exception:
             # Docker 暂不可用时保留任务；下一轮重连仍可恢复。
             pass
+
+
+def recover_launch():
+    """接管后不再由启动方写账本；用固定容器名恢复不确定的 create/start。
+
+    job.json 自交接起只由执行器写。无论 inspect/run/start 的响应是否丢失，
+    都不使用启动方的旧副本回写，避免检查后又推进的跨进程竞态。
+    返回 True 表示已有本任务的交接记录，不能走旧的 waiting 重建流程。
+    """
+    with _guard:
+        try:
+            root = state_root()
+            job = job_state()
+            launch = read_json(root / 'launch.json')
+            if not launch or launch.get('requestId') != job.get('requestId'):
+                return False
+            if job.get('status') != 'waiting':
+                return True
+            helper = 'agent-upgrader-' + root.name
+            manifest = read_json(root / 'manifest.json')
+            if launch.get('helper') != helper or manifest.get('requestId') != job['requestId']:
+                raise ValueError('升级执行器交接记录不匹配')
+            ids = docker('ps', '-aq', '--filter', 'name=^/' + helper + '$')
+            if ids:
+                info = inspect_container(helper)
+                labels = info['Config'].get('Labels') or {}
+                if (labels.get('orchidea.agent-upgrader') != root.name
+                        or labels.get('orchidea.agent-upgrade-request') != job['requestId']):
+                    raise ValueError('同名执行器不属于本次升级，保留任务等待确认')
+                if not info['State'].get('Running') and info['State'].get('Status') in ('created', 'exited', 'dead'):
+                    docker('start', helper)
+            else:
+                # 即使此前 run 仍在 daemon 中处理，相同名称也只允许创建一个容器。
+                docker(*launch['args'])
+        except Exception:
+            # Docker 不可用/结果不确定都不是失败证据；保留账本并在心跳/重连时再核对。
+            logger.warning('升级执行器启动结果尚未确认，保留任务并等待重试')
+        return True
 
 
 @contextlib.contextmanager
@@ -237,6 +279,7 @@ def start_upgrade(ws, data, resume=False):
         _starting = True
     root = state_root()
     job = {'requestId': request_id, 'targetImage': data.get('image'), 'seq': previous.get('seq', 0) if resuming else 0}
+    handed_off = False
     try:
         dep = deployment_info()
         validate_image(data.get('image'), dep['image'])
@@ -270,6 +313,7 @@ def start_upgrade(ws, data, resume=False):
         socket_mount = next(m for m in dep['mounts'] if m.get('Destination') == '/var/run/docker.sock')
         args = ['run', '-d', '--name', helper_name, '--restart', 'on-failure:3',
                 '--label', 'orchidea.agent-upgrader=' + root.name,
+                '--label', 'orchidea.agent-upgrade-request=' + request_id,
                 '-v', socket_mount['Source'] + ':/var/run/docker.sock']
         for source in sorted({host_project_mount['Source'], host_state_mount['Source']}):
             args += ['-v', source + ':' + source]
@@ -280,9 +324,15 @@ def start_upgrade(ws, data, resume=False):
             args += ['-v', host_auth + ':/root/.docker:ro']
         args += ['--entrypoint', 'python', dep['imageId'], '-m', 'services.agent_upgrade',
                  '--run', dep['hostRoot'] + '/manifest.json']
-        docker(*args)
+        # 先持久化可重试的启动意图，再请求 Docker。发布交接记录后启动方永不写终态。
+        # 标记必须早于 atomic_json：replace 后 fsync 抛错时记录也可能已对其它线程可见。
+        handed_off = True
+        atomic_json(root / 'launch.json', {'requestId': request_id, 'helper': helper_name, 'args': args})
+        recover_launch()
+        report(ws)
     except Exception as exc:
-        save_job(root, job, 'failed', str(exc)[:500])
+        if not handed_off:
+            save_job(root, job, 'failed', str(exc)[:500])
         report(ws)
     finally:
         with _guard:

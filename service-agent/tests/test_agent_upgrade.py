@@ -367,3 +367,104 @@ def test_reconnect_docker_unavailable_preserves_task(monkeypatch):
     monkeypatch.setattr(u, 'docker', Mock(side_effect=RuntimeError('offline')))
     u.on_connected(Mock())
     assert u.job_state()['status'] == 'waiting'
+
+
+@pytest.mark.parametrize('failure', [subprocess.TimeoutExpired('docker run', 60), RuntimeError('socket disconnected')])
+def test_lost_launch_response_preserves_executor_progress(deployment, monkeypatch, failure):
+    """daemon 已启动 helper 后 CLI 报错，不能把真实进度覆盖为 failed 或释放服务操作。"""
+    ws = Mock()
+    def lost_response(*args, **kwargs):
+        if args[0] == 'run':
+            job = u.job_state()
+            u.save_job(u.state_root(), job, 'pulling')
+            u.save_job(u.state_root(), job, 'pulling', targetImageId='sha256:new')
+            raise failure
+        return ''
+    monkeypatch.setattr(u, 'docker', lost_response)
+    u.start_upgrade(ws, {'requestId': RID, 'image': 'registry/agent:v2'})
+    job = u.job_state()
+    assert (job['status'], job['seq'], job['targetImageId']) == ('pulling', 3, 'sha256:new')
+    frames = [json.loads(call.args[0])['upgrade'] for call in ws.send.call_args_list]
+    assert [frame['status'] for frame in frames] == ['waiting', 'pulling']
+    assert frames[-1]['targetImageId'] == 'sha256:new'
+    with pytest.raises(RuntimeError):
+        with u.command_slot(): pass
+    u.save_job(u.state_root(), job, 'success')
+    u.report(ws)
+    assert json.loads(ws.send.call_args.args[0])['upgrade']['status'] == 'success'
+
+
+def test_unconfirmed_launch_retries_without_rewriting_job(deployment, monkeypatch):
+    calls = []
+    failed = True
+    def docker(*args, **kwargs):
+        calls.append(args)
+        if args[0] == 'run' and failed:
+            raise subprocess.TimeoutExpired('docker run', 60)
+        return ''
+    monkeypatch.setattr(u, 'docker', docker)
+    u.start_upgrade(Mock(), {'requestId': RID, 'image': 'registry/agent:v2'})
+    before = u.job_state()
+    assert before['status'] == 'waiting'
+    failed = False
+    u.on_connected(Mock())
+    assert u.job_state() == before
+    runs = [call for call in calls if call[0] == 'run']
+    assert len(runs) == 2 and runs[0] == runs[1]
+    assert 'orchidea.agent-upgrade-request=' + RID in runs[0]
+
+
+@pytest.mark.parametrize('status', ['running', 'restarting', 'created', 'exited'])
+def test_existing_executor_is_confirmed_by_request_and_never_recreated(deployment, monkeypatch, status):
+    monkeypatch.setattr(u, 'docker', lambda *a, **k: '')
+    u.start_upgrade(Mock(), {'requestId': RID, 'image': 'registry/agent:v2'})
+    before = u.job_state()
+    calls = []
+    monkeypatch.setattr(u, 'docker', lambda *a, **k: calls.append(a) or ('id' if a[0] == 'ps' else ''))
+    info = {'Config': {'Labels': {'orchidea.agent-upgrader': u.state_root().name, 'orchidea.agent-upgrade-request': RID}},
+            'State': {'Running': status in ('running', 'restarting'), 'Status': status}}
+    monkeypatch.setattr(u, 'inspect_container', lambda name: info)
+    assert u.recover_launch()
+    assert u.job_state() == before
+    assert not any(call[0] == 'run' for call in calls)
+    assert any(call[0] == 'start' for call in calls) is (status in ('created', 'exited'))
+
+
+def test_wrong_executor_or_unavailable_inspect_keeps_task_locked(deployment, monkeypatch):
+    monkeypatch.setattr(u, 'docker', lambda *a, **k: '')
+    u.start_upgrade(Mock(), {'requestId': RID, 'image': 'registry/agent:v2'})
+    before = u.job_state()
+    calls = []
+    monkeypatch.setattr(u, 'docker', lambda *a, **k: calls.append(a) or 'existing')
+    monkeypatch.setattr(u, 'inspect_container', lambda n: {'Config': {'Labels': {}}, 'State': {'Running': False, 'Status': 'created'}})
+    u.recover_launch()
+    monkeypatch.setattr(u, 'inspect_container', Mock(side_effect=RuntimeError('daemon unavailable')))
+    u.recover_launch()
+    assert u.job_state() == before
+    assert all(call[0] == 'ps' for call in calls)
+
+
+def test_handoff_fsync_error_does_not_clobber_started_executor(deployment, monkeypatch):
+    atomic = u.atomic_json
+    def fail_after_publish(path, value):
+        atomic(path, value)
+        if Path(path).name == 'launch.json':
+            job = u.job_state()
+            u.save_job(u.state_root(), job, 'pulling', targetImageId='sha256:new')
+            raise OSError('directory fsync failed after publishing intent')
+    monkeypatch.setattr(u, 'atomic_json', fail_after_publish)
+    monkeypatch.setattr(u, 'docker', lambda *a, **k: '')
+    u.start_upgrade(Mock(), {'requestId': RID, 'image': 'registry/agent:v2'})
+    assert u.job_state()['status'] == 'pulling'
+    assert u.job_state()['targetImageId'] == 'sha256:new'
+
+
+def test_mismatched_manifest_never_starts_executor(deployment, monkeypatch):
+    monkeypatch.setattr(u, 'docker', lambda *a, **k: '')
+    u.start_upgrade(Mock(), {'requestId': RID, 'image': 'registry/agent:v2'})
+    u.atomic_json(u.state_root() / 'manifest.json', {'requestId': 'different'})
+    docker = Mock()
+    monkeypatch.setattr(u, 'docker', docker)
+    assert u.recover_launch()
+    docker.assert_not_called()
+    assert u.job_state()['status'] == 'waiting'

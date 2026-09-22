@@ -130,6 +130,7 @@ def _start_heartbeat(ws):
             if ws and ws.keep_running:
                 _update_state(last_heartbeat_ts=time.time())
                 send_message(ws, {'type': 'heartbeat', 'ts': time.time()})
+                agent_upgrade.recover_launch()
                 agent_upgrade.report(ws)
                 outbox.flush()  # 按退避补投未确认 result(连接存续但此前发送失败/ack 丢失的场景)
 
