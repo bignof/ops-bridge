@@ -22,6 +22,9 @@ COPY services/ services/
 
 # result 出站队列账本默认落挂载卷（compose 均挂 /data），容器重建/镜像升级不丢未确认回执;
 # 部署可用环境变量 OUTBOX_PATH 覆盖
+ARG AGENT_VERSION=dev
+ENV AGENT_VERSION=${AGENT_VERSION}
+LABEL org.opencontainers.image.version=${AGENT_VERSION}
 ENV OUTBOX_PATH=/data/.service-agent/outbox.json
 
 EXPOSE 18081

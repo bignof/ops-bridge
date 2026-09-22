@@ -67,6 +67,8 @@ jobs:
           context: ./service-agent
           file: ./service-agent/Dockerfile
           push: true
+          build-args: |
+            AGENT_VERSION=main-${{ env.TS }}
           tags: |
             ${{ secrets.REGISTRY_URL }}/${{ secrets.SERVICE_AGENT_IMAGE_NAME }}:latest
             ${{ secrets.REGISTRY_URL }}/${{ secrets.SERVICE_AGENT_IMAGE_NAME }}:main-${{ env.TS }}

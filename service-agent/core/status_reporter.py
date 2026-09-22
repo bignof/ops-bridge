@@ -22,9 +22,13 @@ _watch_targets_lock = threading.Lock()
 def set_watch_targets(targets):
     """覆盖式更新：hub 每次推送的都是该 agent 名下的完整清单，不是增量。"""
     global _watch_targets
+    normalized = sorted(list(targets or []), key=lambda t: str(t.get('deploymentId', '')))
     with _watch_targets_lock:
-        _watch_targets = list(targets or [])
+        if _watch_targets == normalized:
+            return False
+        _watch_targets = normalized
     logger.info(f"watch_targets updated: {len(_watch_targets)} deployment(s)")
+    return True
 
 
 def get_watch_targets():

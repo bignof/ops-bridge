@@ -26,8 +26,9 @@ def free_tcp_port() -> int:
 
 
 @pytest.fixture(autouse=True)
-def isolated_outbox_state(tmp_path):
+def isolated_outbox_state(tmp_path, monkeypatch):
     """outbox 是模块级单例:每个测试重定向持久化到临时目录,防跨测试污染与工作区落盘。"""
+    monkeypatch.setenv('AGENT_UPGRADE_DIR', str(tmp_path / 'upgrades'))
     from core import outbox
 
     outbox.configure(str(tmp_path / "outbox-autouse.json"))

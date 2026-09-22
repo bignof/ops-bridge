@@ -406,6 +406,15 @@ HANDLERS = {
 # ─────────────────────────────────────────────
 
 def dispatch(ws, data):
+    from services.agent_upgrade import command_slot
+    try:
+        with command_slot():
+            _dispatch(ws, data)
+    except RuntimeError as exc:
+        send_error(ws, data.get('requestId'), str(exc))
+
+
+def _dispatch(ws, data):
     """解析命令并分发到对应的 handler。"""
     logger.info(
         "Received command: request_id=%s, action=%s, dir=%s",

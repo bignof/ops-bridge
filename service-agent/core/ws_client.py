@@ -7,6 +7,7 @@ import websocket
 
 from config import AGENT_ID, AGENT_KEY, HEARTBEAT_INTERVAL, OUTBOX_PATH, WS_URL
 from core import outbox, plugin_query
+from services import agent_upgrade
 from core.handlers import dispatch, send_message
 from core.log_sessions import start_log_session, stop_log_session, stop_all as stop_all_log_sessions
 from core.compose_inspect import handle_discover as handle_compose_discover, handle_inspect as handle_compose_inspect
@@ -55,6 +56,7 @@ def _on_open(ws):
     outbox.flush(force=True)
     _start_heartbeat(ws)
     start_status_reporting(ws)
+    threading.Thread(target=agent_upgrade.on_connected, args=(ws,), daemon=True).start()
 
 
 def _on_message(ws, message):
@@ -62,7 +64,11 @@ def _on_message(ws, message):
         _update_state(last_message_ts=time.time())
         data = json.loads(message)
         msg_type = data.get('type')
-        if msg_type == 'command':
+        if msg_type == 'agent_upgrade':
+            threading.Thread(target=agent_upgrade.start_upgrade, args=(ws, data), daemon=True).start()
+        elif msg_type == 'agent_upgrade_confirm':
+            agent_upgrade.confirm(data)
+        elif msg_type == 'command':
             # 在独立线程中执行，避免阻塞 WebSocket 接收循环
             threading.Thread(target=dispatch, args=(ws, data), daemon=True).start()
         elif msg_type == 'logs_start':
@@ -87,8 +93,8 @@ def _on_message(ws, message):
         elif msg_type == 'ping':
             send_message(ws, {'type': 'pong', 'timestamp': time.time()})
         elif msg_type == 'watch_targets':
-            set_watch_targets(data.get('targets'))
-            request_report()
+            if set_watch_targets(data.get('targets')):
+                request_report()
         elif msg_type == 'plugin_query_result':
             plugin_query.resolve(data.get('requestId'), data.get('plugins', []))
     except Exception as e:
@@ -124,6 +130,7 @@ def _start_heartbeat(ws):
             if ws and ws.keep_running:
                 _update_state(last_heartbeat_ts=time.time())
                 send_message(ws, {'type': 'heartbeat', 'ts': time.time()})
+                agent_upgrade.report(ws)
                 outbox.flush()  # 按退避补投未确认 result(连接存续但此前发送失败/ack 丢失的场景)
 
     _heartbeat_thread = threading.Thread(target=_beat, daemon=True)
@@ -133,7 +140,7 @@ def _start_heartbeat(ws):
 def connect():
     outbox.configure(OUTBOX_PATH)  # 幂等:每轮重连前确保已从磁盘恢复(进程首连即初始化)
     url = f"{WS_URL}/{AGENT_ID}?key={AGENT_KEY}"
-    logger.info(f"Connecting to {url}...")
+    logger.info("Connecting to %s/%s...", WS_URL, AGENT_ID)
     ws = websocket.WebSocketApp(
         url,
         on_open=_on_open,

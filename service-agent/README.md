@@ -333,3 +333,17 @@ pytest --cov=agent --cov=config --cov=core --cov=services --cov-report=term-miss
 - 每个 agent 都应使用 hub 单独签发的 `AGENT_KEY`，不要在多个节点间复用
 - 建议在内网环境部署，或通过 TLS（`wss://`）加密 WebSocket 连接
 - Docker socket 挂载赋予了 Agent 完整的宿主机容器控制权，请确保只有可信的 ServiceHub 实例能接入
+
+## Agent 自升级
+
+支持交付中枢「服务器 → 升级 Agent」。首次须手工安装带自升级协议的 Agent，之后可从 Hub 指定同仓库标签或 digest 升级。
+
+Agent 等待当前服务操作完成后，用当前已安装镜像启动独立的临时执行器。执行器先拉取并固定目标 digest，再仅重建 Agent 服务；新版实际镜像与 Hub 确认、健康检查都通过才算成功。失败自动恢复旧镜像，执行器中断时根据持久化账本补偿，业务容器不重启。
+
+部署需要挂载 Docker socket、Compose 项目文件和持久化状态目录。支持多个 Compose 文件，修改最后一个定义本服务 image 的文件。`AGENT_ID` 须显式配置；自定义 hostname 时可通过 `AGENT_CONTAINER_NAME` 指定自身容器。状态目录默认 `/data/.service-agent/upgrades/`（`AGENT_UPGRADE_DIR` 可覆盖）。私有仓库凭据目录通过 bind mount 与 `DOCKER_CONFIG` 配置，辅助执行器只读使用，不上传凭据。
+
+原始 Compose 留存于身份对应目录的 `compose.before.yml`；旧版有 digest 时回退配置保留该 digest，首次接入无 digest 的镜像使用保留的本地回退标签。升级成功后的 Compose image 固定为目标 digest；后续手工维护镜像应修改这个实际生效的配置文件。
+
+构建参数 `AGENT_VERSION` 注入版本号，CI 使用 `main-<时间戳>`。上行 `agent_report` 传当前版本、Image ID、自升级能力与持久化任务阶段；Hub 下发 `agent_upgrade`，验证新连接后返回 `agent_upgrade_confirm`。等待中 Agent 重启会恢复同一任务；相同 requestId 不重复执行。
+
+升级期间暂停新的服务操作，日志与插件查询短暂不可用。临时执行器完成后退出，下一次升级清理旧执行器。人工操作 Docker 时须避免与升级任务重叠。
