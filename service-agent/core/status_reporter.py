@@ -37,9 +37,16 @@ _active_ws = None
 _refresh_lock = threading.Lock()
 _refresh_services = set()
 _refresh_running = False
+_collection_lock = threading.Lock()
 
 
 def _collect_and_send(ws, services_filter=None):
+    # 周期巡检和即时通知不并发重复扫描 Docker；单轮所有部署共享一次 inspect。
+    with _collection_lock:
+        _collect_batch(ws, services_filter)
+
+
+def _collect_batch(ws, services_filter=None):
     reports = []
     for target in get_watch_targets():
         if services_filter and target.get('service') and target['service'] not in services_filter:
@@ -47,8 +54,14 @@ def _collect_and_send(ws, services_filter=None):
         services = collect_service_statuses(target['dir'])
         if not services:
             continue
-        reports.append({'deploymentId': target['deploymentId'], 'services': enrich_statuses(services)})
+        reports.append({'deploymentId': target['deploymentId'], 'services': services})
     if reports:
+        enriched = enrich_statuses([service for report in reports for service in report['services']])
+        offset = 0
+        for report in reports:
+            count = len(report['services'])
+            report['services'] = enriched[offset:offset + count]
+            offset += count
         send_message(ws, {'type': 'status_report', 'reports': reports})
 
 

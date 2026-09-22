@@ -98,10 +98,29 @@ def atomic_json(filename, value):
     try:
         with temp.open('x', encoding='utf-8') as stream:
             json.dump(value, stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(temp, filename)
+        _sync_directory(filename.parent)
     finally:
         if temp.exists():
             temp.unlink()
+
+
+def _sync_directory(directory):
+    if os.name == 'nt':
+        return
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _move_plugin(source, target):
+    os.rename(source, target)
+    _sync_directory(source.parent)
+    _sync_directory(target.parent)
 
 
 @contextmanager
@@ -144,11 +163,27 @@ def plugin_entry(root, name):
     if not directory.is_dir():
         raise PluginFileError('invalid', '插件目录不是文件夹')
     metadata = checked_path(root, name + '/package.json')
+    return _package_entry(directory, metadata, name)
+
+
+def _package_entry(directory, metadata, name):
     pkg, raw, info = read_json(metadata)
     if pkg.get('name') != name or not isinstance(pkg.get('version'), str) or not pkg['version'] or len(pkg['version']) > 255:
         raise PluginFileError('invalid', 'package.json 的包名或版本与目录不一致')
     identity = f'{info.st_dev}:{info.st_ino}:{info.st_mtime_ns}:{directory.stat().st_ino}'.encode()
     return {'name': name, 'version': pkg['version'], 'fingerprint': hashlib.sha256(raw + identity).hexdigest(), 'path': str(directory)}
+
+
+def _recovery_payload(root, trash_id, meta):
+    directory = checked_path(root, f'{TRASH_DIR}/{trash_id}/plugin')
+    metadata = checked_path(root, f'{TRASH_DIR}/{trash_id}/plugin/package.json')
+    try:
+        entry = _package_entry(directory, metadata, meta['name'])
+    except (OSError, ValueError, PluginFileError) as exc:
+        raise PluginFileError('conflict', '隔离文件内容已变化，拒绝恢复') from exc
+    if entry['fingerprint'] != meta.get('fingerprint'):
+        raise PluginFileError('conflict', '隔离文件内容已变化，拒绝恢复')
+    return directory
 
 
 def _trash_root(root, create=False):
@@ -184,8 +219,12 @@ def list_trash(root):
         try:
             directory, meta = trash_record(root, entry.name)
             payload = checked_path(root, f'{TRASH_DIR}/{entry.name}/plugin', allow_missing=True)
-            if payload.is_dir() and meta['expiresAtEpoch'] > time.time():
-                result.append({key: meta.get(key) for key in ('trashId', 'name', 'version', 'deletedAt', 'expiresAt')})
+            pending = False
+            if not payload.exists() and meta.get('state') in ('prepared', 'restoring'):
+                pending = plugin_entry(root, meta['name'])['fingerprint'] == meta.get('fingerprint')
+            if (payload.is_dir() or pending) and meta['expiresAtEpoch'] > time.time():
+                result.append({**{key: meta.get(key) for key in ('trashId', 'name', 'version', 'deletedAt', 'expiresAt')},
+                               'restorePending': pending, 'fingerprint': meta.get('fingerprint')})
         except (OSError, ValueError, PluginFileError):
             continue
     return result
@@ -243,7 +282,7 @@ def scan_plugins(root):
             'syncError': report_error, 'recycle': list_trash(root)}
 
 
-def remove_plugin(root, name, expected_fingerprint, request_id, on_remove=None, on_rollback=None):
+def remove_plugin(root, name, expected_fingerprint, request_id, on_remove=None, on_rollback=None, on_inspect=None):
     try:
         trash_id = uuid.UUID(str(request_id)).hex
     except ValueError as exc:
@@ -255,29 +294,42 @@ def remove_plugin(root, name, expected_fingerprint, request_id, on_remove=None, 
             _, previous = trash_record(root, trash_id)
             if previous.get('name') != name or previous.get('fingerprint') != expected_fingerprint:
                 raise PluginFileError('conflict', '重复操作的参数不一致')
-            if previous.get('state') != 'prepared' or (receipt / 'plugin').is_dir():
+            if previous.get('state') != 'prepared':
                 return previous
-            # 在写入准备记录后、移动目录前中断的命令可以安全重试。
-            shutil.rmtree(receipt)
-        entry = plugin_entry(root, name)
-        if not expected_fingerprint or entry['fingerprint'] != expected_fingerprint:
-            raise PluginFileError('conflict', '插件版本或文件已变化，请刷新后重新确认')
-        deleted = time.time()
-        meta = {**entry, 'trashId': trash_id, 'deletedAt': utc_stamp(deleted), 'expiresAt': utc_stamp(deleted + RETENTION_SECONDS),
-                'expiresAtEpoch': deleted + RETENTION_SECONDS, 'state': 'prepared'}
-        receipt.mkdir(mode=0o700)
-        atomic_json(receipt / 'meta.json', meta)
-        source = package_path(root, name)
-        os.rename(source, receipt / 'plugin')
+            meta = previous
+            if 'linkRequired' not in meta:
+                meta['linkRequired'] = meta.get('linkRemoved', bool(on_remove))
+                atomic_json(receipt / 'meta.json', meta)
+        else:
+            entry = plugin_entry(root, name)
+            if not expected_fingerprint or entry['fingerprint'] != expected_fingerprint:
+                raise PluginFileError('conflict', '插件版本或文件已变化，请刷新后重新确认')
+            deleted = time.time()
+            # 在任何文件/链接变动前保存原链接状态，崩溃后仍能完成恢复。
+            meta = {**entry, 'trashId': trash_id, 'deletedAt': utc_stamp(deleted), 'expiresAt': utc_stamp(deleted + RETENTION_SECONDS),
+                    'expiresAtEpoch': deleted + RETENTION_SECONDS, 'state': 'prepared',
+                    'linkRequired': bool(on_inspect()) if on_inspect else bool(on_remove)}
+            receipt.mkdir(mode=0o700)
+            atomic_json(receipt / 'meta.json', meta)
+        payload = checked_path(root, f'{TRASH_DIR}/{trash_id}/plugin', allow_missing=True)
+        if payload.exists():
+            _recovery_payload(root, trash_id, meta)
+            if package_path(root, name, allow_missing=True).exists():
+                raise PluginFileError('conflict', '本地已有新文件，不会继续旧删除操作')
+        else:
+            if plugin_entry(root, name)['fingerprint'] != expected_fingerprint:
+                raise PluginFileError('conflict', '插件版本或文件已变化，请刷新后重新确认')
+            _move_plugin(package_path(root, name), payload)
         try:
             if on_remove:
-                meta['linkRemoved'] = bool(on_remove())
+                meta['linkRemoved'] = bool(on_remove()) or bool(meta.get('linkRemoved'))
+                meta['linkRequired'] = bool(meta.get('linkRequired') or meta['linkRemoved'])
             meta['state'] = 'deleted'
             atomic_json(receipt / 'meta.json', meta)
         except Exception:
-            os.rename(receipt / 'plugin', package_path(root, name, allow_missing=True))
+            _move_plugin(payload, package_path(root, name, allow_missing=True))
             # docker exec 可能已移除链接但回包中断；恢复目录后再确保链接可用。
-            if on_remove and on_rollback:
+            if on_remove and on_rollback and meta.get('linkRequired', True):
                 on_rollback(name)
             shutil.rmtree(receipt)
             raise
@@ -293,23 +345,27 @@ def restore_plugin(root, trash_id, on_restore=None, on_rollback=None):
         if meta['expiresAtEpoch'] <= time.time():
             raise PluginFileError('expired', '文件已超过 7 天恢复期限')
         target = package_path(root, meta['name'], allow_missing=True)
+        payload = checked_path(root, f'{TRASH_DIR}/{trash_id}/plugin', allow_missing=True)
         if target.exists():
-            raise PluginFileError('conflict', '本地已有此插件，不会覆盖现有文件')
-        payload = checked_path(root, f'{TRASH_DIR}/{trash_id}/plugin')
-        pkg, _, _ = read_json(checked_path(root, f'{TRASH_DIR}/{trash_id}/plugin/package.json'))
-        if pkg.get('name') != meta['name'] or pkg.get('version') != meta['version']:
-            raise PluginFileError('conflict', '隔离文件内容已变化，拒绝恢复')
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target = package_path(root, meta['name'], allow_missing=True)
-        os.rename(payload, target)
+            if payload.exists() or meta.get('state') not in ('prepared', 'restoring') or plugin_entry(root, meta['name'])['fingerprint'] != meta.get('fingerprint'):
+                raise PluginFileError('conflict', '本地已有此插件，不会覆盖现有文件')
+        else:
+            _recovery_payload(root, trash_id, meta)
+        meta['linkRequired'] = meta.get('linkRequired', meta.get('linkRemoved', bool(on_restore)))
+        meta['state'] = 'restoring'
+        atomic_json(directory / 'meta.json', meta)
+        if payload.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target = package_path(root, meta['name'], allow_missing=True)
+            _move_plugin(payload, target)
         try:
-            if on_restore and meta.get('linkRemoved'):
+            if on_restore and meta['linkRequired']:
                 on_restore(meta['name'])
             meta['state'] = 'restored'
             atomic_json(directory / 'meta.json', meta)
         except Exception:
-            os.rename(target, payload)
-            if on_restore and meta.get('linkRemoved') and on_rollback:
+            _move_plugin(target, payload)
+            if on_restore and meta['linkRequired'] and on_rollback:
                 on_rollback(meta['name'])
             raise
         return meta

@@ -25,7 +25,9 @@ const parent=path.dirname(link);
 if(fs.existsSync(parent)&&fs.realpathSync(parent)!==path.resolve(parent))throw Error('node_modules 父目录包含符号链接，拒绝操作');
 let info=null;try{info=fs.lstatSync(link)}catch(e){if(e.code!=='ENOENT')throw e}
 const matches=!!info&&info.isSymbolicLink()&&path.resolve(path.dirname(link),fs.readlinkSync(link))===expected;
-if(mode==='remove'){
+if(mode==='check-link'){
+  process.stdout.write(JSON.stringify({removed:matches}));
+}else if(mode==='remove'){
   if(matches)fs.unlinkSync(link);
   process.stdout.write(JSON.stringify({removed:matches}));
 }else if(mode==='restore'){
@@ -37,7 +39,10 @@ if(mode==='remove'){
 
 
 def _run(args):
-    result = subprocess.run(['docker', *args], capture_output=True, text=True, timeout=30)
+    try:
+        result = subprocess.run(['docker', *args], capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired as exc:
+        raise PluginFileError('docker_timeout', '容器响应超时，请检查实例状态后重试') from exc
     if result.returncode:
         raise PluginFileError('docker_error', '无法读取或操作目标容器')
     if len(result.stdout) > 8 * 1024 * 1024:
@@ -131,11 +136,24 @@ def _epoch(value):
         return None
 
 
-def collect_inventory(info, containers):
+def _mount_index(containers):
+    result = {}
+    for container in containers:
+        try:
+            result[container.get('Id')] = storage_mount(container)
+        except (PluginFileError, OSError, ValueError) as exc:
+            result[container.get('Id')] = exc
+    return result
+
+
+def collect_inventory(info, containers, mounts=None):
     identity = {'containerId': info.get('Id'), 'containerName': str(info.get('Name', '')).lstrip('/'),
                 'containerStartedAt': _started_at(info)}
     try:
-        mount = storage_mount(info)
+        mounts = _mount_index(containers) if mounts is None else mounts
+        mount = mounts.get(info.get('Id'))
+        if isinstance(mount, Exception):
+            raise mount
         if mount is None:
             return None
         inventory = scan_plugins(mount['root'])
@@ -144,7 +162,9 @@ def collect_inventory(info, containers):
             if other.get('Id') == info.get('Id'):
                 continue
             try:
-                other_mount = storage_mount(other)
+                other_mount = mounts.get(other.get('Id'))
+                if isinstance(other_mount, Exception):
+                    continue
                 shared_modules = other_mount and mount['modulesMount'] and other_mount['modulesMount'] and (
                     _inside(mount['modulesMount'], other_mount['modulesMount']) or _inside(other_mount['modulesMount'], mount['modulesMount']))
                 if other_mount and (shared_modules or _inside(mount['root'], other_mount['root']) or _inside(other_mount['root'], mount['root'])):
@@ -190,12 +210,17 @@ def enrich_statuses(services):
                  'containerName': s.get('containerName'), 'scannedAt': utc_stamp(), 'error': '无法读取 Docker 插件挂载信息', 'entries': []}}
                 if CONTAINER_RE.fullmatch(str(s.get('containerId', ''))) else s for s in services]
     enriched = []
+    mounts = _mount_index(containers)
+    by_id = {c.get('Id'): c for c in containers}
+    inventories = {}
     for service in services:
         row = dict(service)
         cid = str(row.get('containerId') or '')
-        info = next((c for c in containers if cid and str(c.get('Id', '')).startswith(cid)), None)
+        info = by_id.get(cid) or next((c for c in containers if cid and str(c.get('Id', '')).startswith(cid)), None)
         if info:
-            inventory = collect_inventory(info, containers)
+            if info['Id'] not in inventories:
+                inventories[info['Id']] = collect_inventory(info, containers, mounts)
+            inventory = inventories[info['Id']]
             if inventory is not None:
                 row['plugins'] = inventory
         enriched.append(row)
@@ -241,7 +266,8 @@ def execute_plugin_operation(project_dir, action, payload, request_id):
     if action == 'plugin_remove':
         result = remove_plugin(mount['root'], payload.get('pluginName'), payload.get('fingerprint'), request_id,
                                on_remove=lambda: _link(info, mount, 'remove', payload.get('pluginName')),
-                               on_rollback=lambda name: _link(info, mount, 'restore', name))
+                               on_rollback=lambda name: _link(info, mount, 'restore', name),
+                               on_inspect=lambda: _link(info, mount, 'check-link', payload.get('pluginName')))
         message = f"本地文件已删除：{result['name']}（7 天内可恢复）"
     elif action == 'plugin_restore':
         result = restore_plugin(mount['root'], payload.get('trashId'),

@@ -103,10 +103,37 @@ def test_scan_delete_restore_uses_real_project_and_container(setup, monkeypatch)
     removed, report = plugins.execute_plugin_operation(str(setup.project), 'plugin_remove', payload, str(uuid.uuid4()))
     assert not report[0]['plugins']['entries']
     assert calls[0][0:2] == ['exec', setup.info['Id']]
-    assert 'remove' in calls[0]
+    assert 'check-link' in calls[0]
+    assert 'remove' in calls[1]
     restored, report = plugins.execute_plugin_operation(str(setup.project), 'plugin_restore', {'containerId': setup.info['Id'], 'trashId': removed['trashId']}, str(uuid.uuid4()))
     assert report[0]['plugins']['entries'][0]['name'] == entry['name']
     assert 'restore' in calls[-1]
+
+
+def test_batch_reuses_docker_inspect_mounts_and_inventory(setup, monkeypatch):
+    from unittest.mock import Mock
+    import copy
+    other = copy.deepcopy(setup.info)
+    other['Id'] = 'b'*64
+    other['Name'] = '/second'
+    docker = Mock(return_value=[setup.info, other])
+    mount = Mock(wraps=plugins.storage_mount)
+    scan = Mock(wraps=plugins.collect_inventory)
+    monkeypatch.setattr(plugins, 'all_containers', docker)
+    monkeypatch.setattr(plugins, 'storage_mount', mount)
+    monkeypatch.setattr(plugins, 'collect_inventory', scan)
+    result = plugins.enrich_statuses(setup.services + setup.services)
+    assert len(result) == 2
+    assert docker.call_count == 1 and mount.call_count == 2 and scan.call_count == 1
+
+
+def test_docker_timeout_does_not_expose_embedded_script(monkeypatch):
+    def timeout(*args, **kwargs):
+        raise plugins.subprocess.TimeoutExpired(['docker','exec','node','SECRET SCRIPT'],30)
+    monkeypatch.setattr(plugins.subprocess,'run',timeout)
+    with pytest.raises(files.PluginFileError, match='容器响应超时') as error:
+        plugins._run(['ps'])
+    assert 'SECRET' not in str(error.value)
 
 
 @pytest.mark.parametrize('container_id', ['x', 'b'*64, '', None])

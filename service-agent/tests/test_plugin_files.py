@@ -279,11 +279,118 @@ def test_restore_receipt_failure_restores_recovery_and_removes_link(root, monkey
     put(root)
     removed = remove(root, on_remove=lambda: True)
     links = []
-    def fail(*args):
-        raise OSError('disk full')
+    write = files.atomic_json
+    def fail(path, meta):
+        if meta.get('state') == 'restored':
+            raise OSError('disk full')
+        write(path, meta)
     monkeypatch.setattr(files, 'atomic_json', fail)
     with pytest.raises(OSError):
         files.restore_plugin(root, removed['trashId'], on_restore=lambda name: None, on_rollback=links.append)
     assert not (root / '@business/plugin-test').exists()
     assert links == ['@business/plugin-test']
     assert len(files.list_trash(root)) == 1
+
+
+class ProcessCrash(BaseException):
+    pass
+
+
+def test_link_created_between_inspection_and_delete_is_recoverable(root):
+    put(root)
+    removed = remove(root, on_inspect=lambda: False, on_remove=lambda: True)
+    links = []
+    files.restore_plugin(root, removed['trashId'], on_restore=links.append)
+    assert links == ['@business/plugin-test']
+
+
+def test_interrupted_link_removal_can_retry_and_restore_link(root):
+    put(root)
+    entry = files.plugin_entry(root, '@business/plugin-test')
+    request = str(uuid.uuid4())
+    def crash():
+        raise ProcessCrash()
+    with pytest.raises(ProcessCrash):
+        files.remove_plugin(root, entry['name'], entry['fingerprint'], request,
+                            on_inspect=lambda: True, on_remove=crash)
+    assert not (root / entry['name']).exists()
+    retried = files.remove_plugin(root, entry['name'], entry['fingerprint'], request, on_remove=lambda: False)
+    assert retried['state'] == 'deleted'
+    links = []
+    files.restore_plugin(root, retried['trashId'], on_restore=links.append)
+    assert links == [entry['name']]
+    assert files.plugin_entry(root, entry['name'])['fingerprint'] == entry['fingerprint']
+
+
+def test_legacy_prepared_receipt_does_not_forget_link_on_retry(root):
+    put(root)
+    entry = files.plugin_entry(root, '@business/plugin-test')
+    request = uuid.uuid4()
+    directory = root / files.TRASH_DIR / request.hex
+    directory.mkdir(parents=True)
+    files.atomic_json(directory/'meta.json', {**entry, 'state':'prepared', 'trashId':request.hex, 'expiresAtEpoch':time.time()+100})
+    os.rename(root / entry['name'], directory/'plugin')
+    result = files.remove_plugin(root, entry['name'], entry['fingerprint'], str(request), on_remove=lambda: False)
+    assert result['linkRequired'] is True
+    links = []
+    files.restore_plugin(root, request.hex, on_restore=links.append)
+    assert links == [entry['name']]
+
+
+@pytest.mark.parametrize('crash_after_link', [False, True])
+def test_restore_crash_resumes_without_overwriting_new_files(root, monkeypatch, crash_after_link):
+    put(root)
+    removed = remove(root, on_remove=lambda: True)
+    write = files.atomic_json
+    def crash_write(path, meta):
+        if meta.get('state') == 'restored':
+            raise ProcessCrash()
+        write(path, meta)
+    def crash_link(name):
+        raise ProcessCrash()
+    with monkeypatch.context() as patch:
+        if crash_after_link: patch.setattr(files, 'atomic_json', crash_write)
+        with pytest.raises(ProcessCrash):
+            files.restore_plugin(root, removed['trashId'], on_restore=(lambda name: None) if crash_after_link else crash_link)
+    record = files.list_trash(root)[0]
+    assert record['restorePending'] is True
+    assert record['fingerprint'] == files.plugin_entry(root, removed['name'])['fingerprint']
+    links = []
+    result = files.restore_plugin(root, removed['trashId'], on_restore=links.append)
+    assert result['state'] == 'restored' and links == [removed['name']]
+    assert files.list_trash(root) == []
+
+
+def test_interrupted_restore_rejects_replaced_target(root):
+    put(root)
+    removed = remove(root, on_remove=lambda: True)
+    with pytest.raises(ProcessCrash):
+        files.restore_plugin(root, removed['trashId'], on_restore=lambda name: (_ for _ in ()).throw(ProcessCrash()))
+    (root / removed['name'] / 'package.json').write_text('{"name":"@business/plugin-test","version":"2"}')
+    with pytest.raises(files.PluginFileError, match='不会覆盖'):
+        files.restore_plugin(root, removed['trashId'])
+
+
+def test_delete_crash_before_move_can_be_cancelled_by_restore(root, monkeypatch):
+    put(root)
+    entry = files.plugin_entry(root, '@business/plugin-test')
+    request = uuid.uuid4()
+    with monkeypatch.context() as patch:
+        patch.setattr(files, '_move_plugin', lambda *args: (_ for _ in ()).throw(ProcessCrash()))
+        with pytest.raises(ProcessCrash):
+            files.remove_plugin(root, entry['name'], entry['fingerprint'], str(request), on_remove=lambda: True)
+    assert files.list_trash(root)[0]['restorePending'] is True
+    assert files.restore_plugin(root, request.hex, on_restore=lambda name: None)['state'] == 'restored'
+    assert files.remove_plugin(root, entry['name'], entry['fingerprint'], str(request))['state'] == 'restored'
+
+
+def test_prepared_delete_does_not_unlink_new_replacement(root):
+    put(root)
+    entry = files.plugin_entry(root, '@business/plugin-test')
+    request = uuid.uuid4()
+    def crash(): raise ProcessCrash()
+    with pytest.raises(ProcessCrash):
+        files.remove_plugin(root, entry['name'], entry['fingerprint'], str(request), on_remove=crash)
+    put(root, version='2')
+    with pytest.raises(files.PluginFileError, match='新文件'):
+        files.remove_plugin(root, entry['name'], entry['fingerprint'], str(request), on_remove=lambda: pytest.fail('must not unlink'))

@@ -45,6 +45,21 @@ def reporter(monkeypatch):
     return module
 
 
+def test_one_collection_batches_all_deployments(monkeypatch, reporter):
+    from unittest.mock import Mock
+    reporter.set_watch_targets([{'deploymentId':1,'dir':'/data/a'}, {'deploymentId':2,'dir':'/data/b'}])
+    monkeypatch.setattr(reporter,'collect_service_statuses',lambda directory:[{'name':directory}])
+    enrich = Mock(side_effect=lambda services:[{**s,'plugins':{'status':'ok'}} for s in services])
+    send = Mock()
+    monkeypatch.setattr(reporter,'enrich_statuses',enrich)
+    monkeypatch.setattr(reporter,'send_message',send)
+    reporter._collect_and_send(object())
+    assert enrich.call_count == 1
+    assert len(enrich.call_args.args[0]) == 2
+    reports = send.call_args.args[1]['reports']
+    assert [r['services'][0]['name'] for r in reports] == ['/data/a','/data/b']
+
+
 def test_notifications_merge_without_losing_new_connection(monkeypatch, reporter):
     pending_threads=[]
     class Thread:
