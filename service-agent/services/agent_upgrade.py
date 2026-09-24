@@ -118,11 +118,12 @@ def mapped_path(path, mounts, to_host=False, require_write=True):
     raise ValueError('Agent 的部署目录和升级状态目录需要可写的宿主机挂载')
 
 
-def deployment_info():
-    info = inspect_container(os.getenv('AGENT_CONTAINER_NAME') or os.getenv('HOSTNAME', ''))
-    environment = dict(item.split('=', 1) for item in info['Config'].get('Env', []) if '=' in item)
-    if environment.get('AGENT_ID', '') != os.getenv('AGENT_ID', '') or not os.getenv('AGENT_ID'):
-        raise ValueError('无法确认当前 Agent 容器身份')
+def own_container():
+    return inspect_container(os.getenv('AGENT_CONTAINER_NAME') or os.getenv('HOSTNAME', ''))
+
+
+def compose_selection(info):
+    """返回 (Compose 标签信息, 最后一个定义本服务 image 的 (宿主机路径, 容器内路径))。"""
     labels = info['Config'].get('Labels') or {}
     files = labels.get('com.docker.compose.project.config_files', '').split(',')
     project_dir = labels.get('com.docker.compose.project.working_dir', '')
@@ -143,6 +144,22 @@ def deployment_info():
             selected = (host_path, candidate)
     if selected is None:
         raise ValueError('Compose 中未找到 Agent 镜像配置')
+    return {'files': files, 'projectDir': project_dir, 'service': service, 'project': project}, selected
+
+
+def compose_image(path, service):
+    document = yaml.safe_load(Path(path).read_text(encoding='utf-8')) or {}
+    image = ((document.get('services') or {}).get(service) or {}).get('image')
+    return image if isinstance(image, str) else None
+
+
+def deployment_info():
+    info = own_container()
+    environment = dict(item.split('=', 1) for item in info['Config'].get('Env', []) if '=' in item)
+    if environment.get('AGENT_ID', '') != os.getenv('AGENT_ID', '') or not os.getenv('AGENT_ID'):
+        raise ValueError('无法确认当前 Agent 容器身份')
+    meta, selected = compose_selection(info)
+    files, project_dir, service, project = meta['files'], meta['projectDir'], meta['service'], meta['project']
     # 升级只改 image 这一行；无法定位时在能力探测阶段就拒绝，不能等切换后才失败
     replace_image_text(selected[1].read_text(encoding='utf-8'), service, 'orchidea-agent-probe:latest')
     host_file, compose_path = selected
@@ -174,17 +191,25 @@ def runtime_info():
             base.update(image=dep['image'], imageId=dep['imageId'], selfUpgrade=True)
         except Exception as exc:
             base.update(selfUpgrade=False, reason=str(exc)[:250])
+            # 不支持自升级也照常上报镜像身份：Hub 收敛丢失的升级记录要靠它
+            try:
+                info = own_container()
+                base.update(image=info['Config']['Image'], imageId=info['Image'])
+            except Exception:
+                pass
         _runtime = base
         _runtime_checked_at = now
     return dict(_runtime)
 
 
 def report(ws):
+    # 读账本与发送在同一把锁内：心跳读到的旧任务快照不能晚于新任务的上报到达 Hub
     try:
-        state = job_state()
-        fields = ('requestId', 'targetImage', 'targetImageId', 'previousImageId', 'status', 'seq', 'error')
-        ws.send(json.dumps({'type': 'agent_report', 'runtime': runtime_info(),
-                            'upgrade': {key: state[key] for key in fields if key in state}}))
+        with _guard:
+            state = job_state()
+            fields = ('requestId', 'targetImage', 'targetImageId', 'previousImageId', 'status', 'seq', 'error')
+            ws.send(json.dumps({'type': 'agent_report', 'runtime': runtime_info(),
+                                'upgrade': {key: state[key] for key in fields if key in state}}))
     except Exception:
         # 重连/下一次心跳会补报；不在日志中输出敏感环境或原始 WS 地址。
         pass
@@ -248,9 +273,11 @@ def recover_launch():
 
 
 def reconcile_stale_job():
-    """执行器已退出但任务停在非终态（unknown、中途被删、回退健康检查失败）时，按当前运行镜像收敛。
+    """执行器已退出但任务停在非终态（unknown、中途被删、回退健康检查失败）时收敛到终态。
 
     否则 command_slot 会永久拒绝服务命令，Hub 也会一直占用升级位。仍在运行或刚更新过的任务不动。
+    运行镜像读不到时保留任务；只有运行镜像、Compose 配置（及成功时的 Hub 确认）三者一致才判
+    success / rolled_back，否则记 failed 并提示人工核对，不能把「配置已回退但仍跑新版」记成功。
     返回 True 表示本次改写了任务状态。
     """
     with _guard:
@@ -266,13 +293,35 @@ def reconcile_stale_job():
                 state = inspect_container(helper)['State']
                 if state.get('Running') or state.get('Restarting') or state.get('Status') == 'restarting':
                     return False
-            image_id = runtime_info().get('imageId')
-            if image_id and image_id == job.get('targetImageId'):
-                save_job(state_root(), job, 'success', '')
-            elif image_id and image_id == job.get('previousImageId'):
-                save_job(state_root(), job, 'rolled_back', '升级未完成，当前运行的是升级前的 Agent')
+            info = own_container()
+            image_id = info.get('Image')
+            if not image_id:
+                return False
+            root = state_root()
+            try:
+                meta, (_, local_file) = compose_selection(info)
+                configured = compose_image(local_file, meta['service'])
+                before = root / 'compose.before.yml'
+                original = compose_image(before, meta['service']) if before.is_file() else None
+            except Exception:
+                configured, original = None, None
+            points_old = bool(configured) and (configured in (original, job.get('previousImage'))
+                                               or configured.startswith('orchidea-agent-rollback:'))
+            confirmation = read_json(root / 'confirmed.json')
+            confirmed = (confirmation.get('requestId') == job.get('requestId')
+                         and confirmation.get('imageId') == job.get('targetImageId'))
+            if image_id == job.get('targetImageId') and confirmed and configured and not points_old:
+                save_job(root, job, 'success', '')
+            elif image_id == job.get('previousImageId') and points_old:
+                save_job(root, job, 'rolled_back', '升级未完成，当前运行的是升级前的 Agent')
+            elif image_id == job.get('targetImageId'):
+                save_job(root, job, 'failed', '升级未获 Hub 确认或 Compose 已改回旧版，但仍在运行新版 Agent；'
+                                              '请在服务器核对 Compose 与运行镜像后处理')
+            elif image_id == job.get('previousImageId'):
+                save_job(root, job, 'failed', '仍在运行升级前的 Agent，但 Compose 已指向新版或无法读取；'
+                                              '请在服务器核对 Compose 后处理')
             else:
-                save_job(state_root(), job, 'failed', '升级执行器已退出，当前 Agent 镜像与升级前后均不一致，请检查服务器')
+                save_job(root, job, 'failed', '升级执行器已退出，当前 Agent 镜像与升级前后均不一致，请检查服务器')
             return True
         except Exception:
             # Docker 不可用时不能判断执行器是否仍在运行，保留任务等待下一次心跳
@@ -327,8 +376,9 @@ def start_upgrade(ws, data, resume=False):
         dep = deployment_info()
         validate_image(data.get('image'), dep['image'])
         job.update(previousImageId=dep['imageId'], previousImage=dep['image'])
-        save_job(root, job, 'waiting')
-        report(ws)
+        with _guard:
+            save_job(root, job, 'waiting')
+            report(ws)
         deadline = time.monotonic() + 600
         while True:
             with _guard:
@@ -429,7 +479,9 @@ def replace_image_text(text, service, image):
         if child_indent is None:
             child_indent = indent
         if indent == child_indent and re.match(r'image\s*:', stripped):
-            lines[index] = ' ' * indent + 'image: ' + json.dumps(image) + line[len(body):]
+            comment = re.search(r'\s+#.*$', re.sub(r'"[^"]*"|\'[^\']*\'', lambda m: '_' * len(m.group(0)), body))
+            tail = body[comment.start():] if comment else ''
+            lines[index] = ' ' * indent + 'image: ' + json.dumps(image) + tail + line[len(body):]
             result = ''.join(lines)
             document = yaml.safe_load(result) or {}
             if ((document.get('services') or {}).get(service) or {}).get('image') == image:

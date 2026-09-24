@@ -490,7 +490,8 @@ def test_replace_image_text_only_touches_agent_image_line():
     result = u.replace_image_text(COMMENTED_COMPOSE, 'agent', 'registry/agent@sha256:abcd')
     before, after = COMMENTED_COMPOSE.splitlines(), result.splitlines()
     changed = [(a, b) for a, b in zip(before, after) if a != b]
-    assert changed == [('    image: ${SERVICE_AGENT_IMAGE:?required}  # 行尾注释', '    image: "registry/agent@sha256:abcd"')]
+    assert changed == [('    image: ${SERVICE_AGENT_IMAGE:?required}  # 行尾注释',
+                        '    image: "registry/agent@sha256:abcd"  # 行尾注释')]
     # 未加引号的值保持原文：整份重新序列化会把 22:22、on、0022 按 YAML 1.1 改写
     assert '      - 22:22' in after and '      FLAG: on' in after and '      UMASK: 0022' in after
     assert yaml.safe_load(result)['services']['business']['image'] == 'business:1'
@@ -538,46 +539,94 @@ def test_failed_runtime_probe_is_retried(monkeypatch):
 
 def _stale_job(status, **extra):
     job = {'requestId': RID, 'targetImage': 'registry/agent:v2', 'targetImageId': 'sha256:new',
-           'previousImageId': 'sha256:old', **extra}
+           'previousImageId': 'sha256:old', 'previousImage': 'registry/agent:v1', **extra}
     u.save_job(u.state_root(), job, status)
     stored = u.job_state()
     stored['updatedAt'] -= u.STALE_JOB_SECONDS + 1
     u.atomic_json(u.state_root() / 'job.json', stored)
 
 
-@pytest.mark.parametrize('image_id,expected', [
-    ('sha256:new', 'success'), ('sha256:old', 'rolled_back'), ('sha256:other', 'failed'),
-])
+@pytest.fixture
+def stale(deployment, monkeypatch):
+    """执行器已退出；可设置运行镜像、Compose 中的 image、Hub 是否确认过。"""
+    info, source = deployment
+    monkeypatch.setattr(u, 'docker', lambda *a, **k: '')
+
+    def set_state(running, configured, confirmed=False, status='unknown'):
+        _stale_job(status)
+        info['Image'] = running
+        source.write_text('services:\n  agent:\n    image: %s\n' % configured, encoding='utf-8')
+        if confirmed:
+            u.atomic_json(u.state_root() / 'confirmed.json', {'requestId': RID, 'imageId': 'sha256:new'})
+    return set_state
+
+
 @pytest.mark.parametrize('status', ['unknown', 'verifying', 'switching', 'rolling_back', 'pulling'])
-def test_reconcile_stale_job_converges_by_running_image(monkeypatch, status, image_id, expected):
-    _stale_job(status)
-    monkeypatch.setattr(u, 'runtime_info', lambda: {'imageId': image_id})
-    monkeypatch.setattr(u, 'docker', lambda *a, **k: '')  # 执行器已不存在
+@pytest.mark.parametrize('running,configured,confirmed,expected,hint', [
+    ('sha256:new', 'registry/agent@sha256:abcd', True, 'success', ''),
+    # 回退已把 Compose 改回旧版但 up 失败，仍跑着新版：不能记成功，也不能清掉提示
+    ('sha256:new', 'registry/agent:v1', True, 'failed', 'Compose'),
+    ('sha256:new', 'orchidea-agent-rollback:x', True, 'failed', 'Compose'),
+    # 从未获得 Hub 确认的新版不算成功
+    ('sha256:new', 'registry/agent@sha256:abcd', False, 'failed', 'Hub 确认'),
+    ('sha256:old', 'registry/agent:v1', False, 'rolled_back', ''),
+    ('sha256:old', 'orchidea-agent-rollback:x', False, 'rolled_back', ''),
+    # 配置已切到新版、容器还是旧版（执行器在 compose up 前退出）
+    ('sha256:old', 'registry/agent@sha256:abcd', False, 'failed', 'Compose'),
+    ('sha256:other', 'registry/agent:v1', False, 'failed', '不一致'),
+])
+def test_reconcile_requires_image_compose_and_confirmation_to_agree(stale, status, running, configured, confirmed,
+                                                                    expected, hint):
+    stale(running, configured, confirmed, status)
     assert u.reconcile_stale_job() is True
     job = u.job_state()
     assert job['status'] == expected
-    # seq 递增，Hub 按上报序号接受收敛结果
-    assert job['seq'] == 2
+    assert hint in job['error']
+    assert job['seq'] == 2  # Hub 按上报序号接受收敛结果
     with u.command_slot():
         pass
 
 
+def test_reconcile_uses_backup_to_recognise_original_config(stale):
+    stale('sha256:old', 'registry/agent:custom-old')
+    u.atomic_text(u.state_root() / 'compose.before.yml', 'services:\n  agent:\n    image: registry/agent:custom-old\n')
+    assert u.reconcile_stale_job() is True
+    assert u.job_state()['status'] == 'rolled_back'
+
+
+def test_reconcile_keeps_job_when_running_image_is_unknown(stale, monkeypatch):
+    stale('sha256:new', 'registry/agent@sha256:abcd', True)
+    monkeypatch.setattr(u, 'own_container', Mock(side_effect=RuntimeError('docker inspect timeout')))
+    assert u.reconcile_stale_job() is False
+    monkeypatch.setattr(u, 'own_container', lambda: {'Image': ''})
+    assert u.reconcile_stale_job() is False
+    assert u.job_state()['status'] == 'unknown'  # 身份未知不是失败证据
+
+
+def test_reconcile_marks_failed_when_compose_unreadable(stale, deployment):
+    stale('sha256:old', 'registry/agent:v1')
+    deployment[1].unlink()
+    assert u.reconcile_stale_job() is True
+    assert u.job_state()['status'] == 'failed'
+
+
 @pytest.mark.parametrize('state', [{'Running': True}, {'Running': False, 'Restarting': True},
                                    {'Running': False, 'Status': 'restarting'}])
-def test_reconcile_keeps_job_while_executor_alive(monkeypatch, state):
-    _stale_job('verifying')
-    monkeypatch.setattr(u, 'runtime_info', lambda: {'imageId': 'sha256:new'})
+def test_reconcile_keeps_job_while_executor_alive(stale, deployment, monkeypatch, state):
+    stale('sha256:new', 'registry/agent@sha256:abcd', True, 'verifying')
+    info = deployment[0]
     monkeypatch.setattr(u, 'docker', lambda *a, **k: 'helper-id')
-    monkeypatch.setattr(u, 'inspect_container', lambda name: {'State': state})
+    monkeypatch.setattr(u, 'inspect_container', lambda name: {'State': state} if name.startswith('agent-upgrader-') else info)
     assert u.reconcile_stale_job() is False
     assert u.job_state()['status'] == 'verifying'
 
 
-def test_reconcile_exited_executor_and_skips_fresh_or_terminal(monkeypatch):
-    _stale_job('unknown')
-    monkeypatch.setattr(u, 'runtime_info', lambda: {'imageId': 'sha256:old'})
+def test_reconcile_exited_executor_and_skips_fresh_or_terminal(stale, deployment, monkeypatch):
+    stale('sha256:old', 'registry/agent:v1')
+    info = deployment[0]
     monkeypatch.setattr(u, 'docker', lambda *a, **k: 'helper-id')
-    monkeypatch.setattr(u, 'inspect_container', lambda name: {'State': {'Running': False, 'Status': 'exited'}})
+    monkeypatch.setattr(u, 'inspect_container',
+                        lambda name: {'State': {'Running': False, 'Status': 'exited'}} if name.startswith('agent-upgrader-') else info)
     assert u.reconcile_stale_job() is True
     assert u.job_state()['status'] == 'rolled_back'
     assert u.reconcile_stale_job() is False  # 终态不再改写
@@ -594,14 +643,30 @@ def test_reconcile_waits_when_docker_unavailable(monkeypatch):
     assert u.job_state()['status'] == 'unknown'
 
 
-def test_reconnect_reconciles_before_reporting(monkeypatch):
-    _stale_job('unknown')
-    monkeypatch.setattr(u, 'runtime_info', lambda: {'imageId': 'sha256:new', 'protocol': 1})
-    monkeypatch.setattr(u, 'docker', lambda *a, **k: '')
+def test_reconnect_reconciles_before_reporting(stale):
+    stale('sha256:new', 'registry/agent@sha256:abcd', True)
     ws = Mock()
     u.on_connected(ws)
     frame = json.loads(ws.send.call_args_list[0].args[0])
     assert frame['upgrade']['status'] == 'success'
+
+
+def test_runtime_reports_image_identity_even_without_self_upgrade(deployment):
+    info, source = deployment
+    # 合并键写法：YAML 能解析出 image，但逐行替换无法定位 → 不支持远程升级
+    source.write_text('x-base: &base\n  image: registry/agent:v1\nservices:\n  agent:\n    <<: *base\n', encoding='utf-8')
+    runtime = u.runtime_info()
+    assert runtime['selfUpgrade'] is False and 'image' in runtime['reason']
+    # 镜像身份照常上报，Hub 收敛丢失的升级记录要靠它
+    assert runtime['imageId'] == 'sha256:old' and runtime['image'] == 'registry/agent:v1'
+
+
+def test_replace_image_text_keeps_trailing_comment():
+    text = 'services:\n  agent:\n    image: registry/agent:v1  # 固定版本，勿改\n    env_file: "a # b"\n'
+    result = u.replace_image_text(text, 'agent', 'registry/agent:v2')
+    assert result == 'services:\n  agent:\n    image: "registry/agent:v2"  # 固定版本，勿改\n    env_file: "a # b"\n'
+    quoted = u.replace_image_text('services:\n  agent:\n    image: "reg/a#1"\n', 'agent', 'reg/agent:2')
+    assert quoted == 'services:\n  agent:\n    image: "reg/agent:2"\n'  # 引号里的 # 不是注释
 
 
 def test_launch_intent_write_failure_marks_job_failed(deployment, monkeypatch):

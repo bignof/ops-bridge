@@ -12,7 +12,7 @@ import time
 from config import PLUGIN_FOLLOW_UP_INTERVAL, PLUGIN_FOLLOW_UP_TIMEOUT, STATUS_REPORT_INTERVAL
 from core.handlers import send_message
 from services.compose import collect_service_statuses
-from services.plugins import enrich_statuses
+from services.plugins import _epoch, enrich_statuses
 
 logger = logging.getLogger(__name__)
 
@@ -141,12 +141,30 @@ def request_report(service=None):
 _follow_ups: dict[str, dict] = {}  # 目录 → {'deadline': monotonic 截止时间, 'gen': 命令代次}
 
 
-def _sync_settled(reports):
-    """本次启动的插件同步都已结束（含失败）才停止跟踪；没有插件目录的部署无需跟踪。"""
+# 容器启动这么久仍没有本次启动的同步回执（或插件目录一直读不出），说明它不走插件同步，不再跟踪。
+# 不兼容不写回执的旧应用镜像（用户 2026-09-24 确认）。
+NO_RECEIPT_GRACE = 90
+
+
+def _inventory_settled(item, now):
+    if item.get('status') == 'ok' and item.get('syncCurrent') and (item.get('sync') or {}).get('finishedAt'):
+        return True
+    started = _epoch(item.get('containerStartedAt'))
+    return not item.get('syncCurrent') and started is not None and now - started >= NO_RECEIPT_GRACE
+
+
+def _sync_settled(reports, expected, now=None):
+    """每个目标部署都采到了服务列表，且其中的插件清单都已结束本次同步，才停止跟踪。
+
+    采集失败（compose ps 超时/非 0 返回空）、目标尚未出现在 watch_targets 都不能当成已结束；
+    采到了服务但没有插件目录的部署无需跟踪。
+    """
+    if not expected or len(reports) < expected:
+        return False
+    now = time.time() if now is None else now
     inventories = [service.get('plugins') for report in reports for service in report['services']
                    if isinstance(service.get('plugins'), dict)]
-    return all(item.get('status') == 'ok' and item.get('syncCurrent') and (item.get('sync') or {}).get('finishedAt')
-               for item in inventories)
+    return all(_inventory_settled(item, now) for item in inventories)
 
 
 def follow_up(project_dir):
@@ -178,7 +196,8 @@ def follow_up(project_dir):
                 settled = False
                 if ws and ws.keep_running:
                     try:
-                        settled = _sync_settled(_collect_and_send(ws, dirs={key}))
+                        expected = sum(1 for t in get_watch_targets() if _dir_key(t.get('dir', '')) == key)
+                        settled = _sync_settled(_collect_and_send(ws, dirs={key}), expected)
                     except Exception as exc:
                         logger.warning('插件同步跟踪采集失败: %s', exc)
                 if settled:

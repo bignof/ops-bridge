@@ -32,13 +32,41 @@ def _report(*inventories, plain=False):
 
 
 def test_sync_settled_requires_every_inventory_current_and_finished():
-    assert status_reporter._sync_settled(_report(_inventory(), plain=True))
-    assert status_reporter._sync_settled(_report(plain=True))  # 部署没有插件目录：无需跟踪
-    assert status_reporter._sync_settled([])
-    assert not status_reporter._sync_settled(_report(_inventory(), _inventory(current=False)))
-    assert not status_reporter._sync_settled(_report(_inventory(finished=None)))  # 同步进行中
-    assert not status_reporter._sync_settled(_report(_inventory(status='error')))
-    assert not status_reporter._sync_settled(_report({'status': 'ok', 'syncCurrent': False, 'sync': None}))
+    settled = status_reporter._sync_settled
+    assert settled(_report(_inventory(), plain=True), 1)
+    assert settled(_report(plain=True), 1)  # 部署没有插件目录：无需跟踪
+    assert not settled(_report(_inventory(), _inventory(current=False)), 1)
+    assert not settled(_report(_inventory(finished=None)), 1)  # 同步进行中
+    assert not settled(_report(_inventory(status='error')), 1)
+    assert not settled(_report({'status': 'ok', 'syncCurrent': False, 'sync': None}), 1)
+
+
+def test_empty_or_unmatched_collection_is_not_settled():
+    settled = status_reporter._sync_settled
+    # compose ps 超时/非 0 时采集结果为空，不能当成同步已结束
+    assert not settled([], 1)
+    # 目标还没出现在 watch_targets
+    assert not settled([], 0)
+    assert not settled(_report(_inventory()), 0)
+    # 两个同目录部署只采到一个
+    assert not settled(_report(_inventory()), 2)
+
+
+def test_no_receipt_after_grace_stops_tracking():
+    started = '2026-09-24T00:00:00Z'
+    start = status_reporter._epoch(started)
+    no_receipt = {'status': 'ok', 'syncCurrent': False, 'sync': None, 'containerStartedAt': started}
+    unreadable = {'status': 'error', 'containerStartedAt': started}
+    stale_receipt = {'status': 'ok', 'syncCurrent': False, 'sync': {'finishedAt': 'x'}, 'containerStartedAt': started}
+    running = {'status': 'ok', 'syncCurrent': True, 'sync': {'finishedAt': None}, 'containerStartedAt': started}
+    grace = status_reporter.NO_RECEIPT_GRACE
+    for item in (no_receipt, unreadable, stale_receipt):
+        # 刚启动：同步脚本可能还没写回执，继续跟踪
+        assert not status_reporter._sync_settled(_report(item), 1, start + grace - 1)
+        # 启动已久仍没有本次回执：不走插件同步，停止跟踪（不兼容旧镜像）
+        assert status_reporter._sync_settled(_report(item), 1, start + grace)
+    # 本次同步正在进行：不受宽限期影响，继续跟踪到结束或截止
+    assert not status_reporter._sync_settled(_report(running), 1, start + 10 * grace)
 
 
 @pytest.fixture
@@ -49,7 +77,17 @@ def follow(monkeypatch):
     monkeypatch.setattr(status_reporter.time, 'sleep', lambda seconds: sleeps.append(seconds))
     ws = SimpleNamespace(keep_running=True)
     monkeypatch.setattr(status_reporter, '_active_ws', ws)
+    status_reporter.set_watch_targets([{'deploymentId': 1, 'dir': '/data/a'}])
     return ws, sleeps
+
+
+def test_follow_up_keeps_going_when_collection_comes_back_empty(follow, monkeypatch):
+    ws, sleeps = follow
+    results = iter([[], _report(_inventory())])  # 第一轮 compose ps 超时返回空
+    monkeypatch.setattr(status_reporter, '_collect_and_send', lambda *a, **k: next(results))
+    status_reporter.follow_up('/data/a')
+    assert sleeps == [status_reporter.PLUGIN_FOLLOW_UP_INTERVAL]
+    assert status_reporter._follow_ups == {}
 
 
 def test_follow_up_collects_target_dir_until_sync_settles(follow, monkeypatch, tmp_path):

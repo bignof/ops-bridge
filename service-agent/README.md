@@ -58,7 +58,7 @@ service-agent（容器）
 | `HEARTBEAT_INTERVAL`  | 心跳间隔（秒），默认 `30`     | `30`                                                 |
 | `STATUS_REPORT_INTERVAL` | 定时巡检上报间隔（秒），默认 `120` | `120`                                          |
 | `PLUGIN_FOLLOW_UP_INTERVAL` | restart/update 后跟踪插件同步的采集间隔（秒），默认 `10` | `10`                     |
-| `PLUGIN_FOLLOW_UP_TIMEOUT` | 跟踪插件同步的最长时长（秒），默认 `300`；同步结束即提前停止 | `300`                  |
+| `PLUGIN_FOLLOW_UP_TIMEOUT` | 跟踪插件同步的最长时长（秒），默认 `300`；同步结束，或容器启动 90 秒仍无本次同步回执即提前停止 | `300` |
 | `HEALTH_PORT`         | 容器内健康检查端口            | `18081`                                              |
 | `SERVICE_AGENT_IMAGE` | 运行时拉取的镜像地址          | `registry.example.com/orchidea/service-agent:latest` |
 | `HUB_HTTP_URL`        | 中枢 HTTP 基址（日志归档上传用），留空按 `WS_URL` 推导 | `https://hub.example.com`                            |
@@ -345,7 +345,7 @@ Agent 等待当前服务操作完成后，用当前已安装镜像启动独立�
 
 部署需要挂载 Docker socket、Compose 项目文件和持久化状态目录。支持多个 Compose 文件，修改最后一个定义本服务 image 的文件。`AGENT_ID` 须显式配置；自定义 hostname 时可通过 `AGENT_CONTAINER_NAME` 指定自身容器。状态目录默认 `/data/.service-agent/upgrades/`（`AGENT_UPGRADE_DIR` 可覆盖）。私有仓库凭据目录通过 bind mount 与 `DOCKER_CONFIG` 配置，辅助执行器只读使用，不上传凭据。
 
-修改 Compose 时只替换本服务的 `image:` 这一行，其余内容、注释和引号保持原样（整份重新序列化会丢注释，并按 YAML 1.1 改写 `22:22`、`on` 这类未加引号的值）。配置须为块样式；无法定位 image 行时能力探测直接给出原因，不允许远程升级。能力探测失败后每 60 秒重试。
+修改 Compose 时只替换本服务的 `image:` 这一行（保留该行的行尾注释），其余内容、注释和引号保持原样（整份重新序列化会丢注释，并按 YAML 1.1 改写 `22:22`、`on` 这类未加引号的值）。`image:` 必须以单行键值直接写在该服务自己的映射里，不支持流样式、合并键或锚点继承；无法定位时能力探测直接给出原因，不允许远程升级，但照常上报当前镜像。能力探测失败后每 60 秒重试。
 
 原始 Compose 留存于身份对应目录的 `compose.before.yml`；旧版有 digest 时回退配置保留该 digest，首次接入无 digest 的镜像使用保留的本地回退标签。升级成功后的 Compose image 固定为目标 digest；后续手工维护镜像应修改这个实际生效的配置文件。
 
@@ -353,6 +353,6 @@ Agent 等待当前服务操作完成后，用当前已安装镜像启动独立�
 
 升级期间暂停新的服务操作，日志与插件查询短暂不可用。临时执行器完成后退出，下一次升级清理旧执行器。人工操作 Docker 时须避免与升级任务重叠。
 
-回退只要求旧 Agent 进程响应 `/health`（含未连 Hub 时的 503），不要求连上 Hub，Hub 故障期间也能完成回退。执行器已退出但任务停在非终态超过 2 分钟时，心跳和重连按当前运行的 Image ID 收敛为 success / rolled_back / failed，避免永久拒绝服务操作。
+回退只要求旧 Agent 进程响应 `/health`（含未连 Hub 时的 503），不要求连上 Hub，Hub 故障期间也能完成回退。执行器已退出但任务停在非终态超过 2 分钟时，心跳和重连会收敛到终态，避免永久拒绝服务操作：运行镜像、Compose 配置（成功时还要 Hub 确认）三者一致才记 success / rolled_back，否则记 failed 并提示人工核对；读不到当前运行镜像时保留任务。从旧版 Agent 升到本版本的那一次仍由旧执行器执行，以上保护从下一次升级起生效。
 
 执行器启动使用持久化 `launch.json` 交接记录。`launch.json` 本身写入失败时直接记 failed。发布交接后，启动方不再写入 `job.json` 的失败终态；即使 Docker 已启动容器但 CLI 超时/断链，也保留执行器的真实进度与服务操作限制。心跳和重连按固定容器名、Agent 身份标签和本次 requestId 核对执行器；已存在则复用或启动同一个容器，不确定时继续等待，避免覆盖账本或重复创建升级任务。
