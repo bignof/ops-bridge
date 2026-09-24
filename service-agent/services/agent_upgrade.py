@@ -19,6 +19,10 @@ _guard = threading.RLock()
 _active = 0
 _starting = False
 _runtime = None
+_runtime_checked_at = 0.0
+RUNTIME_RETRY_SECONDS = 60
+# 执行器已退出、任务仍停在非终态超过此时长，按当前运行镜像收敛（执行器正常推进时每一步都会刷新 updatedAt）
+STALE_JOB_SECONDS = 120
 _boot_id = str(uuid.uuid4())
 logger = logging.getLogger(__name__)
 
@@ -139,6 +143,8 @@ def deployment_info():
             selected = (host_path, candidate)
     if selected is None:
         raise ValueError('Compose 中未找到 Agent 镜像配置')
+    # 升级只改 image 这一行；无法定位时在能力探测阶段就拒绝，不能等切换后才失败
+    replace_image_text(selected[1].read_text(encoding='utf-8'), service, 'orchidea-agent-probe:latest')
     host_file, compose_path = selected
     root = state_root()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -158,8 +164,10 @@ def deployment_info():
 
 
 def runtime_info():
-    global _runtime
-    if _runtime is None:
+    """成功结果缓存到进程结束；失败（Docker 繁忙、配置正在编辑等）按间隔重新探测。"""
+    global _runtime, _runtime_checked_at
+    now = time.monotonic()
+    if _runtime is None or (not _runtime.get('selfUpgrade') and now - _runtime_checked_at >= RUNTIME_RETRY_SECONDS):
         base = {'protocol': PROTOCOL, 'bootId': _boot_id, 'version': os.getenv('AGENT_VERSION', 'dev')}
         try:
             dep = deployment_info()
@@ -167,6 +175,7 @@ def runtime_info():
         except Exception as exc:
             base.update(selfUpgrade=False, reason=str(exc)[:250])
         _runtime = base
+        _runtime_checked_at = now
     return dict(_runtime)
 
 
@@ -182,6 +191,7 @@ def report(ws):
 
 
 def on_connected(ws):
+    reconcile_stale_job()
     report(ws)
     if recover_launch():
         return
@@ -235,6 +245,39 @@ def recover_launch():
             # Docker 不可用/结果不确定都不是失败证据；保留账本并在心跳/重连时再核对。
             logger.warning('升级执行器启动结果尚未确认，保留任务并等待重试')
         return True
+
+
+def reconcile_stale_job():
+    """执行器已退出但任务停在非终态（unknown、中途被删、回退健康检查失败）时，按当前运行镜像收敛。
+
+    否则 command_slot 会永久拒绝服务命令，Hub 也会一直占用升级位。仍在运行或刚更新过的任务不动。
+    返回 True 表示本次改写了任务状态。
+    """
+    with _guard:
+        try:
+            job = job_state()
+            status = job.get('status')
+            if not status or status in TERMINAL or status == 'waiting' or _starting:
+                return False
+            if time.time() - float(job.get('updatedAt') or 0) < STALE_JOB_SECONDS:
+                return False
+            helper = 'agent-upgrader-' + state_root().name
+            if docker('ps', '-aq', '--filter', 'name=^/' + helper + '$'):
+                state = inspect_container(helper)['State']
+                if state.get('Running') or state.get('Restarting') or state.get('Status') == 'restarting':
+                    return False
+            image_id = runtime_info().get('imageId')
+            if image_id and image_id == job.get('targetImageId'):
+                save_job(state_root(), job, 'success', '')
+            elif image_id and image_id == job.get('previousImageId'):
+                save_job(state_root(), job, 'rolled_back', '升级未完成，当前运行的是升级前的 Agent')
+            else:
+                save_job(state_root(), job, 'failed', '升级执行器已退出，当前 Agent 镜像与升级前后均不一致，请检查服务器')
+            return True
+        except Exception:
+            # Docker 不可用时不能判断执行器是否仍在运行，保留任务等待下一次心跳
+            logger.warning('升级任务状态暂时无法核对，等待下一次心跳')
+            return False
 
 
 @contextlib.contextmanager
@@ -331,7 +374,8 @@ def start_upgrade(ws, data, resume=False):
         recover_launch()
         report(ws)
     except Exception as exc:
-        if not handed_off:
+        # 交接记录未落盘（launch.json 写入失败）时执行器不会启动，必须由启动方写失败，否则任务永远 waiting
+        if not handed_off or read_json(root / 'launch.json').get('requestId') != request_id:
             save_job(root, job, 'failed', str(exc)[:500])
         report(ws)
     finally:
@@ -345,11 +389,66 @@ def compose(manifest, *args):
                   *files, *args, timeout=180)
 
 
+SERVICE_KEY = re.compile(r'(["\']?)([^"\':#\s][^"\':#]*)\1\s*:\s*(#.*)?')
+
+
+def replace_image_text(text, service, image):
+    """只替换 services.<service>.image 这一行，保留其余内容、注释和引号。
+
+    整份 YAML 重新序列化会丢注释，并按 YAML 1.1 改写未加引号的值（如端口 22:22、on/off）。
+    仅支持块样式 Compose；定位不到时抛错，由能力探测提前拒绝自升级。
+    """
+    lines = text.splitlines(keepends=True)
+    in_services = False
+    service_indent = None
+    child_indent = None
+    in_service = False
+    for index, line in enumerate(lines):
+        body = line.rstrip('\r\n')
+        stripped = body.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        indent = len(body) - len(body.lstrip(' '))
+        if indent == 0:
+            in_services = re.fullmatch(r'services\s*:\s*(#.*)?', stripped) is not None
+            service_indent = None
+            in_service = False
+            continue
+        if not in_services:
+            continue
+        if service_indent is None or indent <= service_indent:
+            match = SERVICE_KEY.fullmatch(stripped)
+            if not match:
+                continue
+            service_indent = indent
+            in_service = match.group(2).strip() == service
+            child_indent = None
+            continue
+        if not in_service:
+            continue
+        if child_indent is None:
+            child_indent = indent
+        if indent == child_indent and re.match(r'image\s*:', stripped):
+            lines[index] = ' ' * indent + 'image: ' + json.dumps(image) + line[len(body):]
+            result = ''.join(lines)
+            document = yaml.safe_load(result) or {}
+            if ((document.get('services') or {}).get(service) or {}).get('image') == image:
+                return result
+            break
+    raise ValueError('无法在 Compose 文件中定位 Agent 的 image 行，请改为块样式配置后再升级')
+
+
 def write_image(manifest, image):
     path = Path(manifest['composeFile'])
-    document = yaml.safe_load(path.read_text(encoding='utf-8'))
-    document['services'][manifest['service']]['image'] = image
-    atomic_text(path, yaml.safe_dump(document, allow_unicode=True, sort_keys=False))
+    atomic_text(path, replace_image_text(path.read_text(encoding='utf-8'), manifest['service'], image))
+
+
+# HTTP 错误码（含未连 Hub 的 503）也说明进程在响应；连接失败才抛错
+LIVENESS_PROBE = (
+    "import os,urllib.request,urllib.error\n"
+    "try:urllib.request.urlopen('http://127.0.0.1:'+os.getenv('HEALTH_PORT','18081')+'/health',timeout=3)\n"
+    "except urllib.error.HTTPError:pass"
+)
 
 
 def wait_ready(manifest, expected, root, confirm_hub, timeout=180):
@@ -357,12 +456,17 @@ def wait_ready(manifest, expected, root, confirm_hub, timeout=180):
     while time.monotonic() < deadline:
         try:
             info = inspect_container(manifest['containerName'])
-            healthy = info['State'].get('Health', {}).get('Status') == 'healthy'
-            # 无 Docker healthcheck 的既有部署也必须检查 HTTP /health（含已连接 Hub）。
-            if 'Health' not in info['State']:
-                docker('exec', manifest['containerName'], 'python', '-c',
-                       "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'"
-                       "+os.getenv('HEALTH_PORT','18081')+'/health',timeout=3)", timeout=8)
+            if confirm_hub:
+                healthy = info['State'].get('Health', {}).get('Status') == 'healthy'
+                # 无 Docker healthcheck 的既有部署也必须检查 HTTP /health（含已连接 Hub）。
+                if 'Health' not in info['State']:
+                    docker('exec', manifest['containerName'], 'python', '-c',
+                           "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'"
+                           "+os.getenv('HEALTH_PORT','18081')+'/health',timeout=3)", timeout=8)
+                    healthy = True
+            else:
+                # 回退只确认旧 Agent 进程已起来：/health 在未连上 Hub 时返回 503，Hub 故障期间不能据此判回退失败
+                docker('exec', manifest['containerName'], 'python', '-c', LIVENESS_PROBE, timeout=8)
                 healthy = True
             confirmation = read_json(Path(root) / 'confirmed.json')
             confirmed = (confirmation.get('requestId') == manifest['requestId']

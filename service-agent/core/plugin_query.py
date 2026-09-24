@@ -13,7 +13,8 @@ import uuid
 logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
-_pending: dict[str, dict] = {}  # requestId -> {'event': Event, 'result': list | None}
+_pending: dict[str, dict] = {}  # requestId -> {'event': Event, 'result': list | None, 'error': str | None}
+ERRORS = {'not_found', 'unavailable'}  # hub 明确拒绝的原因；旧 hub 不带此字段
 _sender = None
 
 
@@ -31,14 +32,17 @@ def clear_sender() -> None:
 
 
 def request(service: str, timeout: float):
-    """发 plugin_query、阻塞等 plugin_query_result。返回纯数组或 None（无连接/发送失败/超时）。"""
+    """发 plugin_query、阻塞等 plugin_query_result。
+
+    返回纯数组、None（无连接/发送失败/超时）或 QueryError（hub 找不到服务或生成清单失败）。
+    """
     with _lock:
         sender = _sender
         if sender is None:
             return None
         request_id = uuid.uuid4().hex
         event = threading.Event()
-        _pending[request_id] = {'event': event, 'result': None}
+        _pending[request_id] = {'event': event, 'result': None, 'error': None}
     try:
         def _send():
             try:
@@ -55,13 +59,22 @@ def request(service: str, timeout: float):
             return None
         with _lock:
             entry = _pending.get(request_id)
+            if entry and entry['error']:
+                return QueryError(entry['error'])
             return entry['result'] if entry else None
     finally:
         with _lock:
             _pending.pop(request_id, None)
 
 
-def resolve(request_id, plugins) -> None:
+class QueryError:
+    """hub 明确拒绝本次拉取；/queryPlugin 返回非 200，让 sync-plugins 记为失败而不是「没有插件」。"""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+
+
+def resolve(request_id, plugins, error=None) -> None:
     """收到 plugin_query_result：填结果并唤醒。未命中（超时已清/未知）直接 no-op。"""
     if not request_id:
         return
@@ -70,4 +83,5 @@ def resolve(request_id, plugins) -> None:
         if entry is None:
             return
         entry['result'] = plugins if isinstance(plugins, list) else []
+        entry['error'] = error if error in ERRORS else None
         entry['event'].set()

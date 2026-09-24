@@ -19,6 +19,7 @@ from core.status_reporter import set_watch_targets, start_status_reporting, stop
 logger = logging.getLogger(__name__)
 
 _heartbeat_thread = None
+_initial_report_ws = None  # 已完成首轮全量采集的连接：重连后清单不变也要立即补采
 _state = {
     'connected': False,
     'last_connect_ts': None,
@@ -60,6 +61,7 @@ def _on_open(ws):
 
 
 def _on_message(ws, message):
+    global _initial_report_ws
     try:
         _update_state(last_message_ts=time.time())
         data = json.loads(message)
@@ -93,10 +95,13 @@ def _on_message(ws, message):
         elif msg_type == 'ping':
             send_message(ws, {'type': 'pong', 'timestamp': time.time()})
         elif msg_type == 'watch_targets':
-            if set_watch_targets(data.get('targets')):
+            changed = set_watch_targets(data.get('targets'))
+            # 断连期间 worker 通知和命令结束采集都会丢，每条新连接收到首份清单时全量采集一次
+            if changed or _initial_report_ws is not ws:
+                _initial_report_ws = ws
                 request_report()
         elif msg_type == 'plugin_query_result':
-            plugin_query.resolve(data.get('requestId'), data.get('plugins', []))
+            plugin_query.resolve(data.get('requestId'), data.get('plugins', []), data.get('error'))
     except Exception as e:
         logger.error(f"Error processing message: {e}")
 
@@ -130,6 +135,7 @@ def _start_heartbeat(ws):
             if ws and ws.keep_running:
                 _update_state(last_heartbeat_ts=time.time())
                 send_message(ws, {'type': 'heartbeat', 'ts': time.time()})
+                agent_upgrade.reconcile_stale_job()
                 agent_upgrade.recover_launch()
                 agent_upgrade.report(ws)
                 outbox.flush()  # 按退避补投未确认 result(连接存续但此前发送失败/ack 丢失的场景)

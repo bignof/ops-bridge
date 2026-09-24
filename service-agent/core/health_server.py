@@ -120,6 +120,11 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self.send_response(504)
             self.end_headers()
             return
+        if isinstance(items, plugin_query.QueryError):
+            # 服务不存在或未部署到本机 → 404；hub 生成清单失败（如下载基址缺配）→ 502
+            self.send_response(404 if items.reason == 'not_found' else 502)
+            self.end_headers()
+            return
         body = json.dumps(items).encode('utf-8')   # 顶层纯数组（request 已解包）
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')

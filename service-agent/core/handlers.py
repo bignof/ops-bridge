@@ -458,7 +458,11 @@ def _dispatch(ws, data):
             handler(ws, data, request_id, project_dir)
     finally:
         _finish_project_command(project_key)
-        if action in ('restart', 'update', 'plugin_remove', 'plugin_restore'):
+        if action in ('restart', 'update'):
+            # 命令结束时插件同步通常还没开始，跟踪到同步结束再停
+            from core.status_reporter import follow_up
+            follow_up(project_dir)
+        elif action in ('plugin_remove', 'plugin_restore'):
             from core.status_reporter import request_report
             request_report()
         logger.info(

@@ -96,7 +96,7 @@ def test_on_message_routes_plugin_query_result_to_resolve(monkeypatch):
     pq = importlib.import_module('core.plugin_query')
     wsc = importlib.import_module('core.ws_client')
     captured = {}
-    monkeypatch.setattr(pq, 'resolve', lambda rid, plugins: captured.update(rid=rid, plugins=plugins))
+    monkeypatch.setattr(pq, 'resolve', lambda rid, plugins, error=None: captured.update(rid=rid, plugins=plugins))
     import json
     wsc._on_message(None, json.dumps({'type': 'plugin_query_result', 'requestId': 'r9', 'plugins': [{'a': 1}]}))
     assert captured == {'rid': 'r9', 'plugins': [{'a': 1}]}

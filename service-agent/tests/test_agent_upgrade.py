@@ -18,6 +18,7 @@ RID = '11111111-2222-3333-4444-555555555555'
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch):
     monkeypatch.setattr(u, '_runtime', None)
+    monkeypatch.setattr(u, '_runtime_checked_at', 0.0)
     monkeypatch.setattr(u, '_active', 0)
     monkeypatch.setattr(u, '_starting', False)
     monkeypatch.setenv('AGENT_ID', 'test-agent')
@@ -468,3 +469,191 @@ def test_mismatched_manifest_never_starts_executor(deployment, monkeypatch):
     assert u.recover_launch()
     docker.assert_not_called()
     assert u.job_state()['status'] == 'waiting'
+
+
+COMMENTED_COMPOSE = '''# 部署说明
+services:
+  agent:
+    # 镜像由升级任务维护
+    image: ${SERVICE_AGENT_IMAGE:?required}  # 行尾注释
+    ports:
+      - 22:22
+    environment:
+      FLAG: on
+      UMASK: 0022
+  business:
+    image: business:1
+'''
+
+
+def test_replace_image_text_only_touches_agent_image_line():
+    result = u.replace_image_text(COMMENTED_COMPOSE, 'agent', 'registry/agent@sha256:abcd')
+    before, after = COMMENTED_COMPOSE.splitlines(), result.splitlines()
+    changed = [(a, b) for a, b in zip(before, after) if a != b]
+    assert changed == [('    image: ${SERVICE_AGENT_IMAGE:?required}  # 行尾注释', '    image: "registry/agent@sha256:abcd"')]
+    # 未加引号的值保持原文：整份重新序列化会把 22:22、on、0022 按 YAML 1.1 改写
+    assert '      - 22:22' in after and '      FLAG: on' in after and '      UMASK: 0022' in after
+    assert yaml.safe_load(result)['services']['business']['image'] == 'business:1'
+
+
+def test_replace_image_text_keeps_crlf_and_quoted_service_key():
+    text = 'services:\r\n  "agent":\r\n    restart: always\r\n    image: old:1\r\n'
+    result = u.replace_image_text(text, 'agent', 'registry/agent:v2')
+    assert result == 'services:\r\n  "agent":\r\n    restart: always\r\n    image: "registry/agent:v2"\r\n'
+
+
+@pytest.mark.parametrize('text', [
+    'services: {agent: {image: old:1}}\n',          # 流样式无法逐行定位
+    'services:\n  other:\n    image: old:1\n',     # 找不到目标服务
+    'services:\n  agent:\n    build: .\n',          # 服务没有 image 行
+    'volumes:\n  agent:\n    image: old:1\n',       # 不在 services 下
+])
+def test_replace_image_text_rejects_unlocatable_image(text):
+    with pytest.raises(ValueError, match='image'):
+        u.replace_image_text(text, 'agent', 'registry/agent:v2')
+
+
+def test_flow_style_compose_disables_self_upgrade(deployment, monkeypatch):
+    info, source = deployment
+    source.write_text('services: {agent: {image: "registry/agent:v1"}}\n', encoding='utf-8')
+    runtime = u.runtime_info()
+    assert runtime['selfUpgrade'] is False
+    assert 'image' in runtime['reason']
+
+
+def test_failed_runtime_probe_is_retried(monkeypatch):
+    get = Mock(side_effect=[ValueError('docker busy'), {'image': 'registry/agent:v1', 'imageId': 'sha256:old'}])
+    monkeypatch.setattr(u, 'deployment_info', get)
+    now = [1000.0]
+    monkeypatch.setattr(u.time, 'monotonic', lambda: now[0])
+    assert u.runtime_info()['selfUpgrade'] is False
+    now[0] += u.RUNTIME_RETRY_SECONDS - 1
+    assert u.runtime_info()['selfUpgrade'] is False
+    now[0] += 1
+    assert u.runtime_info()['selfUpgrade'] is True
+    now[0] += 3600
+    u.runtime_info()
+    assert get.call_count == 2  # 成功结果一直缓存
+
+
+def _stale_job(status, **extra):
+    job = {'requestId': RID, 'targetImage': 'registry/agent:v2', 'targetImageId': 'sha256:new',
+           'previousImageId': 'sha256:old', **extra}
+    u.save_job(u.state_root(), job, status)
+    stored = u.job_state()
+    stored['updatedAt'] -= u.STALE_JOB_SECONDS + 1
+    u.atomic_json(u.state_root() / 'job.json', stored)
+
+
+@pytest.mark.parametrize('image_id,expected', [
+    ('sha256:new', 'success'), ('sha256:old', 'rolled_back'), ('sha256:other', 'failed'),
+])
+@pytest.mark.parametrize('status', ['unknown', 'verifying', 'switching', 'rolling_back', 'pulling'])
+def test_reconcile_stale_job_converges_by_running_image(monkeypatch, status, image_id, expected):
+    _stale_job(status)
+    monkeypatch.setattr(u, 'runtime_info', lambda: {'imageId': image_id})
+    monkeypatch.setattr(u, 'docker', lambda *a, **k: '')  # 执行器已不存在
+    assert u.reconcile_stale_job() is True
+    job = u.job_state()
+    assert job['status'] == expected
+    # seq 递增，Hub 按上报序号接受收敛结果
+    assert job['seq'] == 2
+    with u.command_slot():
+        pass
+
+
+@pytest.mark.parametrize('state', [{'Running': True}, {'Running': False, 'Restarting': True},
+                                   {'Running': False, 'Status': 'restarting'}])
+def test_reconcile_keeps_job_while_executor_alive(monkeypatch, state):
+    _stale_job('verifying')
+    monkeypatch.setattr(u, 'runtime_info', lambda: {'imageId': 'sha256:new'})
+    monkeypatch.setattr(u, 'docker', lambda *a, **k: 'helper-id')
+    monkeypatch.setattr(u, 'inspect_container', lambda name: {'State': state})
+    assert u.reconcile_stale_job() is False
+    assert u.job_state()['status'] == 'verifying'
+
+
+def test_reconcile_exited_executor_and_skips_fresh_or_terminal(monkeypatch):
+    _stale_job('unknown')
+    monkeypatch.setattr(u, 'runtime_info', lambda: {'imageId': 'sha256:old'})
+    monkeypatch.setattr(u, 'docker', lambda *a, **k: 'helper-id')
+    monkeypatch.setattr(u, 'inspect_container', lambda name: {'State': {'Running': False, 'Status': 'exited'}})
+    assert u.reconcile_stale_job() is True
+    assert u.job_state()['status'] == 'rolled_back'
+    assert u.reconcile_stale_job() is False  # 终态不再改写
+    u.save_job(u.state_root(), {'requestId': RID}, 'verifying')  # 刚更新过：执行器可能仍在推进
+    assert u.reconcile_stale_job() is False
+    u.save_job(u.state_root(), {'requestId': RID}, 'waiting')  # waiting 由 recover_launch 负责
+    assert u.reconcile_stale_job() is False
+
+
+def test_reconcile_waits_when_docker_unavailable(monkeypatch):
+    _stale_job('unknown')
+    monkeypatch.setattr(u, 'docker', Mock(side_effect=RuntimeError('daemon unavailable')))
+    assert u.reconcile_stale_job() is False
+    assert u.job_state()['status'] == 'unknown'
+
+
+def test_reconnect_reconciles_before_reporting(monkeypatch):
+    _stale_job('unknown')
+    monkeypatch.setattr(u, 'runtime_info', lambda: {'imageId': 'sha256:new', 'protocol': 1})
+    monkeypatch.setattr(u, 'docker', lambda *a, **k: '')
+    ws = Mock()
+    u.on_connected(ws)
+    frame = json.loads(ws.send.call_args_list[0].args[0])
+    assert frame['upgrade']['status'] == 'success'
+
+
+def test_launch_intent_write_failure_marks_job_failed(deployment, monkeypatch):
+    atomic = u.atomic_json
+    def fail_launch(path, value):
+        if Path(path).name == 'launch.json':
+            raise OSError('disk full')
+        atomic(path, value)
+    monkeypatch.setattr(u, 'atomic_json', fail_launch)
+    calls = []
+    monkeypatch.setattr(u, 'docker', lambda *a, **k: calls.append(a) or '')
+    u.start_upgrade(Mock(), {'requestId': RID, 'image': 'registry/agent:v2'})
+    job = u.job_state()
+    assert job['status'] == 'failed' and 'disk full' in job['error']
+    assert not any(c[0] == 'run' for c in calls)
+    with u.command_slot():
+        pass
+
+
+def test_rollback_readiness_does_not_require_hub_connection(execution, monkeypatch):
+    manifest, root, source, calls = execution
+    # 旧 Agent 未连上 Hub：Docker 健康检查因 /health 503 判 unhealthy，但进程已在响应
+    monkeypatch.setattr(u, 'inspect_container', lambda n: {'Image': 'sha256:old', 'State': {'Running': True, 'Health': {'Status': 'unhealthy'}}})
+    assert REAL_WAIT(manifest, 'sha256:old', root, False, timeout=1)
+    probe = next(c for c in calls if c[0] == 'exec')
+    assert probe[-1] == u.LIVENESS_PROBE and 'HTTPError' in u.LIVENESS_PROBE
+    times = iter([0, 0, 3])
+    monkeypatch.setattr(u.time, 'monotonic', lambda: next(times))
+    monkeypatch.setattr(u.time, 'sleep', lambda n: None)
+    # 新版仍须通过 Docker 健康检查并获得 Hub 确认
+    monkeypatch.setattr(u, 'inspect_container', lambda n: {'Image': 'sha256:new', 'State': {'Running': True, 'Health': {'Status': 'unhealthy'}}})
+    u.atomic_json(root / 'confirmed.json', {'requestId': RID, 'imageId': 'sha256:new'})
+    assert not REAL_WAIT(manifest, 'sha256:new', root, True, timeout=1)
+
+
+def test_executor_rewrite_keeps_compose_comments(execution):
+    manifest, root, source, calls = execution
+    source.write_text(COMMENTED_COMPOSE, encoding='utf-8')
+    manifest['composeHash'] = hashlib.sha256(source.read_bytes()).hexdigest()
+    u.atomic_json(root / 'manifest.json', manifest)
+    u.run_upgrade(root / 'manifest.json')
+    assert u.read_json(root / 'job.json')['status'] == 'success'
+    text = source.read_text(encoding='utf-8')
+    assert '# 部署说明' in text and '      - 22:22' in text and '      FLAG: on' in text
+    assert yaml.safe_load(text)['services']['agent']['image'] == 'registry/agent@sha256:abcd'
+
+
+def test_replace_image_text_skips_non_service_lines_and_verifies_result():
+    text = 'services:\n  x-note: >\n    image: not-a-service\n  agent:\n    image: old:1\n'
+    result = u.replace_image_text(text, 'agent', 'registry/agent:v2')
+    assert yaml.safe_load(result)['services']['agent']['image'] == 'registry/agent:v2'
+    assert '    image: not-a-service\n' in result
+    # 重复键时 YAML 取最后一个值：替换第一行不能生效，必须拒绝而不是假装成功
+    with pytest.raises(ValueError):
+        u.replace_image_text('services:\n  agent:\n    image: old:1\n    image: other:2\n', 'agent', 'registry/agent:v2')

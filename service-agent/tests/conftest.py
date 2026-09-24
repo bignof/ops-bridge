@@ -34,3 +34,13 @@ def isolated_outbox_state(tmp_path, monkeypatch):
     outbox.configure(str(tmp_path / "outbox-autouse.json"))
     yield
     outbox.clear_sender()
+
+@pytest.fixture(autouse=True)
+def no_background_follow_up(monkeypatch):
+    """restart/update 结束会起插件同步跟踪线程；默认让它立即结束，专门的用例再显式打开。"""
+    from core import status_reporter
+
+    monkeypatch.setattr(status_reporter, 'PLUGIN_FOLLOW_UP_TIMEOUT', 0)
+    status_reporter._follow_ups.clear()
+    yield
+    status_reporter._follow_ups.clear()
