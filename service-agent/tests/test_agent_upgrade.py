@@ -45,15 +45,17 @@ def deployment(tmp_path, monkeypatch):
     return info, source
 
 
-@pytest.mark.parametrize('image', ['registry/agent:v2', 'registry/agent@sha256:abcd', 'registry/agent:latest'])
+@pytest.mark.parametrize('image', ['registry/agent:v2', 'registry/agent@sha256:abcd', 'registry/agent:latest',
+                                   'other.example.com:3006/service-agent:main-1', 'different/agent:1'])
 def test_image_accept(image):
-    assert u.validate_image(image, 'registry/agent:v1') == image
+    # 允许换仓库：镜像仓库迁移、换域名是正常运维场景
+    assert u.validate_image(image) == image
 
 
-@pytest.mark.parametrize('image', [None, '', '-evil', 'registry/agent:v2;ls', 'different/agent:1', 'registry/agent', 'r' * 501])
+@pytest.mark.parametrize('image', [None, '', '-evil', 'registry/agent:v2;ls', 'registry/agent', 'host:5000/agent', 'r' * 501])
 def test_image_reject(image):
     with pytest.raises(ValueError):
-        u.validate_image(image, 'registry/agent:v1')
+        u.validate_image(image)
 
 
 def test_registry_port_repository():
@@ -191,8 +193,15 @@ def test_start_wait_timeout(deployment, monkeypatch):
     assert u.job_state()['status'] == 'failed'
 
 
-def test_start_rejects_different_repository(deployment):
-    u.start_upgrade(Mock(), {'requestId': RID, 'image': 'evil/agent:v2'})
+def test_start_accepts_other_repository_and_rejects_bad_reference(deployment, monkeypatch):
+    calls = []
+    monkeypatch.setattr(u, 'docker', lambda *a, **k: calls.append(a) or '')
+    u.start_upgrade(Mock(), {'requestId': RID, 'image': 'mirror.example.com/agent:v2'})
+    assert u.job_state()['status'] == 'waiting'
+    assert any(c[0] == 'run' for c in calls)
+    other = RID.replace('1', 'b')
+    u.save_job(u.state_root(), u.job_state(), 'success')
+    u.start_upgrade(Mock(), {'requestId': other, 'image': 'registry/agent;rm -rf /'})
     assert u.job_state()['status'] == 'failed'
 
 

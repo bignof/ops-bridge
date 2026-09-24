@@ -339,7 +339,7 @@ pytest --cov=agent --cov=config --cov=core --cov=services --cov-report=term-miss
 
 ## Agent 自升级
 
-支持交付中枢「服务器 → 升级 Agent」。首次须手工安装带自升级协议的 Agent，之后可从 Hub 指定同仓库标签或 digest 升级。
+支持交付中枢「服务器 → 升级 Agent」。首次须手工安装带自升级协议的 Agent，之后可从 Hub 指定目标镜像（须带标签或 digest，允许换到其他镜像仓库，服务器须能拉取）升级。
 
 Agent 等待当前服务操作完成后，用当前已安装镜像启动独立的临时执行器。执行器先拉取并固定目标 digest，再仅重建 Agent 服务；新版实际镜像与 Hub 确认、健康检查都通过才算成功。失败自动恢复旧镜像，执行器中断时根据持久化账本补偿，业务容器不重启。
 

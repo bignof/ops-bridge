@@ -93,11 +93,13 @@ def image_repository(image):
     return value.rsplit(':', 1)[0] if ':' in value.rsplit('/', 1)[-1] else value
 
 
-def validate_image(image, current):
+def validate_image(image):
+    """只校验镜像地址格式，允许换仓库（镜像仓库迁移、换域名）。
+
+    目标不是可用的 Agent 时新版连不上 Hub、拿不到确认，执行器会自动回退；拉取失败则在切换前记 failed。
+    """
     if not isinstance(image, str) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9._/:@-]{0,499}', image):
         raise ValueError('镜像地址格式不正确')
-    if image_repository(image) != image_repository(current):
-        raise ValueError('只能升级到当前 Agent 镜像仓库中的版本')
     if ':' not in image.rsplit('/', 1)[-1] and '@sha256:' not in image:
         raise ValueError('请指定镜像标签或 digest')
     return image
@@ -374,7 +376,7 @@ def start_upgrade(ws, data, resume=False):
     handed_off = False
     try:
         dep = deployment_info()
-        validate_image(data.get('image'), dep['image'])
+        validate_image(data.get('image'))
         job.update(previousImageId=dep['imageId'], previousImage=dep['image'])
         with _guard:
             save_job(root, job, 'waiting')
