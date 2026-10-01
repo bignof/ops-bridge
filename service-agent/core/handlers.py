@@ -208,6 +208,27 @@ def _recover_previous_compose(project_dir, compose_file, original_compose, outpu
     return ok
 
 
+# drain 成功后任何一步没能把容器重启起来都要写这行：drain 不可撤销（Nacos 已注销、定时任务已停、
+# ready 恒 503），容器仍在 running，巡检不会告警，只有重启才能恢复流量。
+DRAINED_NOT_RESTARTED = '[warn] 实例已下线（drain 成功）但重启未完成，当前不接流量，请尽快手动重启该实例'
+
+
+def _drain_first(data, compose_file, action, output_lines):
+    """drain=true 的 restart/update 在动容器之前先下线排空（与重启同一条命令、同一把目录锁，
+    中间不会插入别的命令，也不会因 hub 侧下发失败而停在「已下线未重启」）。
+    返回 True 表示已下线可以继续；False 表示下线失败，原因已写入 output_lines，调用方不得再动容器。"""
+    port = resolve_container_port_mapping(compose_file)
+    if port is None:
+        output_lines.append("[error] No host port mapped to container port 80; cannot drain.")
+        output_lines.append(f"[info] 下线失败，未执行 {action}，实例保持原状")
+        return False
+    ok, message = drain(port, token=data.get('shutdownToken'))
+    output_lines.append(f"=== drain ===\n{message}")
+    if not ok:
+        output_lines.append(f"[info] 下线失败，未执行 {action}，实例保持原状")
+    return ok
+
+
 def _graceful_healthcheck(compose_file):
     """graceful 模式下 docker 命令成功后调用一次。返回 (healthy, output_lines)。"""
     port = resolve_container_port_mapping(compose_file)
@@ -264,6 +285,11 @@ def handle_update(ws, data, request_id, project_dir):
 
     all_output = []
     original_compose = read_compose_file(compose_file)
+    drained = False  # drain=true 且已下线：之后容器没被重建就得明确告诉 hub「已下线未重启」
+
+    def fail_drained(error):
+        all_output.extend([f"[error] {error}", DRAINED_NOT_RESTARTED])
+        _reply(ws, request_id, False, '\n'.join(all_output), 'update', project_dir)
 
     try:
         updated_services = update_image_in_compose(compose_file, image)
@@ -283,12 +309,24 @@ def handle_update(ws, data, request_id, project_dir):
             _reply(ws, request_id, False, '\n'.join(all_output), 'update', project_dir)
             return
 
+        # 拉取成功之后才下线：拉镜像可能耗时数分钟，先下线会白白缩容；拉取失败也不会留下已下线的实例
+        if data.get('drain'):
+            if not _drain_first(data, compose_file, 'update', all_output):
+                restore_compose_file(compose_file, original_compose)
+                _append_compose_restore(all_output, compose_file)
+                _reply(ws, request_id, False, '\n'.join(all_output), 'update', project_dir)
+                return
+            drained = True
+
         ok, out = run_compose(project_dir, ['down'])
         all_output.append(f"=== docker compose down ===\n{out}")
         if not ok:
             recovered = _recover_previous_compose(project_dir, compose_file, original_compose, all_output)
             if not recovered:
                 all_output.append("[error] Recovery failed after unsuccessful docker compose down.")
+            if drained:
+                # down 失败时旧容器可能原样还在，恢复用的 up -d 不会重建它，下线状态解除不了
+                all_output.append(DRAINED_NOT_RESTARTED)
             _reply(ws, request_id, False, '\n'.join(all_output), 'update', project_dir)
             return
 
@@ -298,17 +336,25 @@ def handle_update(ws, data, request_id, project_dir):
             recovered = _recover_previous_compose(project_dir, compose_file, original_compose, all_output)
             if not recovered:
                 all_output.append("[error] Recovery failed after unsuccessful docker compose up -d.")
+                if drained:
+                    all_output.append(DRAINED_NOT_RESTARTED)
             _reply(ws, request_id, False, '\n'.join(all_output), 'update', project_dir)
             return
 
     except subprocess.TimeoutExpired:
         restore_compose_file(compose_file, original_compose)
-        send_error(ws, request_id, "Command execution timed out (5 min)")
+        if drained:
+            fail_drained("Command execution timed out (5 min)")
+        else:
+            send_error(ws, request_id, "Command execution timed out (5 min)")
         return
     except Exception as e:
         restore_compose_file(compose_file, original_compose)
         logger.exception("Execution error")
-        send_error(ws, request_id, str(e))
+        if drained:
+            fail_drained(str(e))
+        else:
+            send_error(ws, request_id, str(e))
         return
 
     ok = True
@@ -340,7 +386,7 @@ def handle_drain(ws, data, request_id, project_dir):
 
 
 def handle_restart(ws, data, request_id, project_dir):
-    """restart: docker compose restart"""
+    """restart: docker compose restart；drain=true 时先下线排空再重启（同一条命令内完成）。"""
     compose_file = find_compose_file(project_dir)
     if not compose_file:
         send_error(ws, request_id, f"No docker-compose.yaml/yml found in {project_dir}")
@@ -349,17 +395,28 @@ def handle_restart(ws, data, request_id, project_dir):
     logger.info(f"restart: dir={project_dir}")
     send_message(ws, {'type': 'ack', 'requestId': request_id, 'status': 'processing'})
 
-    try:
-        ok, out = run_compose(project_dir, ['restart'])
-    except subprocess.TimeoutExpired:
-        send_error(ws, request_id, "Command execution timed out (5 min)")
-        return
-    except Exception as e:
-        logger.exception("Execution error")
-        send_error(ws, request_id, str(e))
+    output_lines = []
+    drained = bool(data.get('drain'))
+    if drained and not _drain_first(data, compose_file, 'restart', output_lines):
+        _reply(ws, request_id, False, '\n'.join(output_lines), 'restart', project_dir)
         return
 
-    output_lines = [f"=== docker compose restart ===\n{out}"]
+    try:
+        ok, out = run_compose(project_dir, ['restart'])
+    except Exception as e:
+        if not isinstance(e, subprocess.TimeoutExpired):
+            logger.exception("Execution error")
+        error = "Command execution timed out (5 min)" if isinstance(e, subprocess.TimeoutExpired) else str(e)
+        if drained:
+            output_lines.extend([f"[error] {error}", DRAINED_NOT_RESTARTED])
+            _reply(ws, request_id, False, '\n'.join(output_lines), 'restart', project_dir)
+        else:
+            send_error(ws, request_id, error)
+        return
+
+    output_lines.append(f"=== docker compose restart ===\n{out}")
+    if not ok and drained:
+        output_lines.append(DRAINED_NOT_RESTARTED)
     if ok and data.get('graceful'):
         healthy, extra_lines = _graceful_healthcheck(compose_file)
         output_lines.extend(extra_lines)

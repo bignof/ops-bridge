@@ -5,7 +5,7 @@ import time
 
 import websocket
 
-from config import AGENT_ID, AGENT_KEY, HEARTBEAT_INTERVAL, OUTBOX_PATH, WS_URL
+from config import AGENT_AUTH_MODE, AGENT_ID, AGENT_KEY, HEARTBEAT_INTERVAL, OUTBOX_PATH, WS_URL
 from core import outbox, plugin_query
 from services import agent_upgrade
 from core.handlers import dispatch, send_message
@@ -20,6 +20,12 @@ logger = logging.getLogger(__name__)
 
 _heartbeat_thread = None
 _initial_report_ws = None  # 已完成首轮全量采集的连接：重连后清单不变也要立即补采
+
+AUTH_HEADER = 'X-Agent-Key'
+# 当前使用的 key 传递方式（见 config.AGENT_AUTH_MODE）。中枢鉴权在升级握手完成之后才判定，
+# 失败时以 1008 'auth failed' 关闭——所以 on_open 不代表鉴权通过，收到中枢的第一条消息才算。
+_auth_transport = 'query' if AGENT_AUTH_MODE == 'query' else 'header'
+_header_auth_confirmed = False  # 请求头方式已被中枢接受过：之后的 1008 是 key 本身的问题，不再回退
 _state = {
     'connected': False,
     'last_connect_ts': None,
@@ -61,9 +67,11 @@ def _on_open(ws):
 
 
 def _on_message(ws, message):
-    global _initial_report_ws
+    global _initial_report_ws, _header_auth_confirmed
     try:
         _update_state(last_message_ts=time.time())
+        if _auth_transport == 'header':
+            _header_auth_confirmed = True  # 鉴权失败的连接收不到任何业务消息，能收到即说明中枢认请求头
         data = json.loads(message)
         msg_type = data.get('type')
         if msg_type == 'agent_upgrade':
@@ -111,7 +119,26 @@ def _on_error(ws, error):
     logger.error(f"WebSocket error: {error}")
 
 
+def _on_auth_rejected(close_status_code, close_msg):
+    """auto 模式的 key 传递方式切换。只认中枢鉴权失败的 1008 'auth failed'（key 轮换踢线等其它 1008 不算）。
+    请求头方式从未被接受过 → 多半是只认 ?key= 的旧中枢，改用 URL 参数；URL 参数也被拒 → key 本身不对，
+    切回请求头，免得升级中枢后还一直把 key 放在 URL 里。"""
+    global _auth_transport
+    if AGENT_AUTH_MODE != 'auto' or close_status_code != 1008:
+        return
+    reason = close_msg.decode('utf-8', 'replace') if isinstance(close_msg, bytes) else str(close_msg or '')
+    if reason != 'auth failed':
+        return
+    if _auth_transport == 'header' and not _header_auth_confirmed:
+        _auth_transport = 'query'
+        logger.warning("中枢拒绝了请求头方式的鉴权，可能是旧版中枢，改用 URL 参数重连；升级中枢后重启 Agent 即恢复请求头方式")
+    elif _auth_transport == 'query':
+        _auth_transport = 'header'
+        logger.warning("URL 参数方式同样鉴权失败，请核对 AGENT_ID / AGENT_KEY 是否与中枢签发的一致")
+
+
 def _on_close(ws, close_status_code, close_msg):
+    _on_auth_rejected(close_status_code, close_msg)
     stop_status_reporting(ws)
     _update_state(connected=False, last_disconnect_ts=time.time())
     outbox.clear_sender()  # 补投暂停,等重连的 _on_open 换新通道
@@ -146,10 +173,14 @@ def _start_heartbeat(ws):
 
 def connect():
     outbox.configure(OUTBOX_PATH)  # 幂等:每轮重连前确保已从磁盘恢复(进程首连即初始化)
-    url = f"{WS_URL}/{AGENT_ID}?key={AGENT_KEY}"
-    logger.info("Connecting to %s/%s...", WS_URL, AGENT_ID)
+    if _auth_transport == 'header':
+        url, header = f"{WS_URL}/{AGENT_ID}", [f"{AUTH_HEADER}: {AGENT_KEY}"]
+    else:
+        url, header = f"{WS_URL}/{AGENT_ID}?key={AGENT_KEY}", None
+    logger.info("Connecting to %s/%s (key via %s)...", WS_URL, AGENT_ID, _auth_transport)
     ws = websocket.WebSocketApp(
         url,
+        header=header,
         on_open=_on_open,
         on_message=_on_message,
         on_error=_on_error,

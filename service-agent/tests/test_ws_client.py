@@ -193,10 +193,11 @@ def test_connect_builds_websocket_app_and_runs_forever(monkeypatch: pytest.Monke
     created: dict = {}
 
     class FakeWebSocketApp:
-        def __init__(self, url, on_open, on_message, on_error, on_close):
+        def __init__(self, url, header, on_open, on_message, on_error, on_close):
             created.update(
                 {
                     "url": url,
+                    "header": header,
                     "on_open": on_open,
                     "on_message": on_message,
                     "on_error": on_error,
@@ -212,7 +213,9 @@ def test_connect_builds_websocket_app_and_runs_forever(monkeypatch: pytest.Monke
 
     module.connect()
 
-    assert created["url"] == "ws://hub.example/ws/agent/agent-7?key=secret-key"
+    # 默认 auto：key 走请求头，URL 里不出现（网关/nginx 访问日志不会记下 key）
+    assert created["url"] == "ws://hub.example/ws/agent/agent-7"
+    assert created["header"] == ["X-Agent-Key: secret-key"]
     assert created["ping_interval"] == 20
     assert created["ping_timeout"] == 10
 
@@ -241,6 +244,8 @@ def test_connect_handles_real_websocket_round_trip(monkeypatch: pytest.MonkeyPat
     client_thread = threading.Thread(target=run_client)
 
     async def handler(websocket) -> None:
+        observed["path"] = websocket.request.path
+        observed["key_header"] = websocket.request.headers.get("X-Agent-Key")
         server_connected.set()
         await websocket.send(json.dumps({"type": "ping"}))
         observed["pong"] = json.loads(await websocket.recv())
@@ -271,6 +276,7 @@ def test_connect_handles_real_websocket_round_trip(monkeypatch: pytest.MonkeyPat
     assert client_thread.is_alive() is False
     assert observed["pong"] == {"type": "pong", "timestamp": observed["pong"]["timestamp"]}
     assert observed["command"] == {"type": "command", "requestId": "req-real"}
+    assert observed["path"] == "/ws/agent/agent-7" and observed["key_header"] == "secret-key"
 
 
 def test_on_close_stops_log_sessions(monkeypatch: pytest.MonkeyPatch) -> None:

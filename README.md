@@ -34,6 +34,8 @@ docker build -t orchidea/service-agent:local ./service-agent
 
 ## 发布约定
 
+推送 `main` 后，`docker-publish.yml` 先调用 `ci.yml` 跑完整测试（含 97% 覆盖率门），通过才构建并推送镜像（`main-<时间戳>` 与 `latest`）；测试失败不出镜像。依赖与基础镜像都锁定版本，升级时改 `service-agent/requirements.txt` 与 `Dockerfile` 并走同一流程。
+
 镜像发布 workflow 需要以下 secrets：
 
 - `REGISTRY_URL`
@@ -48,3 +50,4 @@ docker build -t orchidea/service-agent:local ./service-agent
 - [一期验收清单（存档）](docs/PHASE1_ACCEPTANCE.md)
 - [后续路线规划](docs/ROADMAP.md)
 - [Service Agent 操作说明](service-agent/README.md)
+- [Agent ↔ 交付中枢协议](service-agent/PROTOCOL.md)

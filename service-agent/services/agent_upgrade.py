@@ -13,6 +13,8 @@ import uuid
 
 import yaml
 
+from core.capabilities import CAPABILITIES
+
 PROTOCOL = 1
 TERMINAL = {'success', 'rolled_back', 'failed'}
 _guard = threading.RLock()
@@ -187,7 +189,8 @@ def runtime_info():
     global _runtime, _runtime_checked_at
     now = time.monotonic()
     if _runtime is None or (not _runtime.get('selfUpgrade') and now - _runtime_checked_at >= RUNTIME_RETRY_SECONDS):
-        base = {'protocol': PROTOCOL, 'bootId': _boot_id, 'version': os.getenv('AGENT_VERSION', 'dev')}
+        base = {'protocol': PROTOCOL, 'bootId': _boot_id, 'version': os.getenv('AGENT_VERSION', 'dev'),
+                'capabilities': list(CAPABILITIES)}
         try:
             dep = deployment_info()
             base.update(image=dep['image'], imageId=dep['imageId'], selfUpgrade=True)

@@ -1,4 +1,11 @@
-websocket-client
-requests
-pyyaml
-python-dotenv
+# 全部依赖（含传递依赖）锁定到具体版本：镜像在 CI 测过什么就发布什么，不会在两次构建之间悄悄换版本。
+# 升级：在 Python 3.12 干净环境里 pip install 新版本、跑完测试，再用 pip freeze 的结果更新本文件。
+websocket-client==1.9.2
+requests==2.34.2
+pyyaml==6.0.3
+python-dotenv==1.2.4
+# requests 的传递依赖
+certifi==2026.7.22
+charset-normalizer==3.5.2
+idna==3.20
+urllib3==2.8.0

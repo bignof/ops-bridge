@@ -28,7 +28,10 @@ service-agent（容器）
 ## 功能
 
 - 通过 WebSocket 与控制台保持长连接，自动断线重连
-- 支持 `update` 和 `restart` 两类平台命令
+- 支持 `update` / `restart` / `drain` 平台命令；restart/update 可带 `drain: true`，在同一条命令里先下线排空再重启
+- 支持 `plugin_scan` / `plugin_remove` / `plugin_restore` 业务容器插件文件操作
+- 巡检上报包含已停止的容器（`docker compose ps --all`），一次性容器不上报
+- 连接时上报版本与能力清单（`agent_report.runtime.capabilities`），Hub 据此决定可用功能
 - 支持 `logs_start` / `logs_stop` 日志流会话，用于实时查看 `docker compose logs -f --tail N`
 - 支持 `logfile_list` / `logfile_fetch` / `logfile_follow` 日志文件协议：列出部署目录下的日志文件、把某个文件 gzip 上传到中枢归档、实时跟随子目录里最新的日志文件
 - 支持 `compose_discover` / `compose_inspect`：只读扫描 compose 项目并汇报服务 / 容器名 / 镜像 / 端口
@@ -54,6 +57,7 @@ service-agent（容器）
 | `WS_URL`              | 控制台 WebSocket 地址         | `ws://192.168.1.10:13000/ws/agent`                   |
 | `AGENT_ID`            | Agent 唯一标识                | `prod-server-01`                                     |
 | `AGENT_KEY`           | Hub 为该 agent 签发的独立 key | `hub-issued-agent-key`                               |
+| `AGENT_AUTH_MODE`     | key 的传递方式：`auto`（默认，先用 `X-Agent-Key` 请求头，旧版 Hub 拒绝时自动改用 URL 参数）、`header`、`query` | `auto` |
 | `RECONNECT_DELAY`     | 断线重连间隔（秒），默认 `5`  | `5`                                                  |
 | `HEARTBEAT_INTERVAL`  | 心跳间隔（秒），默认 `30`     | `30`                                                 |
 | `STATUS_REPORT_INTERVAL` | 定时巡检上报间隔（秒），默认 `120` | `120`                                          |
@@ -99,168 +103,7 @@ INFO - Health server listening on http://0.0.0.0:18081/health
 
 ## WebSocket 消息协议
 
-### 服务端 → Agent（下发命令）
-
-```json
-{
-  "type": "command",
-  "requestId": "req-123",
-  "action": "update",
-  "dir": "/data/dev/admin",
-  "image": "hello-world:latest"
-}
-```
-
-| 字段        | 类型   | 必填            | 说明                                                                                                         |
-| ----------- | ------ | --------------- | ------------------------------------------------------------------------------------------------------------ |
-| `type`      | string | ✅              | 固定为 `"command"`                                                                                           |
-| `requestId` | string | ✅              | 请求唯一 ID，原样返回                                                                                        |
-| `action`    | string | ✅              | `update` 或 `restart`                                                                                        |
-| `dir`       | string | ✅              | compose 文件所在目录的宿主机绝对路径                                                                         |
-| `image`     | string | `update` 时必填 | 新镜像全名含 tag（如 `registry/repo:new-tag`）。Agent 自动在 compose 文件中找到同仓库的服务并替换 image 字段 |
-
-#### 支持的 action
-
-| action    | 执行流程                                                                                                                                                                                        |
-| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `update`  | ① 找到与目标镜像同仓库的服务并更新 `image` → ② `docker compose pull` 成功后才执行切换 → ③ `docker compose down` → ④ `docker compose up -d`；若拉取或启动失败，会恢复原 compose 并尝试拉起旧版本 |
-| `restart` | `docker compose restart`                                                                                                                                                                        |
-
-并发约束：如果同一个 Agent 在短时间内收到多条命令，Agent 会按 `dir` 做互斥控制。同一目录上的 `update` / `restart` 会排队串行执行，避免 compose 文件和 Docker 操作互相冲突；不同目录仍允许并行。
-
-### 服务端 → Agent（日志流）
-
-```json
-{
-  "type": "logs_start",
-  "sessionId": "log-123",
-  "dir": "/data/dev/admin",
-  "tail": 200,
-  "timestamps": true
-}
-```
-
-| 字段         | 类型    | 必填 | 说明 |
-| ------------ | ------- | ---- | ---- |
-| `type`       | string  | ✅   | `logs_start` 或 `logs_stop` |
-| `sessionId`  | string  | ✅   | 日志会话唯一 ID，由 Hub 生成 |
-| `dir`        | string  | ✅   | compose 文件所在目录的宿主机绝对路径 |
-| `tail`       | integer | 否   | 启动时先输出最近多少行，默认 `200` |
-| `timestamps` | boolean | 否   | 是否追加 `docker compose logs --timestamps` |
-
-`logs_stop` 示例：
-
-```json
-{
-  "type": "logs_stop",
-  "sessionId": "log-123"
-}
-```
-
-### Agent → 服务端（回复）
-
-**ACK（处理中）：**
-
-```json
-{ "type": "ack", "requestId": "req-123", "status": "processing" }
-```
-
-**结果（成功）：**
-
-```json
-{
-  "type": "result",
-  "requestId": "req-123",
-  "status": "success",
-  "output": "=== pull ===\n...\n=== down ===\n...\n=== up -d ===\n...",
-  "message": "Action 'update' finished for project 'my-app'."
-}
-```
-
-**结果（失败）：**
-
-```json
-{ "type": "result", "requestId": "req-123", "status": "failed", "error": "..." }
-```
-
-**日志会话开始：**
-
-```json
-{
-  "type": "logs_started",
-  "sessionId": "log-123",
-  "tail": 200,
-  "timestamps": true
-}
-```
-
-**日志分块：**
-
-```json
-{
-  "type": "logs_chunk",
-  "sessionId": "log-123",
-  "chunk": "web-1  | service started\n"
-}
-```
-
-**日志结束：**
-
-```json
-{
-  "type": "logs_finished",
-  "sessionId": "log-123",
-  "exitCode": 0,
-  "stopped": false,
-  "chunks": 32
-}
-```
-
-**日志错误：**
-
-```json
-{
-  "type": "logs_error",
-  "sessionId": "log-123",
-  "error": "Directory not found: /data/dev/admin"
-}
-```
-
-说明：
-
-- 当前日志能力是单向流式输出，不包含交互式 shell
-- Agent 会直接执行 `docker compose logs -f --tail N`，当 Hub 断开该流时会终止对应进程
-
-### 服务端 → Agent（日志文件协议 logfile_*）
-
-路径安全：`dir` 必须是含 compose 文件的目录；日志根 = `dir/<logDir 或 logs>`，realpath 后必须在 `dir` 之内；`file` / `subdir` 相对日志根，越界一律 `forbidden`；只认 `*.log` 与 `*.log.N`。
-
-| 帧 | 方向 | 字段 |
-| --- | --- | --- |
-| `logfile_list` | ↓ | `requestId`, `dir`, `logDir?` |
-| `logfile_list_result` | ↑ | `requestId`, `root`, `files: [{path,size,mtime}]`, `error?`（`mtime` 为带时区偏移的 ISO 8601，如 `2026-09-05T17:30:15+08:00`；`logfile_fetch` 上传的 `X-Hub-File-Mtime` 同此格式） |
-| `logfile_fetch` | ↓ | `requestId`, `archiveId`, `dir`, `logDir?`, `file`, `uploadPath`, `uploadToken`, `uploadExpiresAt` |
-| `logfile_fetch_result` | ↑ | `requestId`, `archiveId`, `ok`, `sizeRaw?`, `sizeSent?`, `error?`（旁路通知，状态真源是 HTTP 上传） |
-| `logfile_follow` | ↓ | `sessionId`, `dir`, `logDir?`, `subdir`, `tail?`(默认 200，≤500), `filter?` |
-| `logfile_started` | ↑ | `sessionId`, `file`, `fileSize` |
-| `logfile_entries` | ↑ | `sessionId`, `seq`, `file`, `startOffset`, `endOffset`, `entries: [{offset,text,timestamp,level}]`, `dropped` |
-| `logfile_rotated` | ↑ | `sessionId`, `from`, `to` |
-| `logfile_finished` | ↑ | `sessionId`, `reason`（`unfollow` / `file_gone` / `error`） |
-| `logfile_error` | ↑ | `sessionId`, `error: {code,message}` |
-| `logfile_unfollow` | ↓ | `sessionId` |
-
-`filter`：`{ levels?: string[], keyword?: string, regex?: boolean, since?: 'YYYY-MM-DD HH:mm:ss', until?: ... }`；以「条目」（首行 + 堆栈续行）为单位匹配，follow 忽略 since/until。上传：agent 边 gzip 边 `POST <HUB_HTTP_URL 或 WS_URL 推导><uploadPath>`，头 `Content-Type: application/gzip`、`X-Hub-Upload-Token`、`X-Hub-Raw-Size`、`X-Hub-File-Mtime`。限制：跟随会话同时最多 3 条、上传同时 1 个，超出回 `busy`；每秒超过 2000 条的条目直接丢并在 `dropped` 报数。与 hub 断连时全部跟随会话、进行中的上传与旧的 `logs_*` 会话一律停止。
-
-### 服务端 → Agent（compose 发现）
-
-| 帧 | 方向 | 字段 |
-| --- | --- | --- |
-| `compose_discover` | ↓ | `requestId` |
-| `compose_discover_result` | ↑ | `requestId`, `root`, `projects: [{dir, composeFile, services, error?}]`, `truncated`, `error?` |
-| `compose_inspect` | ↓ | `requestId`, `dir` |
-| `compose_inspect_result` | ↑ | `requestId`, `dir`, `composeFile`, `services: [{name, containerName, image, ports}]`, `error?` |
-
-发现只扫 `PROJECTS_ROOT` 向下 3 层、跳过 `.` 开头目录与 `node_modules`、找到项目不再下钻、最多 200 个；两者都只读文件、不执行 docker。错误码：`not_found` / `invalid` / `io_error`。
+连接与鉴权、版本与能力清单、全部帧的字段与语义统一见 [PROTOCOL.md](PROTOCOL.md)，本文不再重复。
 
 ## 健康检查
 
@@ -288,15 +131,17 @@ service-agent/
 ├── agent.py            # Agent 主程序
 ├── config.py           # 环境变量和运行参数
 ├── core/               # WebSocket、命令处理、健康检查
+│   ├── capabilities.py # 上报给 Hub 的协议能力清单
 │   ├── handlers.py
 │   ├── log_sessions.py # 实时日志流会话
 │   └── ws_client.py
 ├── services/           # Compose 操作封装
-├── requirements.txt    # Python 依赖
+├── requirements.txt    # Python 依赖（含间接依赖全部锁定版本）
 ├── requirements-dev.txt
 ├── Dockerfile          # 镜像构建文件
 ├── docker-compose.yml  # 一键部署配置
 ├── tests/              # 自动化测试
+├── PROTOCOL.md         # 与交付中枢的 WebSocket 协议
 └── README.md
 ```
 
@@ -334,6 +179,7 @@ pytest --cov=agent --cov=config --cov=core --cov=services --cov-report=term-miss
 ## 安全建议
 
 - 每个 agent 都应使用 hub 单独签发的 `AGENT_KEY`，不要在多个节点间复用
+- key 默认经 `X-Agent-Key` 请求头传递，不出现在 URL 与代理访问日志里；Hub 全部升级后可把 `AGENT_AUTH_MODE` 固定为 `header`
 - 建议在内网环境部署，或通过 TLS（`wss://`）加密 WebSocket 连接
 - Docker socket 挂载赋予了 Agent 完整的宿主机容器控制权，请确保只有可信的 ServiceHub 实例能接入
 

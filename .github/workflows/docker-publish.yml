@@ -31,8 +31,15 @@ jobs:
               - 'service-agent/**'
               - '.github/workflows/docker-publish.yml'
 
-  service-agent:
+  # 发布前必须先过完整测试与 97% 覆盖率门禁：未经测试的提交不能变成 :latest / main-<时间戳> 镜像，
+  # 否则 pull_policy: always 的 Agent 一次容器重建就会拉到它。
+  test:
     needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.service-agent == 'true'
+    uses: ./.github/workflows/ci.yml
+
+  service-agent:
+    needs: [changes, test]
     if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.service-agent == 'true'
     runs-on: ubuntu-latest
     permissions:

@@ -77,16 +77,28 @@ def update_image_in_compose(compose_file, new_image):
     return updated
 
 
+def _is_one_off(entry):
+    """`docker compose run` 起的一次性容器（label com.docker.compose.oneoff=True）不是部署实例，不参与巡检。"""
+    labels = entry.get('Labels')
+    if isinstance(labels, dict):
+        return str(labels.get('com.docker.compose.oneoff', '')).lower() == 'true'
+    if isinstance(labels, str):
+        return any(part.strip().lower() == 'com.docker.compose.oneoff=true' for part in labels.split(','))
+    return False
+
+
 def collect_service_statuses(compose_dir):
     """
     在 compose_dir 下采集所有 service 的真实运行状态：
-    docker compose ps --format json（每行一个 service 的 JSON，NDJSON）+
+    docker compose ps --all --format json（每行一个 service 的 JSON，NDJSON）+
     对每个拿到的容器 ID 补一次 docker inspect 拿精确 StartedAt（compose ps 本身不给机器可比较的时间戳，
     只有 RunningFor/Status 这类人话字符串）。
+    必须带 --all：compose v2 的 ps 默认只列运行中的容器，崩溃退出的实例会整个消失，
+    hub 既收不到 exited 也就发不出劣化告警，只会在 6 分钟后误报「agent 可能离线」。
     compose ps 本身失败（目录没有 compose 文件/容器未创建）返回空列表，调用方按"这轮跳过"处理。
     单个容器 inspect 失败只影响该 service 的 startedAt（置 None），不影响其它字段、不影响其它 service。
     """
-    cmd = _get_compose_cmd() + ['ps', '--format', 'json']
+    cmd = _get_compose_cmd() + ['ps', '--all', '--format', 'json']
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=compose_dir)
     except Exception:
@@ -94,14 +106,21 @@ def collect_service_statuses(compose_dir):
     if result.returncode != 0:
         return []
 
-    services = []
+    entries = []
     for line in result.stdout.splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            entry = json.loads(line)
+            parsed = json.loads(line)
         except ValueError:
+            continue
+        # compose 2.21 之前把整份结果输出成一行 JSON 数组，之后是 NDJSON；两种都认
+        entries.extend(parsed if isinstance(parsed, list) else [parsed])
+
+    services = []
+    for entry in entries:
+        if not isinstance(entry, dict) or _is_one_off(entry):
             continue
         container_id = entry.get('ID')
         started_at = None

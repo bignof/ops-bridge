@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # 镜像发布流水线先调用本 workflow，测试和覆盖率门禁通过后才构建推送（docker-publish.yml）
+  workflow_call:
 
 jobs:
   service-agent:

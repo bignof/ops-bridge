@@ -183,7 +183,7 @@ def test_collect_service_statuses_single_service(monkeypatch: pytest.MonkeyPatch
     )
 
     def fake_run(cmd, **kwargs):
-        if cmd[-3:] == ["ps", "--format", "json"]:
+        if cmd[-4:] == ["ps", "--all", "--format", "json"]:
             return SimpleNamespace(returncode=0, stdout=ps_line + "\n", stderr="")
         if cmd[:2] == ["docker", "inspect"]:
             return SimpleNamespace(returncode=0, stdout="2026-07-31T08:20:19.123456Z\n", stderr="")
@@ -208,13 +208,13 @@ def test_collect_service_statuses_single_service(monkeypatch: pytest.MonkeyPatch
 
 
 def test_collect_service_statuses_multi_service_ndjson(monkeypatch: pytest.MonkeyPatch) -> None:
-    """docker compose ps --format json 是一行一个 JSON 对象(NDJSON)，不是 JSON 数组——多 service 逐行输出。"""
+    """docker compose ps --all --format json 是一行一个 JSON 对象(NDJSON)，不是 JSON 数组——多 service 逐行输出。"""
     compose._compose_cmd = ["docker", "compose"]  # 跳过探测调用，否则会被下面的 fake_run 判成意外命令
     line1 = json.dumps({"ID": "c1", "Image": "img-a:1", "State": "running", "Name": "svc-a-1", "Service": "a"})
     line2 = json.dumps({"ID": "c2", "Image": "img-b:1", "State": "exited", "Name": "svc-b-1", "Service": "b"})
 
     def fake_run(cmd, **kwargs):
-        if cmd[-3:] == ["ps", "--format", "json"]:
+        if cmd[-4:] == ["ps", "--all", "--format", "json"]:
             return SimpleNamespace(returncode=0, stdout=f"{line1}\n{line2}\n", stderr="")
         if cmd[:2] == ["docker", "inspect"]:
             return SimpleNamespace(returncode=0, stdout="2026-01-01T00:00:00Z\n", stderr="")
@@ -250,7 +250,7 @@ def test_collect_service_statuses_inspect_failure_leaves_started_at_none(monkeyp
     )
 
     def fake_run(cmd, **kwargs):
-        if cmd[-3:] == ["ps", "--format", "json"]:
+        if cmd[-4:] == ["ps", "--all", "--format", "json"]:
             return SimpleNamespace(returncode=0, stdout=ps_line + "\n", stderr="")
         if cmd[:2] == ["docker", "inspect"]:
             return SimpleNamespace(returncode=1, stdout="", stderr="no such container")
@@ -263,3 +263,59 @@ def test_collect_service_statuses_inspect_failure_leaves_started_at_none(monkeyp
 
     assert services[0]["startedAt"] is None
     assert services[0]["image"] == "nginx:1"  # 其它字段不受 inspect 失败影响
+
+
+def _fake_ps(stdout):
+    def fake_run(cmd, **kwargs):
+        if cmd[-4:] == ["ps", "--all", "--format", "json"]:
+            return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+        if cmd[:2] == ["docker", "inspect"]:
+            return SimpleNamespace(returncode=0, stdout="2026-01-01T00:00:00Z\n", stderr="")
+        raise AssertionError(f"unexpected cmd: {cmd}")
+
+    return fake_run
+
+
+def test_collect_service_statuses_reports_exited_containers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """compose v2 的 ps 默认只列运行中容器；不带 --all 时崩溃退出的实例会从上报里消失，hub 永远看不到 exited。"""
+    compose._compose_cmd = ["docker", "compose"]
+    line = json.dumps({"ID": "dead1", "Image": "app:1", "State": "exited", "Name": "app-1", "Service": "app"})
+    monkeypatch.setattr(compose.subprocess, "run", _fake_ps(line + "\n"))
+
+    services = compose.collect_service_statuses("/data/app")
+    compose._compose_cmd = None
+
+    assert [(s["name"], s["state"]) for s in services] == [("app", "exited")]
+
+
+def test_collect_service_statuses_skips_one_off_run_containers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--all 会带出 `docker compose run` 留下的一次性容器：它们不是部署实例，标签字符串和字典两种格式都要剔除。"""
+    compose._compose_cmd = ["docker", "compose"]
+    main = json.dumps({"ID": "c1", "Image": "app:1", "State": "running", "Name": "app-1", "Service": "app",
+                       "Labels": "com.docker.compose.oneoff=False,com.docker.compose.service=app"})
+    run_str = json.dumps({"ID": "c2", "Image": "app:1", "State": "exited", "Name": "app-run-1a2b", "Service": "app",
+                          "Labels": "com.docker.compose.service=app,com.docker.compose.oneoff=True"})
+    run_dict = json.dumps({"ID": "c3", "Image": "app:1", "State": "exited", "Name": "app-run-3c4d", "Service": "app",
+                           "Labels": {"com.docker.compose.oneoff": "True"}})
+    monkeypatch.setattr(compose.subprocess, "run", _fake_ps(f"{main}\n{run_str}\n{run_dict}\n"))
+
+    services = compose.collect_service_statuses("/data/app")
+    compose._compose_cmd = None
+
+    assert [s["containerId"] for s in services] == ["c1"]
+
+
+def test_collect_service_statuses_accepts_legacy_json_array(monkeypatch: pytest.MonkeyPatch) -> None:
+    """compose 2.21 之前 --format json 输出单行 JSON 数组；与 NDJSON 同样解析，非对象条目忽略。"""
+    compose._compose_cmd = ["docker", "compose"]
+    payload = json.dumps([
+        {"ID": "c1", "Image": "a:1", "State": "running", "Name": "a-1", "Service": "a"},
+        {"ID": "c2", "Image": "b:1", "State": "exited", "Name": "b-1", "Service": "b"},
+        "garbage",
+    ])
+    monkeypatch.setattr(compose.subprocess, "run", _fake_ps(payload + "\nnot-json\n"))
+
+    services = compose.collect_service_statuses("/data/multi")
+    compose._compose_cmd = None
+
+    assert [(s["name"], s["state"]) for s in services] == [("a", "running"), ("b", "exited")]

@@ -731,3 +731,14 @@ def test_replace_image_text_skips_non_service_lines_and_verifies_result():
     # 重复键时 YAML 取最后一个值：替换第一行不能生效，必须拒绝而不是假装成功
     with pytest.raises(ValueError):
         u.replace_image_text('services:\n  agent:\n    image: old:1\n    image: other:2\n', 'agent', 'registry/agent:v2')
+
+
+def test_runtime_reports_capabilities_with_or_without_self_upgrade(monkeypatch):
+    """能力清单与自升级无关：探测失败时也照常上报，Hub 按它决定 drain 合并下发与提前拒绝。"""
+    from core.capabilities import CAPABILITIES
+    monkeypatch.setattr(u, 'deployment_info', Mock(side_effect=ValueError('docker busy')))
+    monkeypatch.setattr(u, 'own_container', Mock(side_effect=ValueError('docker busy')))
+    runtime = u.runtime_info()
+    assert runtime['selfUpgrade'] is False
+    assert runtime['capabilities'] == list(CAPABILITIES)
+    assert {'drain_restart', 'status_all', 'header_auth'} <= set(runtime['capabilities'])

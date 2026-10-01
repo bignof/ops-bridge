@@ -1,7 +1,9 @@
-FROM docker:27-cli AS docker-cli
+# 基础镜像固定到具体版本（与此前浮动标签 27-cli / 3.12-slim 当时解析到的版本一致），
+# 同一提交任何时候构建结果相同；升级时改这里并走完 CI。
+FROM docker:27.5.1-cli AS docker-cli
 
 # 使用较新的轻量级 Python 镜像，降低基础镜像漏洞风险
-FROM python:3.12-slim
+FROM python:3.12.14-slim-trixie
 
 # 设置工作目录
 WORKDIR /app

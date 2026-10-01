@@ -21,6 +21,11 @@ class ChinaTimeFormatter(logging.Formatter):
 WS_URL             = os.getenv('WS_URL', '')
 AGENT_ID           = os.getenv('AGENT_ID', socket.gethostname())
 AGENT_KEY          = os.getenv('AGENT_KEY', '')
+# 连接鉴权 key 的传递方式：auto（默认）先走 X-Agent-Key 请求头，被只认 URL 参数的旧中枢拒绝后自动改用 ?key=；
+# header / query 固定其一。请求头方式下 key 不出现在 URL 里，不会被网关/nginx 的访问日志记下来。
+AGENT_AUTH_MODE    = os.getenv('AGENT_AUTH_MODE', 'auto').strip().lower()
+if AGENT_AUTH_MODE not in ('auto', 'header', 'query'):
+    AGENT_AUTH_MODE = 'auto'
 RECONNECT_DELAY    = int(os.getenv('RECONNECT_DELAY', '5'))
 HEARTBEAT_INTERVAL = int(os.getenv('HEARTBEAT_INTERVAL', '30'))
 STATUS_REPORT_INTERVAL = int(os.getenv('STATUS_REPORT_INTERVAL', '120'))
