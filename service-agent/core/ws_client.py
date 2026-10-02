@@ -22,10 +22,14 @@ _heartbeat_thread = None
 _initial_report_ws = None  # 已完成首轮全量采集的连接：重连后清单不变也要立即补采
 
 AUTH_HEADER = 'X-Agent-Key'
-# 当前使用的 key 传递方式（见 config.AGENT_AUTH_MODE）。中枢鉴权在升级握手完成之后才判定，
-# 失败时以 1008 'auth failed' 关闭——所以 on_open 不代表鉴权通过，收到中枢的第一条消息才算。
+# 中枢鉴权失败的关闭原因（close code 1008）。中枢在升级握手完成之后才判定，所以 on_open 不代表鉴权通过。
+# 认识请求头的中枢拒绝请求头里的 key 时回 AUTH_FAILED_HEADER；带了请求头却收到旧语义的 AUTH_FAILED，
+# 说明中枢根本没读请求头（旧版只认 ?key=）。
+AUTH_FAILED = 'auth failed'
+AUTH_FAILED_HEADER = 'auth failed: header'
+HUB_FEATURE_HEADER_AUTH = 'header_auth'  # hub_hello.features：中枢认识 X-Agent-Key 请求头
+# 当前使用的 key 传递方式（见 config.AGENT_AUTH_MODE）
 _auth_transport = 'query' if AGENT_AUTH_MODE == 'query' else 'header'
-_header_auth_confirmed = False  # 请求头方式已被中枢接受过：之后的 1008 是 key 本身的问题，不再回退
 _state = {
     'connected': False,
     'last_connect_ts': None,
@@ -66,15 +70,30 @@ def _on_open(ws):
     threading.Thread(target=agent_upgrade.on_connected, args=(ws,), daemon=True).start()
 
 
+def _on_hub_hello(data):
+    """中枢连上后发的 hub_hello。auto 模式此前因旧中枢退回 URL 参数的，中枢升级后在这里切回请求头，
+    下次重连起 key 不再进 URL（当前连接已经建立，URL 里的 key 已留在访问日志，断开重连也追不回）。"""
+    global _auth_transport
+    features = data.get('features')
+    if (
+        AGENT_AUTH_MODE == 'auto'
+        and _auth_transport == 'query'
+        and isinstance(features, list)
+        and HUB_FEATURE_HEADER_AUTH in features
+    ):
+        _auth_transport = 'header'
+        logger.info("中枢已支持请求头鉴权，下次重连改用请求头传 key")
+
+
 def _on_message(ws, message):
-    global _initial_report_ws, _header_auth_confirmed
+    global _initial_report_ws
     try:
         _update_state(last_message_ts=time.time())
-        if _auth_transport == 'header':
-            _header_auth_confirmed = True  # 鉴权失败的连接收不到任何业务消息，能收到即说明中枢认请求头
         data = json.loads(message)
         msg_type = data.get('type')
-        if msg_type == 'agent_upgrade':
+        if msg_type == 'hub_hello':
+            _on_hub_hello(data)
+        elif msg_type == 'agent_upgrade':
             threading.Thread(target=agent_upgrade.start_upgrade, args=(ws, data), daemon=True).start()
         elif msg_type == 'agent_upgrade_confirm':
             agent_upgrade.confirm(data)
@@ -110,6 +129,8 @@ def _on_message(ws, message):
                 request_report()
         elif msg_type == 'plugin_query_result':
             plugin_query.resolve(data.get('requestId'), data.get('plugins', []), data.get('error'))
+        else:
+            logger.debug("Ignored unknown message type: %s", msg_type)
     except Exception as e:
         logger.error(f"Error processing message: {e}")
 
@@ -120,19 +141,23 @@ def _on_error(ws, error):
 
 
 def _on_auth_rejected(close_status_code, close_msg):
-    """auto 模式的 key 传递方式切换。只认中枢鉴权失败的 1008 'auth failed'（key 轮换踢线等其它 1008 不算）。
-    请求头方式从未被接受过 → 多半是只认 ?key= 的旧中枢，改用 URL 参数；URL 参数也被拒 → key 本身不对，
-    切回请求头，免得升级中枢后还一直把 key 放在 URL 里。"""
+    """auto 模式的 key 传递方式切换，只看中枢鉴权失败的 1008（key 轮换踢线等其它 1008 不算）。
+    - 带请求头被回旧语义的 'auth failed'：中枢没读请求头（只认 ?key= 的旧中枢，或新中枢被回滚），改用 URL 参数。
+      不管此前请求头是否被接受过：中枢回滚后还死守请求头，全部 Agent 会永久连不上。
+    - 带请求头被回 'auth failed: header'：中枢认识请求头，是 AGENT_ID / AGENT_KEY 不对，不回退——
+      回退只会把（可能属于别的服务器的）有效 key 写进访问日志。
+    - URL 参数被拒：key 本身不对，切回请求头，免得一直把 key 放在 URL 里。"""
     global _auth_transport
     if AGENT_AUTH_MODE != 'auto' or close_status_code != 1008:
         return
     reason = close_msg.decode('utf-8', 'replace') if isinstance(close_msg, bytes) else str(close_msg or '')
-    if reason != 'auth failed':
-        return
-    if _auth_transport == 'header' and not _header_auth_confirmed:
-        _auth_transport = 'query'
-        logger.warning("中枢拒绝了请求头方式的鉴权，可能是旧版中枢，改用 URL 参数重连；升级中枢后重启 Agent 即恢复请求头方式")
-    elif _auth_transport == 'query':
+    if _auth_transport == 'header':
+        if reason == AUTH_FAILED:
+            _auth_transport = 'query'
+            logger.warning("中枢没有读取请求头里的 key（旧版中枢），改用 URL 参数重连；中枢升级后会自动切回请求头")
+        elif reason == AUTH_FAILED_HEADER:
+            logger.error("中枢拒绝了请求头里的 key，请核对 AGENT_ID / AGENT_KEY 是否与中枢签发的一致")
+    elif reason in (AUTH_FAILED, AUTH_FAILED_HEADER):
         _auth_transport = 'header'
         logger.warning("URL 参数方式同样鉴权失败，请核对 AGENT_ID / AGENT_KEY 是否与中枢签发的一致")
 

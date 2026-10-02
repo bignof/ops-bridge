@@ -20,7 +20,7 @@ from services.compose import (
     resolve_container_port_mapping,
     update_image_in_compose,
 )
-from services.app_http import drain, wait_healthy
+from services.app_http import DRAIN_UNKNOWN, DRAINED, drain, drain_outcome, readiness_state, wait_healthy
 
 logger = logging.getLogger(__name__)
 
@@ -166,10 +166,24 @@ def send_message(ws, message_dict):
         return False
 
 
+_results_sent: set[str] = set()  # 本进程已回过 result 的 requestId，dispatch 兜底据此避免重复回结果
+_results_sent_lock = threading.Lock()
+
+
 def _send_result(ws, message_dict):
     """result 必达:先记账 outbox(断连丢失可补投,hub result_ack 清账),再立即经当前 ws 发送。"""
     outbox.remember(message_dict)
+    with _results_sent_lock:
+        _results_sent.add(message_dict.get('requestId'))
     send_message(ws, message_dict)
+
+
+def _take_result_sent(request_id):
+    with _results_sent_lock:
+        if request_id in _results_sent:
+            _results_sent.discard(request_id)
+            return True
+        return False
 
 
 def send_error(ws, request_id, error_msg):
@@ -212,21 +226,56 @@ def _recover_previous_compose(project_dir, compose_file, original_compose, outpu
 # ready 恒 503），容器仍在 running，巡检不会告警，只有重启才能恢复流量。
 DRAINED_NOT_RESTARTED = '[warn] 实例已下线（drain 成功）但重启未完成，当前不接流量，请尽快手动重启该实例'
 
+# 下线请求可能已生效、却既没拿到明确结果也探不到就绪状态时写这行（hub 以「下线结果未知」识别，
+# plugin-hub rolling-run.ts AGENT_DRAIN_UNKNOWN_MARKER，改动文案须两端同步）
+DRAIN_UNKNOWN_MARKER = '下线结果未知'
+
+
+def _drain_kept(action):
+    return f"[info] 下线失败，未执行 {action}，实例保持原状"
+
+
+def _drain_unknown(action):
+    return (
+        f"[warn] {DRAIN_UNKNOWN_MARKER}（应用可能已开始下线，就绪探针也不通），未执行 {action}，"
+        "实例可能已不接流量，请核对后尽快手动重启该实例"
+    )
+
 
 def _drain_first(data, compose_file, action, output_lines):
     """drain=true 的 restart/update 在动容器之前先下线排空（与重启同一条命令、同一把目录锁，
     中间不会插入别的命令，也不会因 hub 侧下发失败而停在「已下线未重启」）。
-    返回 True 表示已下线可以继续；False 表示下线失败，原因已写入 output_lines，调用方不得再动容器。"""
-    port = resolve_container_port_mapping(compose_file)
+    返回 True 表示已下线可以继续；False 表示没有下线成功，原因已写入 output_lines，调用方不得再动容器。
+    不抛异常：抛出去命令线程会在只回了 ack 的情况下结束，hub 只能等 30 分钟超时。
+
+    下线请求没拿到明确结果（读超时、回包中断等）时以一次就绪探针为准：已不就绪 = 关闭标志已打上，
+    实例不再接流量，继续执行目标 action 才能恢复；仍就绪 = 下线没生效，实例保持原状；
+    探针也不通 = 无法判断，不动容器，写「下线结果未知」提醒人工核对。"""
+    try:
+        port = resolve_container_port_mapping(compose_file)
+    except Exception as e:  # compose 文件读不了或格式不对：下线请求还没发出，实例确实没动
+        output_lines.append(f"[error] Failed to read port mapping from {compose_file}: {e}")
+        output_lines.append(_drain_kept(action))
+        return False
     if port is None:
         output_lines.append("[error] No host port mapped to container port 80; cannot drain.")
-        output_lines.append(f"[info] 下线失败，未执行 {action}，实例保持原状")
+        output_lines.append(_drain_kept(action))
         return False
-    ok, message = drain(port, token=data.get('shutdownToken'))
+    outcome, message = drain_outcome(port, token=data.get('shutdownToken'))
     output_lines.append(f"=== drain ===\n{message}")
-    if not ok:
-        output_lines.append(f"[info] 下线失败，未执行 {action}，实例保持原状")
-    return ok
+    if outcome == DRAINED:
+        return True
+    if outcome == DRAIN_UNKNOWN:
+        state = readiness_state(port)
+        if state == 'not_ready':
+            output_lines.append(f"[warn] 下线请求没有明确结果，但应用已不就绪，按已下线继续执行 {action}")
+            return True
+        if state != 'ready':
+            output_lines.append(_drain_unknown(action))
+            return False
+        output_lines.append("[info] 下线请求没有明确结果，应用仍就绪，下线未生效")
+    output_lines.append(_drain_kept(action))
+    return False
 
 
 def _graceful_healthcheck(compose_file):
@@ -396,12 +445,13 @@ def handle_restart(ws, data, request_id, project_dir):
     send_message(ws, {'type': 'ack', 'requestId': request_id, 'status': 'processing'})
 
     output_lines = []
-    drained = bool(data.get('drain'))
-    if drained and not _drain_first(data, compose_file, 'restart', output_lines):
-        _reply(ws, request_id, False, '\n'.join(output_lines), 'restart', project_dir)
-        return
-
+    drained = False
     try:
+        if data.get('drain'):
+            if not _drain_first(data, compose_file, 'restart', output_lines):
+                _reply(ws, request_id, False, '\n'.join(output_lines), 'restart', project_dir)
+                return
+            drained = True
         ok, out = run_compose(project_dir, ['restart'])
     except Exception as e:
         if not isinstance(e, subprocess.TimeoutExpired):
@@ -463,12 +513,20 @@ HANDLERS = {
 # ─────────────────────────────────────────────
 
 def dispatch(ws, data):
+    """命令线程入口。任何异常都要回一个 result：命令线程无声结束时 hub 只能等 30 分钟超时兜底，
+    滚动也跟着卡住。handler 已经回过 result 的不再重复回（迟到的 failed 会被 hub 追加成留痕）。"""
     from services.agent_upgrade import command_slot
+    request_id = data.get('requestId')
     try:
         with command_slot():
             _dispatch(ws, data)
-    except RuntimeError as exc:
-        send_error(ws, data.get('requestId'), str(exc))
+    except Exception as exc:
+        if not isinstance(exc, RuntimeError):
+            logger.exception("Command handler crashed: request_id=%s", request_id)
+        if not _take_result_sent(request_id):
+            send_error(ws, request_id, str(exc))
+    finally:
+        _take_result_sent(request_id)
 
 
 def _dispatch(ws, data):

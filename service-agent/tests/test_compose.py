@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -319,3 +320,90 @@ def test_collect_service_statuses_accepts_legacy_json_array(monkeypatch: pytest.
     compose._compose_cmd = None
 
     assert [(s["name"], s["state"]) for s in services] == [("a", "running"), ("b", "exited")]
+
+
+def _fake_ps_with_inspect(stdout, inspected):
+    """inspected：容器 ID → docker inspect 输出（"<StartedAt>|<oneoff 标签值>"）。"""
+    def fake_run(cmd, **kwargs):
+        if cmd[-4:] == ["ps", "--all", "--format", "json"]:
+            return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+        if cmd[:2] == ["docker", "inspect"]:
+            return SimpleNamespace(returncode=0, stdout=inspected[cmd[-1]] + "\n", stderr="")
+        raise AssertionError(f"unexpected cmd: {cmd}")
+
+    return fake_run
+
+
+def test_collect_service_statuses_legacy_array_without_labels_skips_one_off_by_inspect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """compose 2.20 的 JSON 数组输出没有 Labels 字段：一次性容器要靠 docker inspect 的标签剔除。"""
+    compose._compose_cmd = ["docker", "compose"]
+    payload = json.dumps([
+        {"ID": "c1", "Image": "app:1", "State": "running", "Name": "app-1", "Service": "app"},
+        {"ID": "c2", "Image": "app:1", "State": "exited", "Name": "app-run-1a2b", "Service": "app"},
+    ])
+    inspected = {"c1": "2026-01-01T00:00:00Z|", "c2": "2026-01-01T00:00:00Z|True"}
+    monkeypatch.setattr(compose.subprocess, "run", _fake_ps_with_inspect(payload + "\n", inspected))
+
+    services = compose.collect_service_statuses("/data/app")
+    compose._compose_cmd = None
+
+    assert [s["containerId"] for s in services] == ["c1"]
+
+
+def test_collect_service_statuses_labels_from_ps_win_over_inspect(monkeypatch: pytest.MonkeyPatch) -> None:
+    compose._compose_cmd = ["docker", "compose"]
+    line = json.dumps({"ID": "c1", "Image": "app:1", "State": "running", "Name": "app-1", "Service": "app",
+                       "Labels": "com.docker.compose.oneoff=False"})
+    monkeypatch.setattr(compose.subprocess, "run", _fake_ps_with_inspect(line + "\n", {"c1": "2026-01-01T00:00:00Z|True"}))
+
+    services = compose.collect_service_statuses("/data/app")
+    compose._compose_cmd = None
+
+    assert [s["containerId"] for s in services] == ["c1"]
+
+
+def test_collect_service_statuses_created_container_has_no_started_at(monkeypatch: pytest.MonkeyPatch) -> None:
+    """从未启动过的容器 StartedAt 是 Go 零值：原样上报会被 hub 当成「更旧的上报」丢弃。"""
+    compose._compose_cmd = ["docker", "compose"]
+    line = json.dumps({"ID": "c1", "Image": "app:2", "State": "created", "Name": "app-1", "Service": "app"})
+    monkeypatch.setattr(compose.subprocess, "run", _fake_ps_with_inspect(line + "\n", {"c1": "0001-01-01T00:00:00Z|"}))
+
+    services = compose.collect_service_statuses("/data/app")
+    compose._compose_cmd = None
+
+    assert services[0]["state"] == "created" and services[0]["startedAt"] is None
+
+
+def test_collect_service_statuses_lists_running_containers_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    """旧版 hub 拿第一个当主容器：--all 带出的已退出初始化容器排在前面会让部署被误判为 exited。"""
+    compose._compose_cmd = ["docker", "compose"]
+    lines = [
+        json.dumps({"ID": "c1", "Image": "app:1", "State": "exited", "Name": "app-init-1", "Service": "init"}),
+        json.dumps({"ID": "c2", "Image": "app:1", "State": "running", "Name": "app-web-1", "Service": "web"}),
+        json.dumps({"ID": "c3", "Image": "redis:7", "State": "running", "Name": "app-redis-1", "Service": "redis"}),
+    ]
+    monkeypatch.setattr(compose.subprocess, "run", _fake_ps("\n".join(lines) + "\n"))
+
+    services = compose.collect_service_statuses("/data/app")
+    compose._compose_cmd = None
+
+    assert [s["name"] for s in services] == ["web", "redis", "init"]
+
+
+def test_collect_service_statuses_inspect_exception_keeps_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    compose._compose_cmd = ["docker", "compose"]
+    line = json.dumps({"ID": "c1", "Image": "app:1", "State": "running", "Name": "app-1", "Service": "app"})
+
+    def fake_run(cmd, **kwargs):
+        if cmd[-4:] == ["ps", "--all", "--format", "json"]:
+            return SimpleNamespace(returncode=0, stdout=line + "\n", stderr="")
+        raise subprocess.TimeoutExpired(cmd, 10)
+
+    monkeypatch.setattr(compose.subprocess, "run", fake_run)
+
+    services = compose.collect_service_statuses("/data/app")
+    compose._compose_cmd = None
+
+    assert [(s["containerId"], s["startedAt"]) for s in services] == [("c1", None)]

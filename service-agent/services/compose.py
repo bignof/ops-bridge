@@ -77,14 +77,41 @@ def update_image_in_compose(compose_file, new_image):
     return updated
 
 
-def _is_one_off(entry):
-    """`docker compose run` 起的一次性容器（label com.docker.compose.oneoff=True）不是部署实例，不参与巡检。"""
+ONE_OFF_LABEL = 'com.docker.compose.oneoff'
+# docker inspect 一次取启动时间和一次性容器标签；label 不存在时 index 返回空串
+_INSPECT_FORMAT = '{{.State.StartedAt}}|{{index .Config.Labels "' + ONE_OFF_LABEL + '"}}'
+
+
+def _one_off_from_labels(entry):
+    """按 compose ps 输出里的 Labels 判断是否 `docker compose run` 起的一次性容器（label oneoff=True）。
+    没有 Labels 字段（compose 2.21 之前的 JSON 数组输出就没有）返回 None，由 docker inspect 的结果补判。"""
     labels = entry.get('Labels')
     if isinstance(labels, dict):
-        return str(labels.get('com.docker.compose.oneoff', '')).lower() == 'true'
+        return str(labels.get(ONE_OFF_LABEL, '')).lower() == 'true'
     if isinstance(labels, str):
-        return any(part.strip().lower() == 'com.docker.compose.oneoff=true' for part in labels.split(','))
-    return False
+        return any(part.strip().lower() == f'{ONE_OFF_LABEL}=true' for part in labels.split(','))
+    return None
+
+
+def _inspect_container(container_id):
+    """返回 (startedAt, oneOff)。从未启动过的容器（created）StartedAt 是 Go 零值 0001-01-01，
+    当成没有启动时间上报，否则 hub 会把它当作「比上次更旧的上报」丢掉。inspect 失败两项都是 None。"""
+    try:
+        result = subprocess.run(
+            ['docker', 'inspect', '--format', _INSPECT_FORMAT, container_id],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return None, None
+    if result.returncode != 0:
+        return None, None
+    started_at, _, one_off = result.stdout.strip().partition('|')
+    started_at = started_at.strip()
+    if not started_at or started_at.startswith('0001-01-01'):
+        started_at = None
+    return started_at, one_off.strip().lower() == 'true'
 
 
 def collect_service_statuses(compose_dir):
@@ -97,6 +124,7 @@ def collect_service_statuses(compose_dir):
     hub 既收不到 exited 也就发不出劣化告警，只会在 6 分钟后误报「agent 可能离线」。
     compose ps 本身失败（目录没有 compose 文件/容器未创建）返回空列表，调用方按"这轮跳过"处理。
     单个容器 inspect 失败只影响该 service 的 startedAt（置 None），不影响其它字段、不影响其它 service。
+    运行中的容器排在前面：旧版 hub 直接拿第一个当主容器，--all 带出的已退出初始化容器排到前面会被误认。
     """
     cmd = _get_compose_cmd() + ['ps', '--all', '--format', 'json']
     try:
@@ -120,22 +148,17 @@ def collect_service_statuses(compose_dir):
 
     services = []
     for entry in entries:
-        if not isinstance(entry, dict) or _is_one_off(entry):
+        if not isinstance(entry, dict):
+            continue
+        one_off = _one_off_from_labels(entry)
+        if one_off:
             continue
         container_id = entry.get('ID')
         started_at = None
         if container_id:
-            try:
-                inspect_result = subprocess.run(
-                    ['docker', 'inspect', '--format', '{{.State.StartedAt}}', container_id],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                if inspect_result.returncode == 0:
-                    started_at = inspect_result.stdout.strip() or None
-            except Exception:
-                started_at = None
+            started_at, inspected_one_off = _inspect_container(container_id)
+            if one_off is None and inspected_one_off:
+                continue
         services.append(
             {
                 'name': entry.get('Service'),
@@ -147,6 +170,7 @@ def collect_service_statuses(compose_dir):
                 'raw': entry,
             }
         )
+    services.sort(key=lambda service: 0 if service['state'] == 'running' else 1)  # 稳定排序，同类保持原顺序
     return services
 
 

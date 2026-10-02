@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 import requests
+from urllib3.exceptions import MaxRetryError, NewConnectionError, ProtocolError
 
 from services import app_http
 
@@ -74,6 +75,87 @@ def test_drain_reports_connection_error(monkeypatch: pytest.MonkeyPatch) -> None
 
     assert ok is False
     assert "refused" in message
+
+
+def _raise(exc):
+    def fake_post(url, headers, timeout):
+        raise exc
+
+    return fake_post
+
+
+def _refused():
+    """requests 对「连接被拒」的真实形态：ConnectionError(MaxRetryError(reason=NewConnectionError))。"""
+    reason = NewConnectionError(None, "Failed to establish a new connection: [Errno 111] Connection refused")
+    return requests.ConnectionError(MaxRetryError(None, "/api/k8s/shutdown", reason=reason))
+
+
+@pytest.mark.parametrize(
+    "exc,expected",
+    [
+        (_refused(), app_http.DRAIN_FAILED),  # 连不上：请求肯定没送到
+        (requests.ConnectTimeout("connect timed out"), app_http.DRAIN_FAILED),
+        (requests.ReadTimeout("Read timed out."), app_http.DRAIN_UNKNOWN),  # 应用可能还在排空
+        (requests.ConnectionError(ProtocolError("Connection aborted.", ConnectionResetError())), app_http.DRAIN_UNKNOWN),
+        (requests.exceptions.InvalidURL("bad url"), app_http.DRAIN_FAILED),
+        (KeyError("unexpected"), app_http.DRAIN_UNKNOWN),
+    ],
+)
+def test_drain_outcome_classifies_transport_errors(monkeypatch: pytest.MonkeyPatch, exc, expected) -> None:
+    monkeypatch.setattr(app_http.requests, "post", _raise(exc))
+
+    outcome, message = app_http.drain_outcome(13099)
+
+    assert outcome == expected
+    assert message
+
+
+@pytest.mark.parametrize(
+    "status,body,expected",
+    [
+        (200, {"success": True}, app_http.DRAINED),
+        (200, ["not", "an", "object"], app_http.DRAINED),
+        (200, {"success": False, "message": "boom"}, app_http.DRAIN_UNKNOWN),  # 关闭标志可能已打上
+        (403, None, app_http.DRAIN_FAILED),  # token 不对，应用没动手
+        (404, None, app_http.DRAIN_FAILED),
+        (500, None, app_http.DRAIN_UNKNOWN),
+    ],
+)
+def test_drain_outcome_classifies_responses(monkeypatch: pytest.MonkeyPatch, status, body, expected) -> None:
+    monkeypatch.setattr(
+        app_http.requests,
+        "post",
+        lambda url, headers, timeout: SimpleNamespace(status_code=status, text=str(body), json=lambda: body),
+    )
+
+    assert app_http.drain_outcome(13099)[0] == expected
+
+
+def test_drain_outcome_non_json_200_counts_as_drained(monkeypatch: pytest.MonkeyPatch) -> None:
+    def bad_json():
+        raise ValueError("not json")
+
+    monkeypatch.setattr(
+        app_http.requests, "post", lambda url, headers, timeout: SimpleNamespace(status_code=200, text="ok", json=bad_json)
+    )
+
+    assert app_http.drain_outcome(13099) == (app_http.DRAINED, "drained (non-JSON response)")
+
+
+@pytest.mark.parametrize("status,expected", [(200, "ready"), (503, "not_ready"), (404, "unknown")])
+def test_readiness_state_maps_status(monkeypatch: pytest.MonkeyPatch, status, expected) -> None:
+    monkeypatch.setattr(app_http.requests, "get", lambda url, timeout: SimpleNamespace(status_code=status))
+
+    assert app_http.readiness_state(13099) == expected
+
+
+def test_readiness_state_unreachable_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_get(url, timeout):
+        raise requests.ConnectionError("refused")
+
+    monkeypatch.setattr(app_http.requests, "get", fake_get)
+
+    assert app_http.readiness_state(13099) == "unknown"
 
 
 def test_wait_healthy_succeeds_immediately(monkeypatch: pytest.MonkeyPatch) -> None:

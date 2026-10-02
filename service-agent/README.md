@@ -57,7 +57,7 @@ service-agent（容器）
 | `WS_URL`              | 控制台 WebSocket 地址         | `ws://192.168.1.10:13000/ws/agent`                   |
 | `AGENT_ID`            | Agent 唯一标识                | `prod-server-01`                                     |
 | `AGENT_KEY`           | Hub 为该 agent 签发的独立 key | `hub-issued-agent-key`                               |
-| `AGENT_AUTH_MODE`     | key 的传递方式：`auto`（默认，先用 `X-Agent-Key` 请求头，旧版 Hub 拒绝时自动改用 URL 参数）、`header`、`query` | `auto` |
+| `AGENT_AUTH_MODE`     | key 的传递方式：`auto`（默认，先用 `X-Agent-Key` 请求头，只认 URL 参数的旧版 Hub 拒绝时改用 URL 参数，Hub 升级后自动切回请求头；key 本身被拒时不回退）、`header`、`query` | `auto` |
 | `RECONNECT_DELAY`     | 断线重连间隔（秒），默认 `5`  | `5`                                                  |
 | `HEARTBEAT_INTERVAL`  | 心跳间隔（秒），默认 `30`     | `30`                                                 |
 | `STATUS_REPORT_INTERVAL` | 定时巡检上报间隔（秒），默认 `120` | `120`                                          |
