@@ -182,10 +182,13 @@ def test_heartbeat_flushes_outbox(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(module, "send_message", fake_send_message)
     monkeypatch.setattr(module.outbox, "flush", lambda **kw: flush_calls.append(kw))
     monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+    cleanup_calls: list[bool] = []
+    monkeypatch.setattr(module.agent_upgrade, "cleanup_executor", lambda: cleanup_calls.append(True))
 
     module._start_heartbeat(ws)
 
     assert len(flush_calls) == 1  # 每个心跳周期补投一次(按退避)
+    assert cleanup_calls == [True]  # 升级结束后由心跳删除已退出的执行器容器
 
 
 def test_connect_builds_websocket_app_and_runs_forever(monkeypatch: pytest.MonkeyPatch) -> None:

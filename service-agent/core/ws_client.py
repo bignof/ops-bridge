@@ -189,6 +189,7 @@ def _start_heartbeat(ws):
                 send_message(ws, {'type': 'heartbeat', 'ts': time.time()})
                 agent_upgrade.reconcile_stale_job()
                 agent_upgrade.recover_launch()
+                agent_upgrade.cleanup_executor()
                 agent_upgrade.report(ws)
                 outbox.flush()  # 按退避补投未确认 result(连接存续但此前发送失败/ack 丢失的场景)
 

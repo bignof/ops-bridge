@@ -21,6 +21,7 @@ def isolated(monkeypatch):
     monkeypatch.setattr(u, '_runtime_checked_at', 0.0)
     monkeypatch.setattr(u, '_active', 0)
     monkeypatch.setattr(u, '_starting', False)
+    monkeypatch.setattr(u, '_cleaned_request', None)
     monkeypatch.setenv('AGENT_ID', 'test-agent')
     monkeypatch.setitem(sys.modules, 'fcntl', SimpleNamespace(LOCK_EX=1, LOCK_NB=2, flock=lambda *a: None))
 
@@ -742,3 +743,69 @@ def test_runtime_reports_capabilities_with_or_without_self_upgrade(monkeypatch):
     assert runtime['selfUpgrade'] is False
     assert runtime['capabilities'] == list(CAPABILITIES)
     assert {'drain_restart', 'status_all', 'header_auth'} <= set(runtime['capabilities'])
+
+
+def _executor(state, owner=None):
+    return {'State': state, 'Config': {'Labels': {'orchidea.agent-upgrader': owner or u.state_root().name,
+                                                  'orchidea.agent-upgrade-request': RID}}}
+
+
+@pytest.mark.parametrize('status', sorted(u.TERMINAL))
+def test_cleanup_removes_finished_executor_once(monkeypatch, status):
+    u.save_job(u.state_root(), {'requestId': RID}, status)
+    calls = []
+    monkeypatch.setattr(u, 'docker', lambda *a, **k: calls.append(a) or ('helper-id' if a[0] == 'ps' else ''))
+    monkeypatch.setattr(u, 'inspect_container', lambda name: _executor({'Running': False, 'Status': 'exited'}))
+    u.cleanup_executor()
+    assert ('rm', 'agent-upgrader-' + u.state_root().name) in calls
+    count = len(calls)
+    u.cleanup_executor()
+    assert len(calls) == count  # 已清理的任务不再每次心跳查 Docker
+
+
+@pytest.mark.parametrize('state', [{'Running': True}, {'Running': False, 'Restarting': True},
+                                   {'Running': False, 'Status': 'restarting'}])
+def test_cleanup_waits_for_executor_to_exit(monkeypatch, state):
+    u.save_job(u.state_root(), {'requestId': RID}, 'success')
+    calls = []
+    monkeypatch.setattr(u, 'docker', lambda *a, **k: calls.append(a) or 'helper-id')
+    current = {'state': state}
+    monkeypatch.setattr(u, 'inspect_container', lambda name: _executor(current['state']))
+    u.cleanup_executor()
+    assert not any(c[0] == 'rm' for c in calls)
+    current['state'] = {'Running': False, 'Status': 'exited'}  # 执行器写完终态后退出
+    u.cleanup_executor()
+    assert any(c[0] == 'rm' for c in calls)
+
+
+def test_cleanup_skips_foreign_container_and_missing_executor(monkeypatch):
+    u.save_job(u.state_root(), {'requestId': RID}, 'success')
+    calls = []
+    monkeypatch.setattr(u, 'docker', lambda *a, **k: calls.append(a) or 'helper-id')
+    monkeypatch.setattr(u, 'inspect_container', lambda name: _executor({'Running': False}, owner='foreign'))
+    u.cleanup_executor()
+    assert not any(c[0] == 'rm' for c in calls)
+    other = RID.replace('1', 'c')
+    u.save_job(u.state_root(), {'requestId': other}, 'failed')
+    monkeypatch.setattr(u, 'docker', lambda *a, **k: calls.append(a) or '')
+    u.cleanup_executor()
+    assert u._cleaned_request == other and not any(c[0] == 'rm' for c in calls)
+
+
+@pytest.mark.parametrize('status', ['waiting', 'pulling', 'switching', 'verifying', 'rolling_back', 'unknown'])
+def test_cleanup_never_touches_unfinished_upgrade(monkeypatch, status):
+    u.save_job(u.state_root(), {'requestId': RID}, status)
+    docker = Mock()
+    monkeypatch.setattr(u, 'docker', docker)
+    u.cleanup_executor()
+    u.save_job(u.state_root(), {'requestId': RID}, 'success')
+    monkeypatch.setattr(u, '_starting', True)  # 新升级正在启动：它自己会处理旧执行器
+    u.cleanup_executor()
+    docker.assert_not_called()
+
+
+def test_cleanup_retries_when_docker_unavailable(monkeypatch):
+    u.save_job(u.state_root(), {'requestId': RID}, 'success')
+    monkeypatch.setattr(u, 'docker', Mock(side_effect=RuntimeError('daemon unavailable')))
+    u.cleanup_executor()
+    assert u._cleaned_request is None

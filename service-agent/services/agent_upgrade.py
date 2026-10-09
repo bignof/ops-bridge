@@ -25,6 +25,8 @@ _runtime_checked_at = 0.0
 RUNTIME_RETRY_SECONDS = 60
 # 执行器已退出、任务仍停在非终态超过此时长，按当前运行镜像收敛（执行器正常推进时每一步都会刷新 updatedAt）
 STALE_JOB_SECONDS = 120
+# 已确认不再残留执行器的任务；终态后心跳不再反复查询 Docker
+_cleaned_request = None
 _boot_id = str(uuid.uuid4())
 logger = logging.getLogger(__name__)
 
@@ -332,6 +334,34 @@ def reconcile_stale_job():
             # Docker 不可用时不能判断执行器是否仍在运行，保留任务等待下一次心跳
             logger.warning('升级任务状态暂时无法核对，等待下一次心跳')
             return False
+
+
+def cleanup_executor():
+    """任务到终态后删除已退出的执行器容器。
+
+    执行器带重启策略，不能用 --rm 自动删除；否则会一直残留到下一次升级。
+    只删本 Agent 的执行器（标签核对）；运行或重启中的、正在启动新升级时都不动，
+    Docker 不可用时下一次心跳再试。持锁执行，避免与 start_upgrade 清理旧执行器互相踩。
+    """
+    global _cleaned_request
+    with _guard:
+        job = job_state()
+        request_id = job.get('requestId')
+        if _starting or job.get('status') not in TERMINAL or request_id == _cleaned_request:
+            return
+        try:
+            root = state_root()
+            helper = 'agent-upgrader-' + root.name
+            if docker('ps', '-aq', '--filter', 'name=^/' + helper + '$'):
+                info = inspect_container(helper)
+                state = info['State']
+                if state.get('Running') or state.get('Restarting') or state.get('Status') == 'restarting':
+                    return
+                if (info['Config'].get('Labels') or {}).get('orchidea.agent-upgrader') == root.name:
+                    docker('rm', helper)
+            _cleaned_request = request_id
+        except Exception:
+            logger.warning('升级执行器暂时无法清理，等待下一次心跳')
 
 
 @contextlib.contextmanager
