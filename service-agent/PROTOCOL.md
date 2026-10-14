@@ -198,6 +198,7 @@ Agent 每 `STATUS_REPORT_INTERVAL` 秒、命令结束后以及每条新连接收
 - 一个部署有多个服务时，Hub 按部署记录的镜像仓库认定主服务，其次按实例名、上次记录的容器名（与容器名相同才算）；都认不出时优先取运行中的，最后才取第一个。实例名排在前面，是为了在认错后（如锁在已退出的初始化容器上）能把实例名改成主容器名来纠正。
 - `plugins` 是容器内插件盘点与最近一次启动同步回执，字段定义见 plugin-hub `plugin-inventory.ts`。
 - `plugins.opsGuard` 是业务服务写在插件目录 `.hub-ops-guard.json` 的运维口令保护状态 `{schemaVersion, mode, state, reason, startedAt, updatedAt}`（`@orchisky/plugin-ops-guard` 写入，Agent 只保留这几个字段）。读不到时为 `null`，`plugins.opsGuardError` 说明原因：`missing`（没有该文件，例如镜像不带守卫插件）、`stale`（文件早于本次容器启动，例如镜像回滚后残留）、`invalid`（超过 4KB、符号链接或格式不对）。
+- `.hub-ops-guard.json` 的格式要求（写入方必须遵守，任一不满足整份按 `invalid` 处理，Agent 不细分是哪个字段）：UTF-8 JSON 对象，`schemaVersion` 为 `1`；`mode`、`state` 为小写字母开头、只含小写字母、数字和下划线、不超过 64 个字符的代码（`^[a-z][a-z0-9_]{0,63}$`），`reason` 为同样格式的代码或 `null`；`startedAt`、`updatedAt` 为不超过 64 个字符的 ISO 8601 时间字符串（容器启动时间已知时，`startedAt` 解析不了或早于容器启动 2 秒以上记 `stale`）。其他字段忽略。
 
 ## 6. 插件清单
 
