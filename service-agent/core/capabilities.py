@@ -13,4 +13,5 @@ CAPABILITIES = (
     'logfile',          # logfile_list / logfile_fetch / logfile_follow / logfile_unfollow
     'compose_inspect',  # compose_discover / compose_inspect
     'plugin_ops',       # plugin_scan / plugin_remove / plugin_restore
+    'ops_code',         # 本机 /verifyOpsCode → ops_code_verify / ops_code_verify_result（PROTOCOL.md 第 10 节）
 )
