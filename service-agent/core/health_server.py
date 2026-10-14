@@ -1,18 +1,61 @@
 import hmac
 import json
 import logging
+import re
 import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from config import AGENT_ID, AGENT_LOCAL_SECRET, CHINA_TZ, HEALTH_HOST, HEALTH_PORT
-from core import plugin_query
+from core import ops_code, plugin_query
 from core.handlers import get_command_execution_state
 from core.ws_client import get_connection_state
 
 logger = logging.getLogger(__name__)
 
 QUERY_PLUGIN_TIMEOUT = 8.0  # 必须 < 15s（sync-plugins.js:201 硬编码客户端超时上限）
+VERIFY_BODY_LIMIT = 4096
+OPERATION_RE = re.compile(r'^[A-Za-z0-9_.-]{1,64}:[A-Za-z0-9_.-]{1,64}$')
+
+
+def _text(value, low, high):
+    return isinstance(value, str) and low <= len(value) <= high
+
+
+def parse_verify_body(raw):
+    """校验 /verifyOpsCode 的请求体，只保留协议字段返回；长度按字符计。不合法抛 ValueError。"""
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError('body')
+    service, code, operation = payload.get('service'), payload.get('code'), payload.get('operation')
+    if (not _text(service, 1, 255) or not _text(code, 1, 64)
+            or not isinstance(operation, str) or not OPERATION_RE.fullmatch(operation)):
+        raise ValueError('fields')
+    fields = {'service': service, 'code': code, 'operation': operation}
+    label = payload.get('operationLabel')
+    if label is not None:
+        if not _text(label, 0, 64):
+            raise ValueError('operationLabel')
+        fields['operationLabel'] = label
+    operator = payload.get('operator')
+    if not isinstance(operator, dict):
+        raise ValueError('operator')
+    user_id, name, ip = operator.get('userId'), operator.get('name'), operator.get('ip')
+    valid_id = (isinstance(user_id, int) and not isinstance(user_id, bool) and 0 <= user_id < 2 ** 63) \
+        or _text(user_id, 1, 64)
+    if not valid_id or (name is not None and not _text(name, 0, 128)) or (ip is not None and not _text(ip, 0, 64)):
+        raise ValueError('operator')
+    fields['operator'] = {'userId': user_id, 'name': name or '', 'ip': ip or ''}
+    file = payload.get('file')
+    if file is not None:
+        if not isinstance(file, dict):
+            raise ValueError('file')
+        file_name, size = file.get('name'), file.get('size')
+        if (not _text(file_name, 0, 255) or isinstance(size, bool) or not isinstance(size, int)
+                or not 0 <= size <= 2 ** 53):
+            raise ValueError('file')
+        fields['file'] = {'name': file_name, 'size': size}
+    return fields
 
 
 def _format_timestamp(value):
@@ -23,6 +66,8 @@ def _format_timestamp(value):
 
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_POST(self):
+        if self.path == '/verifyOpsCode':
+            return self._handle_verify_ops_code()
         if self.path != '/pluginSyncChanged':
             self.send_response(404)
             self.end_headers()
@@ -131,6 +176,44 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _handle_verify_ops_code(self):
+        if not AGENT_LOCAL_SECRET:
+            logger.warning('verifyOpsCode 拒绝请求：AGENT_LOCAL_SECRET 未配置')
+            self.send_response(403)
+            self.end_headers()
+            return
+        supplied = self.headers.get('X-Agent-Secret') or ''
+        if not hmac.compare_digest(supplied.encode('utf-8'), AGENT_LOCAL_SECRET.encode('utf-8')):
+            self.send_response(401)
+            self.end_headers()
+            return
+        try:
+            length = int(self.headers.get('Content-Length') or '0')
+            if length <= 0 or length > VERIFY_BODY_LIMIT:
+                raise ValueError('length')
+            fields = parse_verify_body(self.rfile.read(length))
+        except (ValueError, TypeError, RecursionError):
+            self.send_response(400)
+            self.end_headers()
+            return
+        status, body = ops_code.verify(fields)
+        outcome = body.get('valid') if status == 200 and isinstance(body, dict) else (body or {}).get('reason')
+        # 只记服务、操作和结果，绝不记口令
+        logger.info('verifyOpsCode service=%r operation=%s status=%s result=%s',
+                    fields['service'], fields['operation'], status, outcome)
+        self._send_json(status, body)
+
+    def _send_json(self, status, body):
+        self.send_response(status)
+        if body is None:
+            self.end_headers()
+            return
+        data = json.dumps(body).encode('utf-8')
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def log_message(self, format, *args):
         return
