@@ -215,3 +215,36 @@ def test_all_container_listing_validates_ids_and_json(monkeypatch):
         plugins.all_containers()
     monkeypatch.setattr(plugins, '_run', lambda args: 'a'*64 if args[0]=='ps' else '[{"Id":"a"}]')
     assert plugins.all_containers() == [{'Id':'a'}]
+
+
+def _guard(started_at):
+    return {'schemaVersion': 1, 'mode': 'local', 'state': 'ready', 'reason': None,
+            'startedAt': started_at, 'updatedAt': started_at}
+
+
+def test_ops_guard_status_from_current_boot_is_kept(setup):
+    files.atomic_json(setup.root / files.OPS_GUARD_FILE, _guard(files.utc_stamp(time.time() - 30)))
+    result = plugins.collect_inventory(setup.info, [setup.info])
+    assert result['opsGuard']['mode'] == 'local' and result['opsGuardError'] is None
+
+
+@pytest.mark.parametrize('started_at', ['2000-01-01T00:00:00.000Z', 'garbage'])
+def test_ops_guard_status_older_than_container_is_stale(setup, started_at):
+    files.atomic_json(setup.root / files.OPS_GUARD_FILE, _guard(started_at))
+    result = plugins.collect_inventory(setup.info, [setup.info])
+    assert result['opsGuard'] is None and result['opsGuardError'] == 'stale'
+
+
+def test_ops_guard_status_kept_when_container_start_unknown(setup):
+    setup.info['State']['StartedAt'] = None
+    files.atomic_json(setup.root / files.OPS_GUARD_FILE, _guard('2000-01-01T00:00:00.000Z'))
+    result = plugins.collect_inventory(setup.info, [setup.info])
+    assert result['opsGuard']['mode'] == 'local'
+
+
+def test_ops_guard_status_compares_js_and_docker_timestamps(setup):
+    setup.info['State']['StartedAt'] = '2026-10-13T08:00:00.123456789Z'          # Docker：纳秒 + Z
+    files.atomic_json(setup.root / files.OPS_GUARD_FILE, _guard('2026-10-13T08:00:03.456Z'))  # JS toISOString
+    assert plugins.collect_inventory(setup.info, [setup.info])['opsGuardError'] is None
+    files.atomic_json(setup.root / files.OPS_GUARD_FILE, _guard('2026-10-13T07:59:57.000Z'))
+    assert plugins.collect_inventory(setup.info, [setup.info])['opsGuardError'] == 'stale'

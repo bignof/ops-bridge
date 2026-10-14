@@ -174,6 +174,12 @@ def collect_inventory(info, containers, mounts=None):
         report = inventory.get('sync') or {}
         report_start, container_start = _epoch(report.get('startedAt')), _epoch(identity['containerStartedAt'])
         current = report_start is not None and container_start is not None and report_start >= container_start - 2
+        guard = inventory.get('opsGuard')
+        guard_start = _epoch(guard.get('startedAt')) if guard else None
+        if guard and container_start is not None and (guard_start is None or guard_start < container_start - 2):
+            # 镜像回滚等情况残留的旧状态文件：早于本次容器启动，按「未上报」处理
+            inventory['opsGuard'] = None
+            inventory['opsGuardError'] = 'stale'
         inventory.update(identity)
         inventory.update(mount)
         inventory['sharedWith'] = shared

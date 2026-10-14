@@ -14,6 +14,9 @@ import time
 import uuid
 
 REPORT_FILE = '.hub-plugin-sync.json'
+OPS_GUARD_FILE = '.hub-ops-guard.json'   # 服务写的运维口令保护状态（plugin-ops-guard），随盘点上报
+OPS_GUARD_MAX_BYTES = 4096
+OPS_GUARD_TOKEN_RE = re.compile(r'^[a-z][a-z0-9_]{0,63}$')
 LOCK_FILE = '.hub-plugin-operation.lock'
 TRASH_DIR = '.hub-plugin-trash'
 MAX_JSON_BYTES = 256 * 1024
@@ -246,6 +249,27 @@ def cleanup_expired(root):
             continue
 
 
+def read_ops_guard(root):
+    """读口令保护状态文件，返回 (净化后的状态, 错误代码)；错误代码为 missing / invalid。只留约定字段。"""
+    try:
+        value, _, _ = read_json(checked_path(root, OPS_GUARD_FILE), limit=OPS_GUARD_MAX_BYTES)
+    except PluginFileError as exc:
+        return None, 'missing' if exc.code == 'not_found' else 'invalid'
+    except FileNotFoundError:
+        return None, 'missing'
+    except (OSError, ValueError):
+        return None, 'invalid'
+    reason = value.get('reason')
+    tokens_ok = all(isinstance(value.get(key), str) and OPS_GUARD_TOKEN_RE.fullmatch(value[key])
+                    for key in ('mode', 'state'))
+    reason_ok = reason is None or (isinstance(reason, str) and OPS_GUARD_TOKEN_RE.fullmatch(reason))
+    times_ok = all(isinstance(value.get(key), str) and len(value[key]) <= 64 for key in ('startedAt', 'updatedAt'))
+    if value.get('schemaVersion') != 1 or not tokens_ok or not reason_ok or not times_ok:
+        return None, 'invalid'
+    return {'schemaVersion': 1, 'mode': value['mode'], 'state': value['state'], 'reason': reason,
+            'startedAt': value['startedAt'], 'updatedAt': value['updatedAt']}, None
+
+
 def scan_plugins(root):
     root = checked_root(root)
     names, excluded = [], 0
@@ -277,9 +301,11 @@ def scan_plugins(root):
     except (OSError, ValueError, PluginFileError) as exc:
         report = None
         report_error = '尚无同步回执' if isinstance(exc, (FileNotFoundError, PluginFileError)) and getattr(exc, 'code', 'not_found') == 'not_found' else '同步回执无法读取'
+    ops_guard, ops_guard_error = read_ops_guard(root)
     return {'schemaVersion': 1, 'status': 'ok', 'scannedAt': utc_stamp(), 'entries': entries, 'errors': errors,
             'truncated': len(names) > MAX_PLUGINS, 'excludedCount': excluded, 'sync': report,
-            'syncError': report_error, 'recycle': list_trash(root)}
+            'syncError': report_error, 'recycle': list_trash(root),
+            'opsGuard': ops_guard, 'opsGuardError': ops_guard_error}
 
 
 def remove_plugin(root, name, expected_fingerprint, request_id, on_remove=None, on_rollback=None, on_inspect=None):

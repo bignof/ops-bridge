@@ -394,3 +394,48 @@ def test_prepared_delete_does_not_unlink_new_replacement(root):
     put(root, version='2')
     with pytest.raises(files.PluginFileError, match='新文件'):
         files.remove_plugin(root, entry['name'], entry['fingerprint'], str(request), on_remove=lambda: pytest.fail('must not unlink'))
+
+
+GUARD = {'schemaVersion': 1, 'mode': 'hub', 'state': 'ready', 'reason': None,
+         'startedAt': '2026-10-13T01:00:00.000Z', 'updatedAt': '2026-10-13T01:00:05.000Z'}
+
+
+def test_ops_guard_status_is_read_and_sanitized(root):
+    files.atomic_json(root / files.OPS_GUARD_FILE, {**GUARD, 'extra': 'x' * 100})
+    result = files.scan_plugins(root)
+    assert result['opsGuard'] == GUARD and result['opsGuardError'] is None
+    assert all(not entry['name'].startswith('.') for entry in result['entries'])
+
+
+def test_missing_ops_guard_status_is_reported_as_missing(root):
+    result = files.scan_plugins(root)
+    assert result['opsGuard'] is None and result['opsGuardError'] == 'missing'
+
+
+@pytest.mark.parametrize('value', [
+    {**GUARD, 'schemaVersion': 2}, {**GUARD, 'mode': 'HUB'}, {**GUARD, 'state': ''},
+    {**GUARD, 'reason': 'bad reason'}, {**GUARD, 'reason': 1}, {**GUARD, 'startedAt': 1},
+    {**GUARD, 'updatedAt': 'x' * 65}, ['not', 'a', 'dict'],
+])
+def test_invalid_ops_guard_status(root, value):
+    (root / files.OPS_GUARD_FILE).write_text(json.dumps(value), encoding='utf-8')
+    result = files.scan_plugins(root)
+    assert result['opsGuard'] is None and result['opsGuardError'] == 'invalid'
+
+
+def test_oversized_or_garbled_ops_guard_status(root):
+    (root / files.OPS_GUARD_FILE).write_bytes(b' ' * (files.OPS_GUARD_MAX_BYTES + 1))
+    assert files.scan_plugins(root)['opsGuardError'] == 'invalid'
+    (root / files.OPS_GUARD_FILE).write_bytes(b'\xff\xfe not json')
+    assert files.scan_plugins(root)['opsGuardError'] == 'invalid'
+
+
+def test_symlinked_ops_guard_status_is_rejected(root, tmp_path):
+    target = tmp_path / 'elsewhere.json'
+    target.write_text(json.dumps(GUARD), encoding='utf-8')
+    try:
+        (root / files.OPS_GUARD_FILE).symlink_to(target)
+    except OSError:
+        pytest.skip('本机无符号链接权限，Linux 验收覆盖此分支')
+    result = files.scan_plugins(root)
+    assert result['opsGuard'] is None and result['opsGuardError'] == 'invalid'
