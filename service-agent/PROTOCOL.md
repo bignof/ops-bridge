@@ -14,7 +14,7 @@
 - Hub 判定：请求带了 `X-Agent-Key` 就只认请求头，不再看 URL 参数；没带请求头才读 `?key=`。鉴权失败以 close code `1008` 断开，reason 区分 key 从哪来：
   - `auth failed: header`：请求头里的 key 被拒（AGENT_ID 不存在或 key 不匹配）。
   - `auth failed`：URL 参数里的 key 被拒，或没带 key。只认 `?key=` 的旧版 Hub 对带请求头的连接也回这个（它没读请求头）。
-- 鉴权通过后 Hub 先发 `{"type": "hub_hello", "features": ["header_auth"]}`，声明认识请求头。旧版 Hub 不发。
+- 鉴权通过后 Hub 先发 `{"type": "hub_hello", "features": ["header_auth", "ops_code"]}`。`features` 声明 Hub 支持的连接特性：`header_auth` 表示认识请求头（本节），`ops_code` 表示支持运维口令校验（第 10 节）。旧版 Hub 不发 `hub_hello`，或 `features` 里没有后加的特性。
 - Agent 的 `AGENT_AUTH_MODE`：
   - `auto`（默认）：先用请求头。
     - 带请求头被 `auth failed` 拒绝：Hub 没读请求头（旧版 Hub，或新版 Hub 被回滚），改用 URL 参数重连。不管此前请求头是否被接受过。
@@ -38,7 +38,7 @@ Agent 连上后立即上报，并随每次心跳重复上报 `agent_report`：
     "image": "oci.example.com/service-agent@sha256:…",
     "imageId": "sha256:…",
     "selfUpgrade": true,
-    "capabilities": ["drain_restart", "status_all", "header_auth", "logfile", "compose_inspect", "plugin_ops"]
+    "capabilities": ["drain_restart", "status_all", "header_auth", "logfile", "compose_inspect", "plugin_ops", "ops_code"]
   },
   "upgrade": {
     "requestId": "…",
@@ -74,6 +74,7 @@ Agent 连上后立即上报，并随每次心跳重复上报 `agent_report`：
 | `logfile` | 支持 `logfile_*` 日志文件协议 | 缺失时 `logfile_*` 直接返回「不支持」 |
 | `compose_inspect` | 支持 `compose_discover` / `compose_inspect` | 同上 |
 | `plugin_ops` | 支持 `plugin_scan` / `plugin_remove` / `plugin_restore` 命令 | 同上 |
+| `ops_code` | 支持本机 `/verifyOpsCode` 与 `ops_code_verify` 帧（第 10 节） | 仅展示、排障和发布前检查用；Hub 是否下发结果只看自己，不看这个能力 |
 
 规则：
 
@@ -101,6 +102,7 @@ Agent 连上后立即上报，并随每次心跳重复上报 `agent_report`：
 | `logs_start` / `logs_stop` 与 `logs_*` | ↓ / ↑ | — | `docker compose logs -f` 实时流，见第 7 节 |
 | `logfile_*` | ↓ / ↑ | `logfile` | 日志文件列表、归档上传、实时跟随，见第 8 节 |
 | `compose_discover` / `compose_inspect` 与结果帧 | ↓ / ↑ | `compose_inspect` | 只读扫描 compose 项目，见第 9 节 |
+| `ops_code_verify` / `ops_code_verify_result` | ↑ / ↓ | —（Hub 须在 `hub_hello` 声明 `ops_code`） | 运维口令校验，见第 10 节 |
 
 ## 4. 命令
 
@@ -195,6 +197,7 @@ Agent 每 `STATUS_REPORT_INTERVAL` 秒、命令结束后以及每条新连接收
 - 从未启动过的容器（created）没有启动时间，`startedAt` 为 `null`（不上报 Docker 的零值 `0001-01-01T00:00:00Z`）。
 - 一个部署有多个服务时，Hub 按部署记录的镜像仓库认定主服务，其次按实例名、上次记录的容器名（与容器名相同才算）；都认不出时优先取运行中的，最后才取第一个。实例名排在前面，是为了在认错后（如锁在已退出的初始化容器上）能把实例名改成主容器名来纠正。
 - `plugins` 是容器内插件盘点与最近一次启动同步回执，字段定义见 plugin-hub `plugin-inventory.ts`。
+- `plugins.opsGuard` 是业务服务写在插件目录 `.hub-ops-guard.json` 的运维口令保护状态 `{schemaVersion, mode, state, reason, startedAt, updatedAt}`（`@orchisky/plugin-ops-guard` 写入，Agent 只保留这几个字段）。读不到时为 `null`，`plugins.opsGuardError` 说明原因：`missing`（没有该文件，例如镜像不带守卫插件）、`stale`（文件早于本次容器启动，例如镜像回滚后残留）、`invalid`（超过 4KB、符号链接或格式不对）。
 
 ## 6. 插件清单
 
@@ -259,3 +262,63 @@ Agent 回：`logs_started {sessionId, tail, timestamps}`、`logs_chunk {sessionI
 | `compose_inspect_result` | ↑ | `requestId`, `dir`, `composeFile`, `services: [{name, containerName, image, ports}]`, `error?` |
 
 发现只扫 `PROJECTS_ROOT` 向下 3 层、跳过 `.` 开头目录与 `node_modules`、找到项目不再下钻、最多 200 个；两者都只读文件、不执行 docker。错误码：`not_found` / `invalid` / `io_error`。
+
+## 10. 运维口令校验（ops_code_*）
+
+业务服务（`@orchisky/plugin-ops-guard` 的 hub 模式）在放行备份还原、迁移等受控操作前，经本机 Agent 请 Hub 校验运维口令。口令按环境（namespace）区分，由 Hub 的动态码服务按环境派生。
+
+**本机端点** `POST http://<Agent>:18081/verifyOpsCode`
+
+- 鉴权：请求头 `X-Agent-Secret`，与 `/queryPlugin`、`/pluginSyncChanged` 相同（恒时比较）。`AGENT_LOCAL_SECRET` 未配置时 403，不符时 401。
+- 请求体：JSON，不超过 4KB，不合法返回 400。长度一律按字符计。
+
+  | 字段 | 要求 |
+  | --- | --- |
+  | `service` | 服务编码，1～255 个字符 |
+  | `code` | 口令，1～64 个字符 |
+  | `operation` | 受控操作标识，匹配 `^[A-Za-z0-9_.-]{1,64}:[A-Za-z0-9_.-]{1,64}$` |
+  | `operationLabel` | 可选，操作名，不超过 64 个字符 |
+  | `operator` | `{userId, name, ip}`：userId 为非负整数或 1～64 个字符的字符串；name 不超过 128 个字符，ip 不超过 64 个字符，可省略 |
+  | `file` | 可选，`{name, size}`：name 不超过 255 个字符，size 为非负整数 |
+
+- 响应：
+
+  | 情况 | 状态码 | body |
+  | --- | --- | --- |
+  | 没连上 Hub | 503 | `{"reason": "unreachable"}` |
+  | 已连上、还没收到 `hub_hello`，且连上不足 5 秒 | 503 | `{"reason": "negotiating"}`，可重试 |
+  | `hub_hello` 不含 `ops_code`，或连上 5 秒后仍没收到 `hub_hello`（旧 Hub） | 501 | 无 |
+  | 在途请求已达 8 个，或发送队列已满 | 503 | `{"reason": "busy"}` |
+  | 等结果期间连接断开，或帧发送失败 | 503 | `{"reason": "disconnected"}` |
+  | 8 秒内没收到结果 | 504 | 无 |
+  | 收到结果 | 200 | 结果帧去掉 `type`、`requestId` |
+
+**帧**
+
+```json
+{ "type": "ops_code_verify", "requestId": "…", "service": "done-admin", "code": "123456",
+  "operation": "backups:upload", "operationLabel": "上传备份并还原",
+  "operator": { "userId": 1, "name": "张三", "ip": "172.18.0.1" },
+  "file": { "name": "a.nbdata", "size": 1048576 } }
+{ "type": "ops_code_verify_result", "requestId": "…", "valid": true, "namespace": { "code": "prod", "name": "生产" } }
+{ "type": "ops_code_verify_result", "requestId": "…", "valid": false, "reason": "locked", "retryAfter": 540 }
+```
+
+`valid: false` 时的 `reason`：
+
+| 值 | 含义 |
+| --- | --- |
+| `invalid` | 口令错误或已过期 |
+| `not_found` | 服务不在该 Agent 所属环境，或这台 Agent 上没有该服务的部署 |
+| `locked` | 该（环境, 服务）失败过多被临时锁定，`retryAfter` 为剩余秒数 |
+| `busy` | Hub 上该（环境, 服务）在途校验过多，可稍后重试 |
+| `code_service_disabled` | Hub 未启用动态码服务，或其版本不支持按环境校验 |
+| `unavailable` | Hub 内部出错 |
+
+规则：
+
+- Hub 在 `hub_hello.features` 里声明 `ops_code` 才支持本协议。Agent 的特性状态跟着连接走：连上时置为未知，收到 `hub_hello` 时记下，断开时清空。
+- 结果帧不进出站队列：一问一答，断连即失败。Agent 断开连接时立即唤醒全部在途请求（返回 `disconnected`），迟到的结果按连接代次丢弃；Hub 只把结果发回受理请求的那条连接，那条连接已断开就丢弃。
+- Agent 只有一个发送线程，配容量 8 的有界队列；排队超过 8 秒、属于旧连接或调用方已放弃的帧直接丢弃。
+- Hub 只信连接锁定的 Agent 与环境：按（环境, `service`）核对部署归属并分桶限流（10 分钟失败 20 次锁 15 分钟），不信请求里自报的环境。
+- 两端日志都不记口令。
