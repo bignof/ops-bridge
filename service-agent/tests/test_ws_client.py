@@ -340,3 +340,38 @@ def test_on_close_stops_follow_and_aborts_fetch(monkeypatch: pytest.MonkeyPatch)
     module._on_close(SimpleNamespace(keep_running=False), 1006, "gone")
 
     assert calls == ["logs", "follow", "fetch"]
+
+
+def test_ops_code_follows_connection_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _import_ws_client(monkeypatch)
+    from core import ops_code
+
+    monkeypatch.setattr(module, "_start_heartbeat", lambda ws: None)
+    monkeypatch.setattr(module, "start_status_reporting", lambda ws: None)
+    monkeypatch.setattr(module.agent_upgrade, "on_connected", lambda ws: None)
+    sent: list[dict] = []
+    ws = SimpleNamespace(keep_running=True, send=lambda raw: sent.append(json.loads(raw)))
+    fields = {"service": "app", "code": "112233", "operation": "backups:restore",
+              "operator": {"userId": 1, "name": "", "ip": ""}}
+
+    module._on_open(ws)
+    assert ops_code.verify(dict(fields)) == (503, {"reason": "negotiating"})
+
+    module._on_message(ws, json.dumps({"type": "hub_hello", "features": ["header_auth", "ops_code"]}))
+    box: dict = {}
+    worker = threading.Thread(target=lambda: box.update(result=ops_code.verify(dict(fields), timeout=5)))
+    worker.start()
+    deadline = time.monotonic() + 2
+    while not any(m.get("type") == "ops_code_verify" for m in sent) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    frame = next(m for m in sent if m.get("type") == "ops_code_verify")
+    module._on_message(ws, json.dumps({"type": "ops_code_verify_result", "requestId": frame["requestId"],
+                                       "valid": False, "reason": "invalid"}))
+    worker.join(2)
+    assert box["result"] == (200, {"valid": False, "reason": "invalid"})
+
+    module._on_close(ws, 1006, "gone")
+    assert ops_code.verify(dict(fields)) == (503, {"reason": "unreachable"})
+
+    module._on_open(ws)                                   # 重连：特性回到未知
+    assert ops_code.verify(dict(fields)) == (503, {"reason": "negotiating"})
