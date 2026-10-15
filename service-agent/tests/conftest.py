@@ -44,3 +44,13 @@ def no_background_follow_up(monkeypatch):
     status_reporter._follow_ups.clear()
     yield
     status_reporter._follow_ups.clear()
+
+
+@pytest.fixture(autouse=True)
+def isolated_ops_code_state():
+    """ops_code 是模块级单例（连接、特性、在途表、发送队列）：每个用例前后清空，防跨用例串状态。"""
+    from core import ops_code
+
+    ops_code.reset()
+    yield
+    ops_code.reset()

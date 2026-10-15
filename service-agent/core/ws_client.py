@@ -6,7 +6,7 @@ import time
 import websocket
 
 from config import AGENT_AUTH_MODE, AGENT_ID, AGENT_KEY, HEARTBEAT_INTERVAL, OUTBOX_PATH, WS_URL
-from core import outbox, plugin_query
+from core import ops_code, outbox, plugin_query
 from services import agent_upgrade
 from core.handlers import dispatch, send_message
 from core.log_sessions import start_log_session, stop_log_session, stop_all as stop_all_log_sessions
@@ -64,6 +64,7 @@ def _on_open(ws):
     # sender 必须用会抛错的裸 ws.send:吞异常的 send_message 会让 flush 把失败发送也当成功计预算
     outbox.set_sender(lambda message: ws.send(json.dumps(message)))
     plugin_query.set_sender(lambda message: ws.send(json.dumps(message)))
+    ops_code.on_connected(lambda message: ws.send(json.dumps(message)))  # 特性置为未知，等本连接的 hub_hello
     outbox.flush(force=True)
     _start_heartbeat(ws)
     start_status_reporting(ws)
@@ -75,6 +76,7 @@ def _on_hub_hello(data):
     下次重连起 key 不再进 URL（当前连接已经建立，URL 里的 key 已留在访问日志，断开重连也追不回）。"""
     global _auth_transport
     features = data.get('features')
+    ops_code.set_features(features)
     if (
         AGENT_AUTH_MODE == 'auto'
         and _auth_transport == 'query'
@@ -129,6 +131,8 @@ def _on_message(ws, message):
                 request_report()
         elif msg_type == 'plugin_query_result':
             plugin_query.resolve(data.get('requestId'), data.get('plugins', []), data.get('error'))
+        elif msg_type == 'ops_code_verify_result':
+            ops_code.resolve(data)
         else:
             logger.debug("Ignored unknown message type: %s", msg_type)
     except Exception as e:
@@ -168,6 +172,7 @@ def _on_close(ws, close_status_code, close_msg):
     _update_state(connected=False, last_disconnect_ts=time.time())
     outbox.clear_sender()  # 补投暂停,等重连的 _on_open 换新通道
     plugin_query.clear_sender()  # 与 _on_open 的成对注册对称,断连期间 request() 走 sender-is-None 快速失败
+    ops_code.on_disconnected()  # 立即唤醒在途的口令校验（返回 disconnected），不让调用方干等 8 秒
     stopped = stop_all_log_sessions()  # 泄漏修复：hub 断了，compose logs -f 子进程不能再挂着
     if stopped:
         logger.info(f"Stopped {stopped} log session(s) on disconnect")
