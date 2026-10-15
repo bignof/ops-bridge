@@ -8,7 +8,7 @@ import pytest
 BODY = {
     'service': 'done-admin', 'code': '246802', 'operation': 'backups:upload', 'operationLabel': '上传备份并还原',
     'operator': {'userId': 7, 'name': '张' * 128, 'ip': '172.18.0.1'},
-    'file': {'name': '备份.nbdata', 'size': 1024},
+    'file': {'name': '备份.nbdata', 'size': 1024}, 'target': '备份.nbdata',
 }
 
 
@@ -65,7 +65,7 @@ def test_body_length_is_bounded(monkeypatch, length):
     _with('operationLabel', 'x' * 65), _with('operator', None), _with('operator.userId', True),
     _with('operator.userId', 'x' * 65), _with('operator.userId', -1), _with('operator.name', '张' * 129),
     _with('operator.ip', 'x' * 65), _with('file', 'a.nbdata'), _with('file.size', -1), _with('file.size', '1'),
-    _with('file.name', 'x' * 256),
+    _with('file.name', 'x' * 256), _with('target', 'x' * 256), _with('target', 1),
 ])
 def test_invalid_body_is_rejected(monkeypatch, body):
     status, _, calls = _post(monkeypatch, body)
@@ -80,7 +80,12 @@ def test_valid_body_is_forwarded_with_protocol_fields_only(monkeypatch):
     assert calls == [{'service': 'done-admin', 'code': '246802', 'operation': 'backups:upload',
                       'operationLabel': '上传备份并还原',
                       'operator': {'userId': 7, 'name': '张' * 128, 'ip': '172.18.0.1'},
-                      'file': {'name': '备份.nbdata', 'size': 1024}}]
+                      'file': {'name': '备份.nbdata', 'size': 1024}, 'target': '备份.nbdata'}]
+
+
+def test_target_counts_characters_not_bytes(monkeypatch):
+    status, _, calls = _post(monkeypatch, _with('target', '备' * 255))
+    assert status == 200 and calls[0]['target'] == '备' * 255
 
 
 def test_optional_fields_may_be_omitted(monkeypatch):

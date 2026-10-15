@@ -55,6 +55,11 @@ def parse_verify_body(raw):
                 or not 0 <= size <= 2 ** 53):
             raise ValueError('file')
         fields['file'] = {'name': file_name, 'size': size}
+    target = payload.get('target')
+    if target is not None:
+        if not _text(target, 0, 255):
+            raise ValueError('target')
+        fields['target'] = target
     return fields
 
 

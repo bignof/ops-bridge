@@ -281,6 +281,7 @@ Agent 回：`logs_started {sessionId, tail, timestamps}`、`logs_chunk {sessionI
   | `operationLabel` | 可选，操作名，不超过 64 个字符 |
   | `operator` | `{userId, name, ip}`：userId 为非负整数或 1～64 个字符的字符串；name 不超过 128 个字符，ip 不超过 64 个字符，可省略 |
   | `file` | 可选，`{name, size}`：name 不超过 255 个字符，size 为非负整数 |
+  | `target` | 可选，操作对象（备份文件名、应用记录号等），不超过 255 个字符；只供 Hub 记审计，不参与校验 |
 
 - 响应：
 
@@ -300,7 +301,7 @@ Agent 回：`logs_started {sessionId, tail, timestamps}`、`logs_chunk {sessionI
 { "type": "ops_code_verify", "requestId": "…", "service": "done-admin", "code": "123456",
   "operation": "backups:upload", "operationLabel": "上传备份并还原",
   "operator": { "userId": 1, "name": "张三", "ip": "172.18.0.1" },
-  "file": { "name": "a.nbdata", "size": 1048576 } }
+  "file": { "name": "a.nbdata", "size": 1048576 }, "target": "a.nbdata" }
 { "type": "ops_code_verify_result", "requestId": "…", "valid": true, "namespace": { "code": "prod", "name": "生产" } }
 { "type": "ops_code_verify_result", "requestId": "…", "valid": false, "reason": "locked", "retryAfter": 540 }
 ```
