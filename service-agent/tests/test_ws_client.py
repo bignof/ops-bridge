@@ -420,6 +420,25 @@ def test_on_message_does_not_route_other_frames_to_hub_rpc(monkeypatch: pytest.M
     assert seen == []
 
 
+def _finish(worker, timeout=2):
+    """等 (线程, 装结果的 box) 结束并取结果；线程没结束就明确报错，而不是读 box 时抛 KeyError。"""
+    thread, box = worker
+    thread.join(timeout)
+    assert not thread.is_alive(), "调用没有按预期返回"
+    return box["result"]
+
+
+def _ask_hub_rpc(frame_type, feature, timeout=5):
+    """在线程里发一次 hub_rpc 查询，返回 (线程, 装结果的 box)。"""
+    from core import hub_rpc
+
+    box: dict = {}
+    worker = threading.Thread(
+        target=lambda: box.update(result=hub_rpc.call(frame_type, {"service": "k3f9qm"}, feature, timeout)), daemon=True)
+    worker.start()
+    return worker, box
+
+
 def test_hub_rpc_follows_connection_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
     module = _import_ws_client(monkeypatch)
     from core import hub_rpc
@@ -434,7 +453,7 @@ def test_hub_rpc_follows_connection_lifecycle(monkeypatch: pytest.MonkeyPatch) -
 
     def ask(query):
         box: dict = {}
-        worker = threading.Thread(target=lambda: box.update(result=hub_rpc.call(*query)))
+        worker = threading.Thread(target=lambda: box.update(result=hub_rpc.call(*query)), daemon=True)
         worker.start()
         return worker, box
 
@@ -460,22 +479,19 @@ def test_hub_rpc_follows_connection_lifecycle(monkeypatch: pytest.MonkeyPatch) -
     assert frame["service"] == "k3f9qm"
     module._on_message(ws, json.dumps({"type": "env_config_result", "requestId": frame["requestId"],
                                        "env": {"allowUi": False, "allowDs": True}}))
-    waiting[0].join(2)
-    assert waiting[1]["result"] == (200, {"allowUi": False, "allowDs": True})
+    assert _finish(waiting) == (200, {"allowUi": False, "allowDs": True})
 
     snapshot_worker = ask(snapshot_query)                 # 实例快照走同一条通道
     frame = wait_for_frames("instance_snapshot_query", 1)
     module._on_message(ws, json.dumps({"type": "instance_snapshot_result", "requestId": frame["requestId"],
                                        "snapshot": {"schemaVersion": 1}}))
-    snapshot_worker[0].join(2)
-    assert snapshot_worker[1]["result"] == (200, {"schemaVersion": 1})
+    assert _finish(snapshot_worker) == (200, {"schemaVersion": 1})
 
     pending = ask(env_query)                              # 等结果期间断线：立即返回，不干等超时
     wait_for_frames("env_config_query", 2)
     started = time.monotonic()
     module._on_close(ws, 1006, "gone")
-    pending[0].join(2)
-    assert pending[1]["result"] == (503, {"reason": "hub_disconnected"})
+    assert _finish(pending) == (503, {"reason": "hub_disconnected"})
     assert time.monotonic() - started < 1
     assert hub_rpc.call(*env_query) == (503, {"reason": "hub_disconnected"})
 
@@ -484,5 +500,92 @@ def test_hub_rpc_follows_connection_lifecycle(monkeypatch: pytest.MonkeyPatch) -
     time.sleep(0.1)
     assert len(frames("env_config_query")) == 2
     module._on_message(ws, json.dumps({"type": "hub_hello", "features": ["header_auth"]}))   # 新连接上的中枢不支持
-    again[0].join(2)
-    assert again[1]["result"] == (501, {"reason": "hub_unsupported"})
+    assert _finish(again) == (501, {"reason": "hub_unsupported"})
+
+
+_OPS_FIELDS = {"service": "app", "code": "112233", "operation": "backups:restore",
+               "operator": {"userId": 1, "name": "", "ip": ""}}
+
+
+def _quiet_open(monkeypatch: pytest.MonkeyPatch, module) -> None:
+    """让 _on_open 只剩连接登记：心跳、状态上报、自升级线程都不起。"""
+    monkeypatch.setattr(module, "_start_heartbeat", lambda ws: None)
+    monkeypatch.setattr(module, "start_status_reporting", lambda ws: None)
+    monkeypatch.setattr(module.agent_upgrade, "on_connected", lambda ws: None)
+
+
+def test_requests_during_outbox_replay_see_the_hub_as_not_connected(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _import_ws_client(monkeypatch)
+    from core import hub_rpc, ops_code
+
+    _quiet_open(monkeypatch, module)
+    replaying = threading.Event()
+    finish_replay = threading.Event()
+
+    def slow_flush(**kwargs):                             # 补投没有条数和时长上限
+        replaying.set()
+        finish_replay.wait(5)
+
+    monkeypatch.setattr(module.outbox, "flush", slow_flush)
+    ws = SimpleNamespace(keep_running=True, send=lambda raw: None)
+    opener = threading.Thread(target=module._on_open, args=(ws,), daemon=True)
+    opener.start()
+    try:
+        assert replaying.wait(2)
+        # 补投还没做完，通道还没登记这条连接：请求得到「未连上」的 503（应用会重试），不会被判成 501
+        assert hub_rpc.call("env_config_query", {"service": "k3f9qm"}, "env_config", 1) == (503, {"reason": "hub_disconnected"})
+        assert ops_code.verify(dict(_OPS_FIELDS), timeout=1) == (503, {"reason": "unreachable"})
+    finally:
+        finish_replay.set()
+    opener.join(2)
+    assert not opener.is_alive()
+    assert ops_code.verify(dict(_OPS_FIELDS), timeout=1) == (503, {"reason": "negotiating"})   # 补投做完才登记，开始等 hub_hello
+
+
+def test_negotiation_window_starts_after_the_outbox_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _import_ws_client(monkeypatch)
+    from core import hub_rpc, ops_code
+
+    _quiet_open(monkeypatch, module)
+    now = [100.0]
+    monkeypatch.setattr(hub_rpc, "_monotonic", lambda: now[0])
+    monkeypatch.setattr(ops_code, "_monotonic", lambda: now[0])
+    monkeypatch.setattr(module.outbox, "flush", lambda **kwargs: now.__setitem__(0, now[0] + 60))   # 一次很久的补投
+    sent: list[dict] = []
+    ws = SimpleNamespace(keep_running=True, send=lambda raw: sent.append(json.loads(raw)))
+
+    module._on_open(ws)
+
+    # 窗口从补投做完起算，此刻仍在窗口内：口令校验回 negotiating，环境开关查询在等 hub_hello，都不是 501
+    assert ops_code.verify(dict(_OPS_FIELDS), timeout=1) == (503, {"reason": "negotiating"})
+    worker = _ask_hub_rpc("env_config_query", "env_config")
+    time.sleep(0.1)
+    assert sent == []
+    module._on_message(ws, json.dumps({"type": "hub_hello", "features": ["env_config"]}))
+    deadline = time.monotonic() + 2
+    while not sent and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert [message["type"] for message in sent] == ["env_config_query"]
+    module._on_message(ws, json.dumps({"type": "env_config_result", "requestId": sent[0]["requestId"],
+                                       "env": {"allowUi": True, "allowDs": True}}))
+    assert _finish(worker) == (200, {"allowUi": True, "allowDs": True})
+
+
+def test_channels_are_registered_even_if_the_outbox_replay_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _import_ws_client(monkeypatch)
+    from core import hub_rpc, ops_code
+
+    _quiet_open(monkeypatch, module)
+
+    def broken_flush(**kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(module.outbox, "flush", broken_flush)
+    ws = SimpleNamespace(keep_running=True, send=lambda raw: None)
+
+    with pytest.raises(OSError):
+        module._on_open(ws)
+
+    # 补投抛了异常，连接照样登记：两个通道都在等 hub_hello，而不是停在「未连上」
+    assert ops_code.verify(dict(_OPS_FIELDS), timeout=1) == (503, {"reason": "negotiating"})
+    assert hub_rpc.call("env_config_query", {"service": "k3f9qm"}, "env_config", 0.2) == (504, {"reason": "timeout"})

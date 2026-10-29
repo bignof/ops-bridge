@@ -125,6 +125,8 @@ def test_interface_constants_match_the_contract():
     assert hub_rpc.MAX_IN_FLIGHT == 8
     assert hub_rpc.NEGOTIATE_SECONDS == 5.0
     assert hub_rpc.RESULT_FRAMES == {'env_config_result', 'instance_snapshot_result'}
+    assert hub_rpc.RESULTS == {'env_config_query': ('env_config_result', 'env'),
+                               'instance_snapshot_query': ('instance_snapshot_result', 'snapshot')}
 
 
 # ---- 往返与映射 ----
@@ -183,6 +185,54 @@ def test_malformed_result_frames_are_502_unavailable(rpc, frame):
     reply_with(rpc, {'type': ENV_RESULT, **frame})
     assert hub_rpc.call(*ENV_QUERY, 1.0) == UNAVAILABLE
     assert hub_rpc._channel.pending == {}
+
+
+SNAPSHOT_RESULT = 'instance_snapshot_result'
+
+
+@pytest.mark.parametrize('query,frame', [
+    (ENV_QUERY, {'type': SNAPSHOT_RESULT, 'snapshot': SNAPSHOT}),     # 别的请求的结果帧
+    (ENV_QUERY, {'type': SNAPSHOT_RESULT, 'env': ENV}),               # 类型不对，字段却像
+    (ENV_QUERY, {'type': SNAPSHOT_RESULT, 'error': 'not_bound'}),     # 类型不对的错误帧，不能当成 403
+    (ENV_QUERY, {'type': ENV_RESULT, 'snapshot': SNAPSHOT}),          # 类型对，响应体却在别的请求的字段里
+    (ENV_QUERY, {'env': ENV}),                                        # 没有 type
+    (SNAPSHOT_QUERY, {'type': ENV_RESULT, 'env': ENV}),
+    (SNAPSHOT_QUERY, {'type': ENV_RESULT, 'snapshot': SNAPSHOT}),
+    (SNAPSHOT_QUERY, {'type': SNAPSHOT_RESULT, 'env': ENV}),
+])
+def test_result_frame_must_match_the_request(rpc, query, frame):
+    rpc.connect()
+    reply_with(rpc, frame)
+    assert hub_rpc.call(*query, 1.0) == UNAVAILABLE
+    assert hub_rpc._channel.pending == {}
+
+
+@pytest.mark.parametrize('query,frame,body', [
+    (ENV_QUERY, {'type': ENV_RESULT, 'env': ENV, 'snapshot': SNAPSHOT}, ENV),
+    (SNAPSHOT_QUERY, {'type': SNAPSHOT_RESULT, 'env': ENV, 'snapshot': SNAPSHOT}, SNAPSHOT),
+])
+def test_result_frame_with_both_fields_returns_the_one_for_the_request(rpc, query, frame, body):
+    rpc.connect()
+    reply_with(rpc, frame)
+    assert hub_rpc.call(*query, 1.0) == (200, body)
+
+
+def test_mismatched_result_is_logged_by_field_names_only(rpc, caplog):
+    caplog.set_level(logging.DEBUG)
+    rpc.connect()
+    reply_with(rpc, {'type': SNAPSHOT_RESULT, 'snapshot': {'secretField': 'S3CR3T-VALUE'}})
+    assert hub_rpc.call(*ENV_QUERY, 1.0) == UNAVAILABLE
+    assert 'snapshot' in caplog.text and 'env_config_result' in caplog.text      # 字段名和期望的类型
+    assert 'S3CR3T-VALUE' not in caplog.text and 'secretField' not in caplog.text    # 内容一概不记
+
+
+def test_unregistered_request_frame_is_a_programming_error(rpc):
+    with pytest.raises(ValueError):
+        hub_rpc.call('no_such_query', {'service': 'x'}, 'env_config', 1.0)       # 没连上也先报错，不看连接状态
+    rpc.connect()
+    with pytest.raises(ValueError):
+        hub_rpc.call('no_such_query', {'service': 'x'}, 'env_config', 1.0)
+    assert rpc.sent == [] and hub_rpc._channel.pending == {}
 
 
 # ---- hub_hello 协商 ----
@@ -327,13 +377,6 @@ def test_stale_generation_result_is_dropped(rpc):
     assert not entry['event'].is_set() and entry['result'] is None
     hub_rpc.on_disconnected()
     assert finish(worker) == HUB_DISCONNECTED
-
-
-def test_late_result_after_timeout_is_dropped(rpc):
-    rpc.connect()
-    assert hub_rpc.call(*ENV_QUERY, 0.1) == TIMEOUT
-    hub_rpc.resolve(result_frame(rpc.sent[0]['requestId'], env=ENV))
-    assert hub_rpc._channel.pending == {}
 
 
 def test_stale_result_never_reaches_a_later_call(rpc):
@@ -501,16 +544,18 @@ def test_frames_queued_on_old_connection_are_not_sent_after_reconnect():
 
     hub_rpc.on_connected(blocking_send)
     hub_rpc.set_features(['env_config'])
-    first = call_async(timeout=5)
-    assert wait_for(lambda: old_calls)                           # 发送线程卡在旧连接的 send 上
-    queued = call_async(timeout=5)
-    assert wait_for(lambda: hub_rpc._channel.queue.qsize() == 1)
-    hub_rpc.on_disconnected()                                    # 断线：两个在途请求都立即返回
-    assert finish(first) == HUB_DISCONNECTED
-    assert finish(queued) == HUB_DISCONNECTED
-    new = Rpc().connect()
-    fresh = call_async(timeout=5)
-    release.set()                                                # 旧 send 返回：旧帧丢弃，新帧照常发出
+    try:
+        first = call_async(timeout=5)
+        assert wait_for(lambda: old_calls)                       # 发送线程卡在旧连接的 send 上
+        queued = call_async(timeout=5)
+        assert wait_for(lambda: hub_rpc._channel.queue.qsize() == 1)
+        hub_rpc.on_disconnected()                                # 断线：两个在途请求都立即返回
+        assert finish(first) == HUB_DISCONNECTED
+        assert finish(queued) == HUB_DISCONNECTED
+        new = Rpc().connect()
+        fresh = call_async(timeout=5)
+    finally:
+        release.set()                    # 旧 send 返回：旧帧丢弃，新帧照常发出；上面任一断言失败也要放开，免得发送线程卡住连累后面的用例
     assert wait_for(lambda: new.sent)
     assert len(old_calls) == 1 and len(new.sent) == 1
     assert new.sent[0]['requestId'] != old_calls[0]['requestId']

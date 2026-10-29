@@ -64,9 +64,14 @@ def _on_open(ws):
     # sender 必须用会抛错的裸 ws.send:吞异常的 send_message 会让 flush 把失败发送也当成功计预算
     outbox.set_sender(lambda message: ws.send(json.dumps(message)))
     plugin_query.set_sender(lambda message: ws.send(json.dumps(message)))
-    ops_code.on_connected(lambda message: ws.send(json.dumps(message)))  # 特性置为未知，等本连接的 hub_hello
-    hub_rpc.on_connected(lambda message: ws.send(json.dumps(message)))  # 同上：环境开关、实例快照的一问一答
-    outbox.flush(force=True)
+    try:
+        outbox.flush(force=True)
+    finally:
+        # 一问一答通道放在补投之后登记，它们的协商窗口（5 秒）从这里起算：补投没有条数和时长上限，而 hub_hello
+        # 要等 _on_open 返回后才读得到；先登记再补投的话，补投久了窗口会在 hub_hello 被读到之前就过期，
+        # 把新中枢误判成旧版（501）。补投期间进来的请求得到「未连上」的 503，应用会重试。补投抛异常也照样登记。
+        ops_code.on_connected(lambda message: ws.send(json.dumps(message)))  # 特性置为未知，等本连接的 hub_hello
+        hub_rpc.on_connected(lambda message: ws.send(json.dumps(message)))  # 同上：环境开关、实例快照的一问一答
     _start_heartbeat(ws)
     start_status_reporting(ws)
     threading.Thread(target=agent_upgrade.on_connected, args=(ws,), daemon=True).start()

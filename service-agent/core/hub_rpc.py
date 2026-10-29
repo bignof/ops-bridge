@@ -6,6 +6,8 @@ hub_rpc.py — 与交付中枢的一问一答（agent 半边）：本机 HTTP �
 结果不进出站队列：这是一问一答，断连即失败（同 ops_code）。
 传输层（连接代次、特性、在途表、发送线程和队列）在 core/hub_channel.py，与 ops_code 共用一份实现；
 本模块的 _channel 是它的一个实例，本模块只负责：
+- 帧：每种请求帧对应哪种结果帧、响应体在结果帧的哪个字段，登记在 RESULTS。结果帧必须和发出的请求对得上，
+  类型不是这一种、或者响应体字段不是对象，一律按 502 unavailable 处理，免得错的对象以 200 返回。
 - 协商期间要等：刚连上、hub_hello 还没到的几秒内进来的请求不立即判 501（否则应用会误以为中枢太旧），
   而是在 NEGOTIATE_SECONDS（从连上算起）内等协商结果；timeout 是含等协商在内的总时限。
 - 在途上限 MAX_IN_FLIGHT（含正在等协商的），超出直接返回 busy：中枢慢或卡住时请求不会越积越多。
@@ -25,9 +27,13 @@ logger = logging.getLogger(__name__)
 MAX_IN_FLIGHT = 8
 SEND_QUEUE_SIZE = 8
 NEGOTIATE_SECONDS = 5.0       # 连上后等 hub_hello 的时限（从连上算起）；超过仍没有就当旧版中枢
-RESULT_FRAMES = frozenset({'env_config_result', 'instance_snapshot_result'})   # ws_client 据此分发给 resolve
+# 请求帧 → (期望的结果帧类型, 结果帧里装响应体的字段)。加新的一问一答只需在这里登记一行，ws_client 的分发跟着走
+RESULTS = {
+    'env_config_query': ('env_config_result', 'env'),
+    'instance_snapshot_query': ('instance_snapshot_result', 'snapshot'),
+}
+RESULT_FRAMES = frozenset(frame for frame, _ in RESULTS.values())   # ws_client 据此分发给 resolve
 ERROR_STATUS = {'not_found': 404, 'not_bound': 403, 'unavailable': 502}        # 结果帧 error → HTTP 状态码
-BODY_KEYS = ('env', 'snapshot')                                                # 结果帧里装响应体的字段
 
 _monotonic = time.monotonic   # 测试替换这个时钟，不动全局 time.monotonic
 _channel = HubChannel('hub-rpc', SEND_QUEUE_SIZE, clock=lambda: _monotonic())
@@ -59,8 +65,13 @@ def call(frame_type: str, fields: dict, feature: str, timeout: float) -> tuple[i
       在途已有 MAX_IN_FLIGHT 个             → 503 {"reason": "busy"}
       超时                                 → 504 {"reason": "timeout"}
       结果帧 error 为 not_found / not_bound / unavailable → 404 / 403 / 502 和 {"reason": error}
-      结果帧有 env 或 snapshot              → 200 和那个对象（不含 type、requestId）
+      结果帧有 env 或 snapshot              → 200 和那个对象（env 帧回 env 的值，snapshot 帧回 snapshot 的值）
+      结果帧和请求对不上（类型不符、残缺、认不得的错误码） → 502 {"reason": "unavailable"}
+    frame_type 必须登记在 RESULTS 里，否则抛 ValueError（调用方的编程错误）。
     """
+    expect = RESULTS.get(frame_type)
+    if expect is None:
+        raise ValueError(f'未登记的请求帧类型：{frame_type}')
     request_id = uuid.uuid4().hex
     deadline = _monotonic() + timeout
     with _channel.lock:
@@ -71,6 +82,7 @@ def call(frame_type: str, fields: dict, feature: str, timeout: float) -> tuple[i
         entry = _channel.register(request_id, MAX_IN_FLIGHT)   # 登记即占一个在途名额：等协商的请求也算，免得连上后的几秒内无限堆积
         if entry is None:
             return _reason(503, 'busy')
+        entry['expect'] = expect          # 结果帧要和请求对得上：类型是这一种，响应体在这个字段里
     try:
         return _exchange(request_id, entry, frame_type, fields, feature, deadline)
     finally:
@@ -87,7 +99,7 @@ def _exchange(request_id, entry, frame_type, fields, feature, deadline):
                 # 等满了仍没有 hub_hello：协商窗口先到是旧版中枢（501），调用方的总时限先到只是超时（504）
                 return _reason(501, 'hub_unsupported') if window_end <= deadline else _reason(504, 'timeout')
         if entry['event'].is_set():          # 等协商时（或登记之后、入队之前）断线或换了连接
-            return _outcome(entry['result'])
+            return _outcome(entry)
         if feature not in _channel.features:
             return _reason(501, 'hub_unsupported')
         frame = {**fields, 'type': frame_type, 'requestId': request_id}   # 信封放最后：fields 夹带同名键也盖不掉
@@ -95,20 +107,23 @@ def _exchange(request_id, entry, frame_type, fields, feature, deadline):
             return _reason(503, 'busy')
     if not entry['event'].wait(max(0.0, deadline - _monotonic())):
         return _reason(504, 'timeout')
-    return _outcome(entry['result'])
+    return _outcome(entry)
 
 
-def _outcome(result):
+def _outcome(entry):
     """把定下的结果折成 (HTTP 状态码, 响应体)。"""
+    result = entry['result']
     if result is DISCONNECTED:
         return _reason(503, 'hub_disconnected')
-    error = result.get('error')
-    if error is None:
-        for key in BODY_KEYS:
-            if isinstance(result.get(key), dict):
-                return 200, result[key]
-    elif isinstance(error, str) and error in ERROR_STATUS:
-        return _reason(ERROR_STATUS[error], error)
-    # 既没有有效的 error 也没有 env / snapshot：认不得的错误码（中枢以后可能新增）或残缺的结果帧，只记字段名
-    logger.warning('中枢的结果帧不合规（字段：%s），按 unavailable 处理', ','.join(sorted(map(str, result))) or '无')
+    frame_type, body_key = entry['expect']
+    matches = result.get('type') == frame_type
+    if matches:                           # 结果帧得是这个请求对应的那一种，否则字段再像也不能信
+        error = result.get('error')
+        if error is None and isinstance(result.get(body_key), dict):
+            return 200, result[body_key]
+        if isinstance(error, str) and error in ERROR_STATUS:
+            return _reason(ERROR_STATUS[error], error)
+    # 类型对不上、认不得的错误码（中枢以后可能新增）或残缺的结果帧：只记字段名，不记内容
+    logger.warning('中枢的结果帧不合规（期望 %s，类型%s，字段：%s），按 unavailable 处理',
+                   frame_type, '相符' if matches else '不符', ','.join(sorted(map(str, result))) or '无')
     return _reason(502, 'unavailable')
