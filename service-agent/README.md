@@ -34,7 +34,7 @@ service-agent（容器）
 - 连接时上报版本与能力清单（`agent_report.runtime.capabilities`），Hub 据此决定可用功能
 - 支持 `logs_start` / `logs_stop` 日志流会话，用于实时查看 `docker compose logs -f --tail N`
 - 支持 `logfile_list` / `logfile_fetch` / `logfile_follow` 日志文件协议：列出部署目录下的日志文件、把某个文件 gzip 上传到中枢归档、实时跟随子目录里最新的日志文件
-- 支持 `compose_discover` / `compose_inspect`：只读扫描 compose 项目并汇报服务 / 容器名 / 镜像 / 端口
+- 支持 `compose_discover` / `compose_inspect`：只读扫描 compose 项目并汇报服务 / 容器名 / 镜像 / 端口，发现时还带回目录里 `sync-plugins.config.json` 配的拉取编码
 - 与中枢断连时自动停掉全部日志会话与进行中的上传
 - 统一使用 `docker compose`（v2 插件）执行 Compose 命令
 - 命令在独立线程中执行，不阻塞心跳和其他消息处理
@@ -68,6 +68,7 @@ service-agent（容器）
 | `HUB_HTTP_URL`        | 中枢 HTTP 基址（日志归档上传用），留空按 `WS_URL` 推导 | `https://hub.example.com`                            |
 | `PROJECTS_ROOT`       | compose 项目发现的扫描根（容器内路径），默认 `/data`   | `/data`                                              |
 | `APP_HOST`            | 回到宿主机的地址，默认 `host.docker.internal`；`drain` 与健康检查经它 + compose 解析出的映射端口访问被管应用 | `host.docker.internal` |
+| `AGENT_LOCAL_SECRET`  | 本机业务服务调用 Agent 本机端点（见下文「本机 HTTP 端点」）的共享密钥，请求头 `X-Agent-Secret` 带上；`odk init` 每机随机生成并渲染进 `.env`。未配置时这些端点一律回 403 | 随机字符串 |
 
 > ⚠️ **`APP_HOST` 与 `extra_hosts` 必须配套**：agent 自己是容器，与被管的业务容器各在独立 bridge 网络命名空间，
 > `127.0.0.1` 只是各自的回环、互相连不到，因此只能走「宿主机地址 + 端口映射」访问对方。默认值
@@ -123,6 +124,21 @@ GET /health
 - `commandExecution.activeCommands`: 当前正在执行的目录锁任务数
 - `commandExecution.queuedCommands`: 正在等待目录锁的命令数
 - `commandExecution.projects`: 按目录展开的执行状态，包含 `projectDir`、`activeRequestId`、`activeAction`、`activeSinceTs`、`queuedCount`
+
+## 本机 HTTP 端点
+
+同一个 HTTP 服务（`HEALTH_PORT`，默认 `18081`）上，除 `/health` 外还有给本机业务服务（admin / worker）调用的端点。它们都要请求头 `X-Agent-Secret`，值是 `AGENT_LOCAL_SECRET`：未配置时一律回 403（不会放行），不符回 401。请求和响应的字段、状态码见 [PROTOCOL.md](PROTOCOL.md)。
+
+| 端点 | 用途 | 详见 |
+| --- | --- | --- |
+| `GET /health` | 健康检查（上一节），不需要密钥 | — |
+| `GET /queryPlugin?service=<拉取编码>[&withEnv=1]` | 拉插件发布清单；带 `withEnv=1` 时顺带取环境开关，响应由纯数组变成 `{plugins, env}` | PROTOCOL.md 第 6 节 |
+| `POST /pluginSyncChanged` | 业务服务插件同步有变化，催 Agent 马上重新采集并上报该服务的状态 | `core/health_server.py` |
+| `POST /verifyOpsCode` | 运维口令校验 | PROTOCOL.md 第 10 节 |
+| `GET /envConfig?service=<拉取编码>` | 查应用所在环境的两个配置开关（`allowUi`、`allowDs`） | PROTOCOL.md 第 11 节 |
+| `GET /instanceSnapshot?service=<拉取编码>` | 取本应用的实例快照（各服务器上的实例、插件状态） | PROTOCOL.md 第 12 节 |
+
+`/envConfig`、`/instanceSnapshot` 只把请求转给中枢，Agent 不缓存、不解读：中枢没连上回 503，中枢不支持回 501，慢了回 504（总时限分别是 8 秒、10 秒），应用侧据此降级（开关按「未同步」处理，实例列表退回只显示本节点）。Agent 自己拒绝的请求（400 / 401 / 403 / 404）不带响应体，其余错误都带 `{"reason": ...}`，应用侧据此区分是谁拒绝的，不要给 Agent 自己的拒绝加响应体。
 
 ## 项目结构
 
