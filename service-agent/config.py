@@ -38,8 +38,9 @@ HEALTH_PORT        = int(os.getenv('HEALTH_PORT', '18081'))
 # agent 自己也是容器，跟被管的业务容器各在独立的 bridge 网络命名空间，127.0.0.1 谁也连不到谁；
 # host.docker.internal 需要 compose 里配 extra_hosts: host-gateway 才解析得到，见 docker-compose.yml
 APP_HOST           = os.getenv('APP_HOST', 'host.docker.internal')
-# admin(worker) 调本机 agent /queryPlugin 的共享 secret（odk init 每机随机生成、渲染进本 .env 与 admin 请求头）。
-# 防同网段其它主机裸调该端点；非空时强制校验。
+# admin(worker) 调本机 agent 各端点用的共享 secret（odk init 每机随机生成、渲染进本 .env 与 admin 请求头）。
+# 需要它的本机端点（请求头 X-Agent-Secret）：/queryPlugin、/pluginSyncChanged、/verifyOpsCode、/envConfig、/instanceSnapshot，
+# 与 start_health_server 的启动告警列的一致。防同网段其它主机裸调这些端点；未配置（留空）时它们一律回 403，不会放行。
 AGENT_LOCAL_SECRET = os.getenv('AGENT_LOCAL_SECRET', '')
 # hub 的 HTTP 基址（日志归档上传用）。留空则由 WS_URL 推导：ws→http、wss→https、去掉 /ws/agent 及其后内容。
 HUB_HTTP_URL       = os.getenv('HUB_HTTP_URL', '').strip().rstrip('/')

@@ -535,6 +535,7 @@ def test_check_local_secret_passes_silently_when_the_secret_matches(handler_for)
 def test_check_local_secret_replies_and_returns_false_when_refused(handler_for, secret, headers, status):
     h = handler_for('GET', '/envConfig?service=k3f9qm', secret=secret, headers=headers)
     assert h._check_local_secret('/envConfig') is False
+    # 响应体必须是 None：agent 自己拒绝的 401 / 403 不带响应体，应用侧靠「没有 reason」把它和中枢经 agent 回来的错误区分开
     assert (h.status, h.json()) == (status, None)
 
 

@@ -17,15 +17,13 @@ from config import PROJECTS_ROOT
 from core import log_constants
 from core.handlers import send_message
 from services.compose import find_compose_file, read_compose_file
-from services.plugin_files import PluginFileError, read_json
+from services.plugin_files import SYNC_CONFIG_FILE, SYNC_CONFIG_MAX_BYTES, PluginFileError, inside, read_json
 
 logger = logging.getLogger(__name__)
 
 _SKIP_DIRS = {"node_modules"}
 
-SYNC_CONFIG_FILE = "sync-plugins.config.json"
-SYNC_CONFIG_MAX_BYTES = 65536  # 与 services/plugins.py 读同一个文件的上限一致
-SYNC_SERVICE_MAX_LEN = 255
+SYNC_SERVICE_MAX_LEN = 255  # 拉取编码的长度上限；配置文件名和读取上限在 services/plugin_files.py，与 storage_mount 共用
 
 
 class ComposeInspectError(Exception):
@@ -57,41 +55,41 @@ def inspect_compose(project_dir: str | None) -> dict:
     return {"dir": os.path.abspath(project_dir), "composeFile": os.path.basename(compose_file), "services": services}
 
 
-def _inside(path: str, root: str) -> bool:
-    """path 是否落在 root 内（两者都应已 realpath）。按路径段比较：/data-other 不算在 /data 内。"""
-    path, root = os.path.normcase(path), os.path.normcase(root)
-    try:
-        return os.path.commonpath([path, root]) == root
-    except ValueError:  # Windows 上不同盘符
-        return False
+def _invalid(project_dir: str, reason: str) -> tuple[None, str]:
+    """读不出可用的拉取编码：记一条 warning（只记目录和原因类别，不记文件内容）并返回 (None, 'invalid')。"""
+    logger.warning("%s unusable: dir=%s reason=%s", SYNC_CONFIG_FILE, project_dir, reason)
+    return None, "invalid"
 
 
-def read_sync_service(project_dir: str) -> tuple[str | None, str | None]:
+def read_sync_service(project_dir: str, root: str | None = None) -> tuple[str | None, str | None]:
     """读 <project_dir>/sync-plugins.config.json 里配的拉取编码，返回 (service, error)。
 
     error 为 None / 'missing'（没有这个文件）/ 'invalid'（有文件但读不出可用的编码）。service 为空时取旧字段
     appName，与 docker/nocobase/sync-plugins.js 的 `CONFIG.service || CONFIG.appName` 一致。
 
-    这是在客户服务器上读目录里的文件：只读 PROJECTS_ROOT 内的真实路径（先解析符号链接，真实路径越界的不打开它），
+    这是在客户服务器上读目录里的文件：只读 root 内的真实路径（先解析符号链接，真实路径越界的不打开它）。
+    root 默认取 PROJECTS_ROOT；discover_projects 传它自己扫描的 root，判越界和扫描用同一个根。
     大小在读内容之前由 read_json 判断（超限不读，读取也只读 limit + 1 字节）。
-    日志只记目录和错误类别，不记文件内容。
+    除了「文件不存在」（missing），解析路径、打开、解码时的 OSError / ValueError（嵌套过深 read_json 已转成 PluginFileError）
+    一律归 invalid、不向外抛：一个目录的问题不能让整次扫描失败。日志只记目录和错误类别，不记文件内容。
     """
-    path = os.path.realpath(os.path.join(project_dir, SYNC_CONFIG_FILE))
-    if not _inside(path, os.path.realpath(PROJECTS_ROOT)):
-        logger.warning("%s unusable: dir=%s reason=outside_projects_root", SYNC_CONFIG_FILE, project_dir)
-        return None, "invalid"
+    root = PROJECTS_ROOT if root is None else root
+    try:
+        path = os.path.realpath(os.path.join(project_dir, SYNC_CONFIG_FILE))
+        outside = not inside(path, os.path.realpath(root))
+    except (OSError, ValueError) as exc:
+        return _invalid(project_dir, type(exc).__name__)
+    if outside:
+        return _invalid(project_dir, "outside_projects_root")
     try:
         config, _, _ = read_json(path, limit=SYNC_CONFIG_MAX_BYTES)
     except FileNotFoundError:
         return None, "missing"
-    # 超深嵌套的 JSON 抛 RecursionError，不是 ValueError；一个畸形文件不能让整次扫描失败
-    except (OSError, ValueError, RecursionError, PluginFileError) as exc:
-        logger.warning("%s unusable: dir=%s reason=%s", SYNC_CONFIG_FILE, project_dir, type(exc).__name__)
-        return None, "invalid"
+    except (OSError, ValueError, PluginFileError) as exc:
+        return _invalid(project_dir, type(exc).__name__)
     service = config.get("service") or config.get("appName")
     if not isinstance(service, str) or not 1 <= len(service) <= SYNC_SERVICE_MAX_LEN:
-        logger.warning("%s unusable: dir=%s reason=bad_service_value", SYNC_CONFIG_FILE, project_dir)
-        return None, "invalid"
+        return _invalid(project_dir, "bad_service_value")
     return service, None
 
 
@@ -124,7 +122,7 @@ def discover_projects(root: str) -> tuple[list[dict], bool]:
                 "error": {"code": exc.code, "message": exc.message},
             }
         # 目录里配的拉取编码：compose 本身解析失败的目录也带；读不出只记 syncConfigError，不影响这次扫描
-        sync_service, sync_error = read_sync_service(d)
+        sync_service, sync_error = read_sync_service(d, root)
         project["syncService"] = sync_service
         if sync_error:
             project["syncConfigError"] = sync_error

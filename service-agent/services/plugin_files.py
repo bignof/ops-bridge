@@ -17,6 +17,10 @@ REPORT_FILE = '.hub-plugin-sync.json'
 OPS_GUARD_FILE = '.hub-ops-guard.json'   # 服务写的运维口令保护状态（plugin-ops-guard），随盘点上报
 OPS_GUARD_MAX_BYTES = 4096
 OPS_GUARD_TOKEN_RE = re.compile(r'^[a-z][a-z0-9_]{0,63}$')
+# 业务服务的拉插件配置（docker/nocobase/sync-plugins.js 读它）。agent 有两处读它：storage_mount 取插件挂载位置，
+# compose 发现取里面配的拉取编码；文件名和读取上限只在这里定义，两处保持一致
+SYNC_CONFIG_FILE = 'sync-plugins.config.json'
+SYNC_CONFIG_MAX_BYTES = 64 * 1024
 LOCK_FILE = '.hub-plugin-operation.lock'
 TRASH_DIR = '.hub-plugin-trash'
 MAX_JSON_BYTES = 256 * 1024
@@ -36,9 +40,13 @@ def utc_stamp(value=None):
     return datetime.fromtimestamp(time.time() if value is None else value, timezone.utc).isoformat()
 
 
-def _inside(child, root):
+def inside(child, root):
+    """child 是否落在 root 内（含 root 本身），都是路径字符串或 Path。agent 里判断路径越界只用这一份。
+    按路径段比较：/data-other 不算在 /data 内；Windows 上不分大小写（normcase，POSIX 上原样）；
+    不同盘符时 os.path.commonpath 抛 ValueError，按不在内处理。调用方应先把两边都解析成真实路径。"""
+    child, root = os.path.normcase(child), os.path.normcase(root)
     try:
-        return os.path.commonpath([str(child), str(root)]) == str(root)
+        return os.path.commonpath([child, root]) == root
     except ValueError:
         return False
 
@@ -53,7 +61,7 @@ def checked_root(root):
 def checked_path(root, relative, *, allow_missing=False):
     root = checked_root(root)
     target = root / relative
-    if not _inside(os.path.abspath(target), root) or target == root:
+    if not inside(os.path.abspath(target), root) or target == root:
         raise PluginFileError('unsafe_path', '插件路径越界')
     current = root
     for part in Path(relative).parts:
@@ -78,6 +86,9 @@ def package_path(root, name, *, allow_missing=False):
 
 
 def read_json(filename, limit=MAX_JSON_BYTES):
+    """读 JSON 对象文件，返回 (对象, 原始字节, fstat)。读不了一律抛 OSError（含文件不存在）、ValueError（不是合法 JSON /
+    UTF-8）或 PluginFileError（不是普通文件、超限、不是对象、嵌套过深）；大小在读内容之前判断，读取也只读 limit + 1 字节。
+    调用方不用单独接 RecursionError：嵌套极深的 JSON 让 json 抛它（不是 ValueError），在这里统一转成 PluginFileError。"""
     if not stat.S_ISREG(os.lstat(filename).st_mode):
         raise PluginFileError('invalid', '插件元数据不是普通文件')
     flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
@@ -89,7 +100,10 @@ def read_json(filename, limit=MAX_JSON_BYTES):
         raw = stream.read(limit + 1)
         if len(raw) > limit:
             raise PluginFileError('invalid', '插件元数据超过大小限制')
-        value = json.loads(raw.decode('utf-8'))
+        try:
+            value = json.loads(raw.decode('utf-8'))
+        except RecursionError as exc:
+            raise PluginFileError('invalid', '插件元数据嵌套层数过深') from exc
         if not isinstance(value, dict):
             raise PluginFileError('invalid', '插件元数据格式非法')
         return value, raw, info

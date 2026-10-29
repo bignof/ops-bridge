@@ -3,15 +3,15 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
-import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
 from config import PROJECTS_ROOT
 from services.compose import collect_service_statuses, find_compose_file
-from services.plugin_files import (PluginFileError, checked_root, cleanup_expired, package_path,
-                                   remove_plugin, restore_plugin, scan_plugins, storage_lock, utc_stamp)
+from services.plugin_files import (SYNC_CONFIG_FILE, SYNC_CONFIG_MAX_BYTES, PluginFileError, checked_root, cleanup_expired,
+                                   inside, package_path, read_json, remove_plugin, restore_plugin, scan_plugins,
+                                   storage_lock, utc_stamp)
 
 CONTAINER_RE = re.compile(r'^[a-f0-9]{12,64}$')
 MAX_CONTAINERS = 500
@@ -66,13 +66,6 @@ def _env(info):
     return dict(value.split('=', 1) for value in info.get('Config', {}).get('Env', []) if '=' in value)
 
 
-def _inside(path, root):
-    try:
-        return os.path.commonpath([str(path), str(root)]) == str(root)
-    except ValueError:
-        return False
-
-
 def _host_mapping(info, destination):
     choices = []
     for mount in info.get('Mounts', []):
@@ -90,14 +83,13 @@ def storage_mount(info):
     working = PurePosixPath(info.get('Config', {}).get('WorkingDir') or '/app/nocobase')
     # 只读取显式挂载且位于管理根内的配置，不输出其中凭据。
     config = {}
-    config_file = PurePosixPath(env.get('ORCHISKY_CONFIG_FILE') or str(working / 'sync-plugins.config.json'))
+    config_file = PurePosixPath(env.get('ORCHISKY_CONFIG_FILE') or str(working / SYNC_CONFIG_FILE))
     if not config_file.is_absolute():
         config_file = working / config_file
     mapped_config = _host_mapping(info, config_file)
-    if mapped_config and _inside(mapped_config[1].resolve(), Path(PROJECTS_ROOT).resolve()) and mapped_config[1].is_file():
-        from services.plugin_files import read_json
+    if mapped_config and inside(mapped_config[1].resolve(), Path(PROJECTS_ROOT).resolve()) and mapped_config[1].is_file():
         try:
-            config, _, _ = read_json(mapped_config[1], limit=65536)
+            config, _, _ = read_json(mapped_config[1], limit=SYNC_CONFIG_MAX_BYTES)
         except (OSError, ValueError, PluginFileError):
             raise PluginFileError('invalid', '无法读取插件同步配置')
     configured = env.get('PLUGIN_STORAGE_PATH') or config.get('storagePath') or 'storage/plugins'
@@ -114,7 +106,7 @@ def storage_mount(info):
     if not source:
         raise PluginFileError('unsupported', '插件目录未映射到 Agent 可访问的路径')
     managed = Path(PROJECTS_ROOT).resolve()
-    if not _inside(root.resolve(), managed):
+    if not inside(root.resolve(), managed):
         raise PluginFileError('unsafe_path', '插件挂载不在 Agent 管理目录中')
     root = checked_root(root)
     modules = PurePosixPath(env.get('NODE_MODULES_PATH') or config.get('nodeModulesPath') or 'node_modules')
@@ -166,8 +158,8 @@ def collect_inventory(info, containers, mounts=None):
                 if isinstance(other_mount, Exception):
                     continue
                 shared_modules = other_mount and mount['modulesMount'] and other_mount['modulesMount'] and (
-                    _inside(mount['modulesMount'], other_mount['modulesMount']) or _inside(other_mount['modulesMount'], mount['modulesMount']))
-                if other_mount and (shared_modules or _inside(mount['root'], other_mount['root']) or _inside(other_mount['root'], mount['root'])):
+                    inside(mount['modulesMount'], other_mount['modulesMount']) or inside(other_mount['modulesMount'], mount['modulesMount']))
+                if other_mount and (shared_modules or inside(mount['root'], other_mount['root']) or inside(other_mount['root'], mount['root'])):
                     shared.append(str(other.get('Name', '')).lstrip('/'))
             except (PluginFileError, OSError):
                 continue
@@ -235,7 +227,7 @@ def enrich_statuses(services):
 
 def _project(project_dir):
     project = Path(project_dir).resolve()
-    if not _inside(project, Path(PROJECTS_ROOT).resolve()) or not find_compose_file(str(project)):
+    if not inside(project, Path(PROJECTS_ROOT).resolve()) or not find_compose_file(str(project)):
         raise PluginFileError('unsafe_path', '目标不在 Agent 管理的 compose 目录中')
     return str(project)
 

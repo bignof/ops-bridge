@@ -439,3 +439,105 @@ def test_symlinked_ops_guard_status_is_rejected(root, tmp_path):
         pytest.skip('本机无符号链接权限，Linux 验收覆盖此分支')
     result = files.scan_plugins(root)
     assert result['opsGuard'] is None and result['opsGuardError'] == 'invalid'
+
+
+# ---- 嵌套极深的 JSON：json.loads 抛 RecursionError（不是 ValueError），read_json 统一转成 PluginFileError ----
+
+DEEP = b'[' * 50000    # 远超各 CPython 构建的 C 递归上限，又小于 64KB / 256KB 的读取上限
+
+
+class RecursingJson:
+    """services.plugin_files 里 json 模块的替身：loads 抛 RecursionError，其余照旧。"""
+
+    def __getattr__(self, name):
+        return getattr(json, name)
+
+    @staticmethod
+    def loads(*args, **kwargs):
+        raise RecursionError('maximum recursion depth exceeded while decoding a JSON array from a unicode string')
+
+
+def test_read_json_turns_deep_nesting_into_a_plugin_file_error(root):
+    path = root / 'deep.json'
+    path.write_bytes(DEEP)
+    with pytest.raises(files.PluginFileError) as error:
+        files.read_json(path)
+    assert error.value.code == 'invalid'
+    assert '嵌套' in str(error.value)
+
+
+def test_scan_plugins_survives_deeply_nested_metadata(root):
+    put(root, 'good-plugin', '1.0.0')
+    broken = root / 'deep-plugin'
+    broken.mkdir()
+    (broken / 'package.json').write_bytes(DEEP)
+    (root / files.REPORT_FILE).write_bytes(DEEP)
+    result = files.scan_plugins(root)    # 修复前：RecursionError 直接穿出，整次盘点失败
+    assert [entry['name'] for entry in result['entries']] == ['good-plugin']
+    assert [entry['name'] for entry in result['errors']] == ['deep-plugin']
+    assert result['sync'] is None and result['syncError'] == '同步回执无法读取'
+
+
+@pytest.mark.parametrize('forced', [False, True], ids=['deep-file', 'forced-recursion-error'])
+def test_deeply_nested_ops_guard_status_is_invalid(root, monkeypatch, forced):
+    # 口令保护状态文件最多 4096 字节：有的 CPython 构建（如 Linux 上的 10000 层上限）在这个大小内嵌套不到抛 RecursionError，
+    # 所以另有一个替身版本，保证两种构建上这条路径都被测到
+    content = b'[' * (files.OPS_GUARD_MAX_BYTES - 96)
+    (root / files.OPS_GUARD_FILE).write_bytes(content)
+    if forced:
+        monkeypatch.setattr(files, 'json', RecursingJson())
+    else:
+        try:
+            json.loads(content)
+        except RecursionError:
+            pass
+        except ValueError:
+            pytest.skip('本解释器的 json 在 4096 字节内抛的是 ValueError，由 forced-recursion-error 版本覆盖')
+    assert files.read_ops_guard(root) == (None, 'invalid')    # 修复前：RecursionError 直接穿出
+    result = files.scan_plugins(root)
+    assert result['opsGuard'] is None and result['opsGuardError'] == 'invalid'
+
+
+def test_trash_listing_and_cleanup_skip_a_deeply_nested_record(root):
+    put(root)
+    removed = remove(root)
+    directory, _ = files.trash_record(root, removed['trashId'])
+    (directory / 'meta.json').write_bytes(DEEP)
+    assert files.list_trash(root) == []    # 修复前：RecursionError 穿出
+    files.cleanup_expired(root)
+    assert (directory / 'plugin/keep.txt').exists()    # 读不懂的记录留给人工检查，不删
+
+
+# ---- inside：并成一份的路径包含判断 ----
+
+def test_inside_compares_whole_path_segments(tmp_path):
+    data = tmp_path / 'data'
+    assert files.inside(str(data), str(data))
+    assert files.inside(str(data / 'app' / 'x.json'), str(data))
+    assert not files.inside(str(tmp_path / 'data-other' / 'app'), str(data))    # 同前缀的兄弟目录不算在内
+    assert not files.inside(str(tmp_path), str(data))                           # 上级不算在内
+    assert files.inside(data / 'app', data)                                     # 调用方也会传 Path
+
+
+def test_inside_treats_paths_on_different_drives_as_outside(tmp_path, monkeypatch):
+    def other_drive(paths):
+        raise ValueError("Paths don't have the same drive")
+
+    monkeypatch.setattr(os.path, 'commonpath', other_drive)
+    assert files.inside(str(tmp_path / 'a'), str(tmp_path)) is False
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='只有 Windows 的路径不分大小写')
+def test_inside_ignores_case_on_windows(tmp_path):
+    assert files.inside(str(tmp_path / 'Data' / 'App').upper(), str(tmp_path / 'data'))
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='Windows 的路径不分大小写')
+def test_inside_is_case_sensitive_on_posix(tmp_path):
+    assert not files.inside(str(tmp_path / 'Data' / 'app'), str(tmp_path / 'data'))
+
+
+# ---- 拉取配置的文件名和读取上限：读它的两处（storage_mount、compose 发现）共用这里的常量 ----
+
+def test_sync_config_constants_are_defined_once_here():
+    assert (files.SYNC_CONFIG_FILE, files.SYNC_CONFIG_MAX_BYTES) == ('sync-plugins.config.json', 65536)

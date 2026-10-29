@@ -248,3 +248,33 @@ def test_ops_guard_status_compares_js_and_docker_timestamps(setup):
     assert plugins.collect_inventory(setup.info, [setup.info])['opsGuardError'] is None
     files.atomic_json(setup.root / files.OPS_GUARD_FILE, _guard('2026-10-13T07:59:57.000Z'))
     assert plugins.collect_inventory(setup.info, [setup.info])['opsGuardError'] == 'stale'
+
+
+def _mount_project_at_app_root(setup):
+    """项目目录整个挂到 /app/nocobase：storage_mount 会去读目录里的 sync-plugins.config.json。"""
+    setup.info['Mounts'] = [{'Source': str(setup.project), 'Destination': '/app/nocobase', 'RW': True}]
+
+
+def test_deeply_nested_config_is_visible_as_read_error(setup):
+    # json 对嵌套极深的文件抛 RecursionError（不是 ValueError）：read_json 转成 PluginFileError，
+    # 一个畸形配置只让这个容器报错，不能让整批盘点失败
+    _mount_project_at_app_root(setup)
+    (setup.project / 'sync-plugins.config.json').write_bytes(b'[' * 50000)
+    with pytest.raises(files.PluginFileError) as error:    # 修复前：RecursionError 穿出 storage_mount
+        plugins.storage_mount(setup.info)
+    assert error.value.code == 'invalid' and '无法读取插件同步配置' in str(error.value)
+    assert plugins.collect_inventory(setup.info, [setup.info])['status'] == 'error'
+    assert plugins.enrich_statuses(setup.services)[0]['plugins']['status'] == 'error'
+
+
+def test_sync_config_size_limit_is_64k(setup):
+    # 与 core/compose_inspect.py 读同一个文件，上限一致：恰好 65536 字节能读，多 1 字节不读
+    (setup.project / 'custom/plugins').mkdir(parents=True)
+    _mount_project_at_app_root(setup)
+    config = setup.project / 'sync-plugins.config.json'
+    head = b'{"storagePath": "custom/plugins"}'
+    config.write_bytes(head + b' ' * (65536 - len(head)))
+    assert plugins.storage_mount(setup.info)['containerPath'] == '/app/nocobase/custom/plugins'
+    config.write_bytes(head + b' ' * (65537 - len(head)))
+    with pytest.raises(files.PluginFileError, match='无法读取插件同步配置'):
+        plugins.storage_mount(setup.info)

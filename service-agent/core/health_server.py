@@ -161,9 +161,10 @@ class _HealthHandler(BaseHTTPRequestHandler):
         通过返回 True；不通过时已经回出响应、返回 False，调用方直接 return：
           AGENT_LOCAL_SECRET 未配置 → 403，并记一条只含端点名（label）的 warning；
           请求头不符或没带          → 401。
-        这两种拒绝都没有响应体，也不要给它们加：agent 自己拒绝的 400 / 401 / 403 / 404 一律不带响应体，
-        只有中枢经 agent 回来的错误才带 {"reason": ...}（如 403 {"reason": "not_bound"}），
-        应用侧靠「有没有 reason」区分是谁拒绝的。
+        这两种拒绝都没有响应体，也不要给它们加：agent 自己拒绝的 400 / 401 / 403 / 404 一律不带响应体。
+        应用侧据此判断：没有响应体的 401 / 403 就是 agent 本机拒绝了密钥；带 {"reason": ...} 的响应不是鉴权拒绝
+        （如 403 {"reason": "not_bound"}，以及 hub_rpc.call 折出的 501 / 503 / 504——它们由 agent 自己产生，也带 reason）。
+        反过来，没有响应体的不一定是 agent 拒绝的：/queryPlugin 的 404 / 502 来自中枢，同样不带响应体。
         warning 只记 label，绝不记请求头里的值。"""
         if not AGENT_LOCAL_SECRET:
             # 评审 H1：secret 未配置 fail-closed（403），绝不放行——端点发布在宿主全网卡，

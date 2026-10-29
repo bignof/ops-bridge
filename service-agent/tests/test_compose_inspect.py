@@ -232,7 +232,7 @@ def test_missing_config(sync_root: Path) -> None:
         pytest.param(b"\xff\xfe not json", id="not-utf8"),
         pytest.param("x" * 70000, id="oversized-garbage"),
         pytest.param('{"service": "k3f9qm", "pad": "' + "x" * 70000 + '"}', id="oversized-but-valid-json"),
-        pytest.param("[" * 50000, id="deeply-nested"),  # json 抛 RecursionError，不是 ValueError
+        pytest.param("[" * 50000, id="deeply-nested"),  # json 抛 RecursionError，不是 ValueError；read_json 统一转成 PluginFileError
     ],
 )
 def test_invalid_config(sync_root: Path, content: bytes | str) -> None:
@@ -407,3 +407,112 @@ def test_inspect_does_not_report_sync_config(sync_root: Path) -> None:
 
 def test_capability_listed() -> None:
     assert "discover_sync_service" in CAPABILITIES
+
+
+# ---- 评审留下的小问题：路径解析出错、读文件权限、悬空链接、用 discover_projects 自己的 root ----
+
+
+@pytest.mark.parametrize(
+    "error",
+    [pytest.param(OSError(5, "I/O error"), id="OSError"), pytest.param(ValueError("embedded null byte"), id="ValueError")],
+)
+def test_config_path_resolution_failure_makes_only_that_project_invalid(
+    sync_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, error: Exception
+) -> None:
+    _project(sync_root / "flaky", config={"service": "k3f9qm"})
+    _project(sync_root / "good", config={"service": "k3f9qm"})
+    real_realpath = os.path.realpath
+
+    def flaky_realpath(path, *args, **kwargs):
+        if Path(path).parent.name == "flaky":  # 只有这个目录里的配置文件解析不了路径
+            raise error
+        return real_realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", flaky_realpath)
+    caplog.set_level(logging.INFO)
+
+    found = _discover(sync_root)  # 修复前：异常穿出 discover_projects，handle_discover 会把整次扫描回成 io_error
+
+    assert (found["flaky"]["syncService"], found["flaky"]["syncConfigError"]) == (None, "invalid")
+    assert found["good"]["syncService"] == "k3f9qm" and "syncConfigError" not in found["good"]
+    assert str(sync_root / "flaky") in caplog.text and type(error).__name__ in caplog.text  # 记目录和错误类别
+    ws = FakeWs()
+    compose_inspect.handle_discover(ws, {"requestId": "d1"})
+    assert "error" not in ws.messages[-1] and len(ws.messages[-1]["projects"]) == 2
+
+
+def test_projects_root_resolution_failure_does_not_fail_the_scan(
+    sync_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _project(sync_root / "a", config={"service": "k3f9qm"})
+    _project(sync_root / "b", config={"service": "k3f9qm"})
+    real_realpath = os.path.realpath
+
+    def flaky_realpath(path, *args, **kwargs):
+        if os.path.normcase(str(path)) == os.path.normcase(str(sync_root)):  # 解析扫描根本身出错
+            raise OSError(5, "I/O error")
+        return real_realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", flaky_realpath)
+    ws = FakeWs()
+
+    compose_inspect.handle_discover(ws, {"requestId": "d1"})
+
+    frame = ws.messages[-1]
+    assert "error" not in frame  # 不是 io_error：目录照常列出，只是读不了拉取编码
+    assert [(p["syncService"], p["syncConfigError"]) for p in frame["projects"]] == [(None, "invalid")] * 2
+
+
+def test_unreadable_config_is_invalid_not_missing(
+    sync_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """打开配置文件时 PermissionError（OSError，但不是 FileNotFoundError）归 invalid：文件在，只是读不了。"""
+    locked = _project(sync_root / "locked", config={"service": "k3f9qm"})
+    _project(sync_root / "good", config={"service": "k3f9qm"})
+    real_open = os.open
+
+    def deny(path, *args, **kwargs):
+        if Path(path).name == SYNC_CONFIG and Path(path).parent.name == "locked":
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", deny)
+    caplog.set_level(logging.INFO)
+
+    found = _discover(sync_root)
+
+    assert (found["locked"]["syncService"], found["locked"]["syncConfigError"]) == (None, "invalid")
+    assert found["good"]["syncService"] == "k3f9qm"
+    assert str(locked) in caplog.text and "PermissionError" in caplog.text
+
+
+def test_dangling_symlink_to_a_target_inside_root_is_missing(sync_root: Path) -> None:
+    proj = _project(sync_root / "app")
+    _symlink(proj / SYNC_CONFIG, sync_root / "shared" / "gone.json")  # 目标在根内，但不存在
+    assert compose_inspect.read_sync_service(str(proj)) == (None, "missing")
+
+
+def test_dangling_symlink_to_a_target_outside_root_is_invalid(
+    sync_root: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    proj = _project(sync_root / "app")
+    _symlink(proj / SYNC_CONFIG, tmp_path / "data-other" / "gone.json")  # 目标在根外，也不存在：根本不去看
+    caplog.set_level(logging.INFO)
+    assert compose_inspect.read_sync_service(str(proj)) == (None, "invalid")
+    assert str(proj) in caplog.text and "outside_projects_root" in caplog.text
+
+
+def test_discover_checks_containment_against_its_own_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """判越界用 discover_projects 传进来的 root，不是全局 PROJECTS_ROOT；单参数的 read_sync_service 仍取全局值。"""
+    root = tmp_path / "data"
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.setattr(compose_inspect, "PROJECTS_ROOT", str(elsewhere))
+    proj = _project(root / "app", config={"service": "k3f9qm"})
+
+    p = _only_project(root)  # 修复前：项目在全局根之外，得 invalid
+
+    assert p["syncService"] == "k3f9qm" and "syncConfigError" not in p
+    assert compose_inspect.read_sync_service(str(proj)) == (None, "invalid")  # 原有的单参数调用形态不变
+    assert compose_inspect.read_sync_service(str(proj), str(root)) == ("k3f9qm", None)
+    assert compose_inspect.read_sync_service(str(proj), root=str(elsewhere)) == (None, "invalid")
