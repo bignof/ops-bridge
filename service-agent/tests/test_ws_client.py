@@ -375,3 +375,114 @@ def test_ops_code_follows_connection_lifecycle(monkeypatch: pytest.MonkeyPatch) 
 
     module._on_open(ws)                                   # 重连：特性回到未知
     assert ops_code.verify(dict(fields)) == (503, {"reason": "negotiating"})
+
+
+def test_hub_hello_passes_features_to_hub_rpc(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _import_ws_client(monkeypatch)
+    from core import hub_rpc
+
+    seen: list[object] = []
+    monkeypatch.setattr(hub_rpc, "set_features", lambda features: seen.append(features))
+
+    module._on_message(SimpleNamespace(), json.dumps({"type": "hub_hello", "features": ["header_auth", "env_config"]}))
+    module._on_message(SimpleNamespace(), json.dumps({"type": "hub_hello"}))      # 旧中枢的 hub_hello 没有 features
+
+    assert seen == [["header_auth", "env_config"], None]
+
+
+@pytest.mark.parametrize("msg_type", ["env_config_result", "instance_snapshot_result"])
+def test_on_message_routes_hub_rpc_result_frames(monkeypatch: pytest.MonkeyPatch, msg_type) -> None:
+    module = _import_ws_client(monkeypatch)
+    from core import hub_rpc
+
+    seen: list[dict] = []
+    monkeypatch.setattr(hub_rpc, "resolve", lambda data: seen.append(data))
+    payload = {"type": msg_type, "requestId": "r1", "env": {"allowUi": True, "allowDs": True}}
+
+    module._on_message(SimpleNamespace(), json.dumps(payload))
+
+    assert seen == [payload]
+
+
+@pytest.mark.parametrize(
+    "msg_type",
+    ["ops_code_verify_result", "plugin_query_result", "env_config_query", "instance_snapshot_query", "something_else"],
+)
+def test_on_message_does_not_route_other_frames_to_hub_rpc(monkeypatch: pytest.MonkeyPatch, msg_type) -> None:
+    module = _import_ws_client(monkeypatch)
+    from core import hub_rpc
+
+    seen: list[dict] = []
+    monkeypatch.setattr(hub_rpc, "resolve", lambda data: seen.append(data))
+
+    module._on_message(SimpleNamespace(), json.dumps({"type": msg_type, "requestId": "r1"}))
+
+    assert seen == []
+
+
+def test_hub_rpc_follows_connection_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _import_ws_client(monkeypatch)
+    from core import hub_rpc
+
+    monkeypatch.setattr(module, "_start_heartbeat", lambda ws: None)
+    monkeypatch.setattr(module, "start_status_reporting", lambda ws: None)
+    monkeypatch.setattr(module.agent_upgrade, "on_connected", lambda ws: None)
+    sent: list[dict] = []
+    ws = SimpleNamespace(keep_running=True, send=lambda raw: sent.append(json.loads(raw)))
+    env_query = ("env_config_query", {"service": "k3f9qm"}, "env_config", 5)
+    snapshot_query = ("instance_snapshot_query", {"service": "k3f9qm"}, "instance_snapshot", 5)
+
+    def ask(query):
+        box: dict = {}
+        worker = threading.Thread(target=lambda: box.update(result=hub_rpc.call(*query)))
+        worker.start()
+        return worker, box
+
+    def frames(frame_type):
+        return [message for message in sent if message.get("type") == frame_type]
+
+    def wait_for_frames(frame_type, count):
+        deadline = time.monotonic() + 2
+        while len(frames(frame_type)) < count and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(frames(frame_type)) == count, f"没有等到第 {count} 个 {frame_type} 帧：{sent}"
+        return frames(frame_type)[count - 1]
+
+    assert hub_rpc.call(*env_query) == (503, {"reason": "hub_disconnected"})     # 还没连上
+
+    module._on_open(ws)                                   # 连上：特性未知，请求等 hub_hello，不立即判 501
+    waiting = ask(env_query)
+    time.sleep(0.1)
+    assert sent == []
+
+    module._on_message(ws, json.dumps({"type": "hub_hello", "features": ["header_auth", "env_config", "instance_snapshot"]}))
+    frame = wait_for_frames("env_config_query", 1)
+    assert frame["service"] == "k3f9qm"
+    module._on_message(ws, json.dumps({"type": "env_config_result", "requestId": frame["requestId"],
+                                       "env": {"allowUi": False, "allowDs": True}}))
+    waiting[0].join(2)
+    assert waiting[1]["result"] == (200, {"allowUi": False, "allowDs": True})
+
+    snapshot_worker = ask(snapshot_query)                 # 实例快照走同一条通道
+    frame = wait_for_frames("instance_snapshot_query", 1)
+    module._on_message(ws, json.dumps({"type": "instance_snapshot_result", "requestId": frame["requestId"],
+                                       "snapshot": {"schemaVersion": 1}}))
+    snapshot_worker[0].join(2)
+    assert snapshot_worker[1]["result"] == (200, {"schemaVersion": 1})
+
+    pending = ask(env_query)                              # 等结果期间断线：立即返回，不干等超时
+    wait_for_frames("env_config_query", 2)
+    started = time.monotonic()
+    module._on_close(ws, 1006, "gone")
+    pending[0].join(2)
+    assert pending[1]["result"] == (503, {"reason": "hub_disconnected"})
+    assert time.monotonic() - started < 1
+    assert hub_rpc.call(*env_query) == (503, {"reason": "hub_disconnected"})
+
+    module._on_open(ws)                                   # 重连：特性回到未知，重新等本连接的 hub_hello
+    again = ask(env_query)
+    time.sleep(0.1)
+    assert len(frames("env_config_query")) == 2
+    module._on_message(ws, json.dumps({"type": "hub_hello", "features": ["header_auth"]}))   # 新连接上的中枢不支持
+    again[0].join(2)
+    assert again[1]["result"] == (501, {"reason": "hub_unsupported"})

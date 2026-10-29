@@ -54,3 +54,13 @@ def isolated_ops_code_state():
     ops_code.reset()
     yield
     ops_code.reset()
+
+
+@pytest.fixture(autouse=True)
+def isolated_hub_rpc_state():
+    """hub_rpc 同样是模块级单例（连接、特性、在途表、发送队列）：每个用例前后清空，防跨用例串状态。"""
+    from core import hub_rpc
+
+    hub_rpc.reset()
+    yield
+    hub_rpc.reset()
