@@ -414,7 +414,12 @@ def test_capability_listed() -> None:
 
 @pytest.mark.parametrize(
     "error",
-    [pytest.param(OSError(5, "I/O error"), id="OSError"), pytest.param(ValueError("embedded null byte"), id="ValueError")],
+    [
+        pytest.param(OSError(5, "I/O error"), id="OSError"),
+        pytest.param(ValueError("embedded null byte"), id="ValueError"),
+        # posixpath.realpath 每跳一个符号链接递归一层：一条约 1000 环的链就让它抛 RecursionError（Linux 上实测 1100 环）
+        pytest.param(RecursionError("maximum recursion depth exceeded"), id="RecursionError"),
+    ],
 )
 def test_config_path_resolution_failure_makes_only_that_project_invalid(
     sync_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, error: Exception

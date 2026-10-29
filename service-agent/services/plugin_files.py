@@ -41,7 +41,8 @@ def utc_stamp(value=None):
 
 
 def inside(child, root):
-    """child 是否落在 root 内（含 root 本身），都是路径字符串或 Path。agent 里判断路径越界只用这一份。
+    """child 是否落在 root 内（含 root 本身），都是路径字符串或 Path。services 和 compose 发现共用这一份；
+    core/log_paths.py 另有一份（写法不同），暂未合并。
     按路径段比较：/data-other 不算在 /data 内；Windows 上不分大小写（normcase，POSIX 上原样）；
     不同盘符时 os.path.commonpath 抛 ValueError，按不在内处理。调用方应先把两边都解析成真实路径。"""
     child, root = os.path.normcase(child), os.path.normcase(root)

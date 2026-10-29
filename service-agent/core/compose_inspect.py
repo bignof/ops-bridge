@@ -70,14 +70,16 @@ def read_sync_service(project_dir: str, root: str | None = None) -> tuple[str | 
     这是在客户服务器上读目录里的文件：只读 root 内的真实路径（先解析符号链接，真实路径越界的不打开它）。
     root 默认取 PROJECTS_ROOT；discover_projects 传它自己扫描的 root，判越界和扫描用同一个根。
     大小在读内容之前由 read_json 判断（超限不读，读取也只读 limit + 1 字节）。
-    除了「文件不存在」（missing），解析路径、打开、解码时的 OSError / ValueError（嵌套过深 read_json 已转成 PluginFileError）
-    一律归 invalid、不向外抛：一个目录的问题不能让整次扫描失败。日志只记目录和错误类别，不记文件内容。
+    除了「文件不存在」（missing），解析路径（OSError / ValueError，符号链接链太长时还有 RecursionError）、打开、解码
+    （嵌套过深 read_json 已转成 PluginFileError）时出的错一律归 invalid、不向外抛：一个目录的问题不能让整次扫描失败。
+    日志只记目录和错误类别，不记文件内容。
     """
     root = PROJECTS_ROOT if root is None else root
     try:
+        # posixpath.realpath 每跳一个符号链接递归一层：约 1000 环的链会抛 RecursionError（不是 OSError）
         path = os.path.realpath(os.path.join(project_dir, SYNC_CONFIG_FILE))
         outside = not inside(path, os.path.realpath(root))
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         return _invalid(project_dir, type(exc).__name__)
     if outside:
         return _invalid(project_dir, "outside_projects_root")

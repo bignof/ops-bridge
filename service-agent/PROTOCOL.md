@@ -252,7 +252,7 @@ Agent 每 `STATUS_REPORT_INTERVAL` 秒、命令结束后以及每条新连接收
   | --- | --- | --- |
   | 成功，应用没要 `withEnv`（老应用） | 200 | 纯数组 `[PluginItem, …]`，哪怕 Hub 回了 `env` |
   | 成功，应用要了 `withEnv`，Hub 回了合规的 `env` | 200 | `{"plugins": [PluginItem, …], "env": {"allowUi": true, "allowDs": false}}` |
-  | 成功，应用要了 `withEnv`，Hub 没回 `env`（旧 Hub，或 `env` 形状不合规） | 200 | 仍是纯数组，应用据此把开关当作未同步 |
+  | 成功，应用要了 `withEnv`，Hub 没回 `env`（旧 Hub，或 `env` 形状不合规） | 200 | 仍是纯数组，应用据此知道这次没取到开关：沿用最近一次成功取到的值，从没取到过才按「未同步」（不拦）处理 |
   | Hub 回 `not_bound` | 403 | `{"reason": "not_bound"}`，应用据此把它和 Agent 自己拒绝密钥的 403（没有响应体）区分开 |
   | Hub 回 `not_found` | 404 | 无 |
   | Hub 回 `unavailable` | 502 | 无 |
@@ -332,7 +332,7 @@ Agent 回：`logs_started {sessionId, tail, timestamps}`、`logs_chunk {sessionI
 
   | 字段 | 要求 |
   | --- | --- |
-  | `service` | 服务编码，1～255 个字符 |
+  | `service` | 拉取编码，1～255 个字符 |
   | `code` | 口令，1～64 个字符 |
   | `operation` | 受控操作标识，匹配 `^[A-Za-z0-9_.-]{1,64}:[A-Za-z0-9_.-]{1,64}$` |
   | `operationLabel` | 可选，操作名，不超过 64 个字符 |
@@ -357,7 +357,7 @@ Agent 回：`logs_started {sessionId, tail, timestamps}`、`logs_chunk {sessionI
 **帧**
 
 ```json
-{ "type": "ops_code_verify", "requestId": "…", "service": "done-admin", "code": "123456",
+{ "type": "ops_code_verify", "requestId": "…", "service": "k3f9qm", "code": "123456",
   "operation": "backups:upload", "operationLabel": "上传备份并还原",
   "operator": { "userId": 1, "name": "张三", "ip": "172.18.0.1" },
   "file": { "name": "a.nbdata", "size": 1048576 }, "target": "a.nbdata" }
@@ -380,7 +380,7 @@ Agent 回：`logs_started {sessionId, tail, timestamps}`、`logs_chunk {sessionI
 
 - Hub 在 `hub_hello.features` 里声明 `ops_code` 才支持本协议。Agent 的特性状态跟着连接走：连上时置为未知，收到 `hub_hello` 时记下，断开时清空。
 - 结果帧不进出站队列：一问一答，断连即失败。Agent 断开连接时立即唤醒全部在途请求（返回 `disconnected`），迟到的结果按连接代次丢弃；结果和断线先到的说了算，已经收到的结果不会被随后的断线改写；连接被换掉而没有收到关闭事件时，旧连接上的等待者同样被唤醒。Hub 只把结果发回受理请求的那条连接，那条连接已断开就丢弃。
-- Agent 只有一个发送线程，配容量 8 的有界队列；排队超过 8 秒、属于旧连接或调用方已放弃的帧直接丢弃。传输层与第 11、12 节共用（`core/hub_channel.py`），各持一个独立的通道，在途名额和发送队列互不占用。
+- 发送走专用线程和容量 8 的有界队列；排队超过 8 秒、属于旧连接或调用方已放弃的帧直接丢弃。传输层与第 11、12 节共用实现（`core/hub_channel.py`），但每个通道各有一个发送线程、一个队列和 8 个在途名额：运维口令校验一个通道（线程 `ops-code-sender`），环境开关和实例快照合用另一个（线程 `hub-rpc-sender`），两者互不占用。
 - Hub 只信连接锁定的 Agent，不信请求里自报的环境：按 `service`（拉取编码）找到应用并以它所在的环境为准，核对这个环境已绑定该 Agent 所在的服务器、且这台服务器上有该应用的实例，再按（环境, `service`）分桶限流（10 分钟失败 20 次锁 15 分钟）。
 - 两端日志都不记口令。
 
@@ -431,7 +431,7 @@ Agent 回：`logs_started {sessionId, tail, timestamps}`、`logs_chunk {sessionI
 - 协商期间要等：运维口令校验在 `hub_hello` 还没到时立即回 503 `negotiating`，这两个查询则等待，不立即回 501，免得应用把「刚连上」误认成「Hub 太旧」。窗口从连上算起最多 5 秒（「连上」的算法同第 10 节）：`hub_hello` 到了立即继续，到时仍没有才当旧版 Hub 回 501。总时限包含等协商的时间。
 - 结果帧不进出站队列：一问一答，断连即失败。断开连接时立即唤醒全部在途请求（503 `hub_disconnected`）；迟到的结果、旧连接的结果、不认识的 `requestId` 一律丢弃，已经收到的结果不会被随后的断线改写。Hub 只把结果发回受理请求的那条连接。
 - 结果帧必须和请求对得上：类型是请求对应的那一种（`env_config_result` 对 `env_config_query`，`instance_snapshot_result` 对 `instance_snapshot_query`），响应体字段（`env` / `snapshot`）是对象；否则按 502 `unavailable` 处理，日志只记字段名，不记内容。
-- 在途上限 8 个（包括正在等协商的），超出直接 503 `busy`：Hub 慢或卡住时，应用每分钟的查询不会越积越多。发送线程配容量 8 的有界队列，不设排队超时，只丢属于旧连接、或调用方已放弃的帧（与第 10 节不同：这里的调用方都有总时限，固定的排队超时会误丢仍在等的帧）。
+- 在途上限 8 个（包括正在等协商的），超出直接 503 `busy`：Hub 慢或卡住时，应用每分钟的查询不会越积越多。`/envConfig` 和 `/instanceSnapshot` 共用这个通道（线程 `hub-rpc-sender`）的 8 个在途名额和容量 8 的发送队列，所以 Hub 卡住时，每分钟的开关轮询会和快照请求抢名额，抢不到的直接 503 `busy`。发送队列不设排队超时，只丢属于旧连接、或调用方已放弃的帧（与第 10 节不同：这里的调用方都有总时限，固定的排队超时会误丢仍在等的帧）。
 - `AGENT_LOCAL_SECRET` 一台机器一个，只能证明请求来自这台机器：同机的应用改一下 `service` 就能查别的应用的开关或快照，Hub 仍按 `service` 核对那个应用所在的环境已绑定这台服务器（`not_bound`）。第一期接受这种机器级互信，和 `/queryPlugin` 一样。
 - Agent 的日志只记路径、拉取编码和状态码，不记密钥，也不记结果内容。
 

@@ -402,6 +402,23 @@ def test_log_has_only_path_service_and_status(handler_for, monkeypatch, caplog):
         assert text not in caplog.text
 
 
+@pytest.mark.parametrize('path', HUB_PATHS)
+def test_successful_query_is_logged_at_debug_and_failures_at_info(handler_for, monkeypatch, caplog, path):
+    # 每个节点每分钟都会查一次：成功（200）只记 DEBUG，生产的日志级别是 INFO，不刷屏；非 200 记 INFO，内容不变
+    caplog.set_level(logging.DEBUG)
+    results = iter([(200, {'allowUi': True, 'allowDs': True}), (503, {'reason': 'hub_disconnected'}),
+                    (404, {'reason': 'not_found'})])
+    monkeypatch.setattr(hub_rpc, 'call', lambda t, f, feat, timeout: next(results))
+    for _ in range(3):
+        handler_for('GET', f'{path}?service=k3f9qm').do_GET()
+    records = [(record.levelno, record.getMessage()) for record in caplog.records if record.name == 'core.health_server']
+    assert records == [
+        (logging.DEBUG, f"{path} service='k3f9qm' status=200"),
+        (logging.INFO, f"{path} service='k3f9qm' status=503"),
+        (logging.INFO, f"{path} service='k3f9qm' status=404"),
+    ]
+
+
 def test_capabilities_include_new_names():
     assert {'plugin_query_env', 'env_config', 'instance_snapshot'} <= set(CAPABILITIES)
 

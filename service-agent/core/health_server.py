@@ -252,8 +252,9 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         status, body = hub_rpc.call(frame_type, {'service': service}, feature, timeout)
-        # 只记路径、拉取编码和状态码，不记密钥，也不记结果内容
-        logger.info('%s service=%r status=%s', path, service, status)
+        # 只记路径、拉取编码和状态码，不记密钥，也不记结果内容。每个节点每分钟都会查一次，
+        # 成功（200）只记 DEBUG，免得生产的 INFO 日志被刷屏；非 200 记 INFO
+        logger.log(logging.DEBUG if status == 200 else logging.INFO, '%s service=%r status=%s', path, service, status)
         self._send_json(status, body)
 
     def _send_json(self, status, body):

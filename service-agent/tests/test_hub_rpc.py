@@ -297,11 +297,12 @@ def test_call_timeout_shorter_than_the_window_is_504(rpc):
 
 def test_timeout_is_the_total_budget_including_negotiation(rpc):
     rpc.connect(features=None)
-    later(0.4, lambda: rpc.hello(['env_config']))         # 无人回复；hello 用掉 0.4 秒，之后只剩 0.4 秒
+    later(1.0, lambda: rpc.hello(['env_config']))         # 无人回复；hello 用掉 1.0 秒，之后只剩 0.5 秒
     started = time.monotonic()
-    assert hub_rpc.call(*ENV_QUERY, 0.8) == TIMEOUT
+    assert hub_rpc.call(*ENV_QUERY, 1.5) == TIMEOUT
     assert rpc.events == ['hello', 'frame']
-    assert time.monotonic() - started < 1.15             # 若等完协商再重新计 0.8 秒，会到 1.2 秒以上
+    # 总时限 1.5 秒，到点就返回；若等完协商再重新计 1.5 秒，会到 2.5 秒以上。阈值 2.0 秒两头都留 0.5 秒余量，慢机器上不会误红
+    assert time.monotonic() - started < 2.0
 
 
 def test_reconnect_clears_features_and_restarts_negotiation(rpc):

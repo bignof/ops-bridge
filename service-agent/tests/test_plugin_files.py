@@ -540,4 +540,12 @@ def test_inside_is_case_sensitive_on_posix(tmp_path):
 # ---- 拉取配置的文件名和读取上限：读它的两处（storage_mount、compose 发现）共用这里的常量 ----
 
 def test_sync_config_constants_are_defined_once_here():
+    # 读这个文件的两处用的就是这里的同一个对象，不是各写一份相同的字面量：另写的字面量哪怕值相同也是另一个对象，
+    # 下面的 is 断言会失败
+    from core import compose_inspect
+    from services import plugins
+
     assert (files.SYNC_CONFIG_FILE, files.SYNC_CONFIG_MAX_BYTES) == ('sync-plugins.config.json', 65536)
+    for module in (compose_inspect, plugins):
+        assert module.SYNC_CONFIG_FILE is files.SYNC_CONFIG_FILE
+        assert module.SYNC_CONFIG_MAX_BYTES is files.SYNC_CONFIG_MAX_BYTES
