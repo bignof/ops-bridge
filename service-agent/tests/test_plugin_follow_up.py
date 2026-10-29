@@ -221,10 +221,21 @@ def test_plugin_query_result_error_reaches_resolve(monkeypatch):
     monkeypatch.setattr(module.plugin_query, 'resolve', lambda *args: captured.append(args))
     module._on_message(None, json.dumps({'type': 'plugin_query_result', 'requestId': 'r1', 'plugins': [],
                                          'error': 'not_found'}))
-    assert captured == [('r1', [], 'not_found')]
+    assert captured == [('r1', [], 'not_found', None)]    # 旧中枢的结果帧没有 env
+
+
+def test_plugin_query_result_env_reaches_resolve(monkeypatch):
+    module = _import_ws_client(monkeypatch)
+    captured = []
+    monkeypatch.setattr(module.plugin_query, 'resolve', lambda *args: captured.append(args))
+    env = {'allowUi': True, 'allowDs': False}
+    module._on_message(None, json.dumps({'type': 'plugin_query_result', 'requestId': 'r1',
+                                         'plugins': [{'pluginName': 'a'}], 'env': env}))
+    assert captured == [('r1', [{'pluginName': 'a'}], None, env)]
 
 
 @pytest.mark.parametrize('error,expected', [('not_found', 'not_found'), ('unavailable', 'unavailable'),
+                                            ('not_bound', 'not_bound'),
                                             ('something-else', None), (None, None)])
 def test_request_surfaces_hub_rejection(monkeypatch, error, expected):
     # 独立模块实例：别的用例遗留的连接线程可能在断开时清掉共享模块的 sender
@@ -250,7 +261,7 @@ def _query_handler(monkeypatch, reason):
     monkeypatch.setattr(module, 'get_connection_state', lambda: {'connected': True})
     # 用 health_server 当前绑定的模块构造，别的用例可能已重新导入 core.plugin_query
     reply = module.plugin_query.QueryError(reason)
-    monkeypatch.setattr(module.plugin_query, 'request', lambda service, timeout: reply)
+    monkeypatch.setattr(module.plugin_query, 'request', lambda service, timeout, with_env=False: reply)
     handler = module._HealthHandler.__new__(module._HealthHandler)
     handler.path = '/queryPlugin?service=svc'
     handler.headers = {'X-Agent-Secret': 'topsecret'}
@@ -268,4 +279,4 @@ def test_query_plugin_maps_hub_rejection_to_error_status(monkeypatch, reason, st
     handler.do_GET()
     # 非 200 让 sync-plugins 记为清单拉取失败并保留本地版本，而不是「插件列表为空，同步成功」
     assert responses == [status]
-    assert handler.wfile.getvalue() == b''
+    assert handler.wfile.getvalue() == b''    # 这两种不带响应体；带 reason 的 not_bound（403）见 test_health_server.py

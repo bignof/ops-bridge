@@ -156,40 +156,59 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _handle_query_plugin(self):
+    def _check_local_secret(self, label):
+        """本机端点共用的鉴权：请求头 X-Agent-Secret 须与 AGENT_LOCAL_SECRET 一致。
+        通过返回 True；不通过时已经回出响应、返回 False，调用方直接 return：
+          AGENT_LOCAL_SECRET 未配置 → 403，并记一条只含端点名（label）的 warning；
+          请求头不符或没带          → 401。
+        这两种拒绝都没有响应体，也不要给它们加：agent 自己拒绝的 400 / 401 / 403 / 404 一律不带响应体，
+        只有中枢经 agent 回来的错误才带 {"reason": ...}（如 403 {"reason": "not_bound"}），
+        应用侧靠「有没有 reason」区分是谁拒绝的。
+        warning 只记 label，绝不记请求头里的值。"""
         if not AGENT_LOCAL_SECRET:
             # 评审 H1：secret 未配置 fail-closed（403），绝不放行——端点发布在宿主全网卡，
             # 空 secret 放行等于把该 namespace 插件清单匿名公开给同网段
-            logger.warning('queryPlugin 拒绝请求：AGENT_LOCAL_SECRET 未配置')
+            logger.warning('%s 拒绝请求：AGENT_LOCAL_SECRET 未配置', label)
             self.send_response(403)
             self.end_headers()
-            return
+            return False
         supplied = self.headers.get('X-Agent-Secret') or ''
         # 评审 M4：恒时比较（与 hub 侧 safeEqualHex 对齐），防逐字节短路的时序侧信道
         if not hmac.compare_digest(supplied.encode('utf-8'), AGENT_LOCAL_SECRET.encode('utf-8')):
             self.send_response(401)
             self.end_headers()
+            return False
+        return True
+
+    def _handle_query_plugin(self):
+        if not self._check_local_secret('queryPlugin'):
             return
-        service = (parse_qs(urlparse(self.path).query).get('service') or [''])[0]
+        query = parse_qs(urlparse(self.path).query)
+        service = (query.get('service') or [''])[0]
         if not service:
             self.send_response(400)   # 评审 L3：与 hubSync:queryPlugin 的必填校验对齐，不折叠成 200 []
             self.end_headers()
             return
+        # withEnv=1（或 true）：应用要同时拿环境开关，成功时响应由纯数组变成 {plugins, env}；不带的老应用仍是纯数组
+        with_env = (query.get('withEnv') or [''])[0] in ('1', 'true')
         if not get_connection_state().get('connected'):
             self.send_response(503)   # 未连 hub：让 sync-plugins.js 回退本地版本
             self.end_headers()
             return
-        items = plugin_query.request(service, QUERY_PLUGIN_TIMEOUT)
+        items = plugin_query.request(service, QUERY_PLUGIN_TIMEOUT, with_env=with_env)
         if items is None:
             self.send_response(504)
             self.end_headers()
             return
         if isinstance(items, plugin_query.QueryError):
+            if items.reason == 'not_bound':
+                # 这台服务器没有绑定到应用所在的环境 → 403，且带 reason：应用据此和 agent 自己拒绝密钥的 403（没有响应体）区分
+                return self._send_json(403, {'reason': 'not_bound'})
             # 服务不存在或未部署到本机 → 404；hub 生成清单失败（如下载基址缺配）→ 502
             self.send_response(404 if items.reason == 'not_found' else 502)
             self.end_headers()
             return
-        body = json.dumps(items).encode('utf-8')   # 顶层纯数组（request 已解包）
+        body = json.dumps(items).encode('utf-8')   # 纯数组；只有带 withEnv 且 hub 回了 env 时才是 {plugins, env}（request 已决定）
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(body)))
@@ -197,15 +216,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _handle_verify_ops_code(self):
-        if not AGENT_LOCAL_SECRET:
-            logger.warning('verifyOpsCode 拒绝请求：AGENT_LOCAL_SECRET 未配置')
-            self.send_response(403)
-            self.end_headers()
-            return
-        supplied = self.headers.get('X-Agent-Secret') or ''
-        if not hmac.compare_digest(supplied.encode('utf-8'), AGENT_LOCAL_SECRET.encode('utf-8')):
-            self.send_response(401)
-            self.end_headers()
+        if not self._check_local_secret('verifyOpsCode'):
             return
         try:
             length = int(self.headers.get('Content-Length') or '0')
@@ -225,16 +236,14 @@ class _HealthHandler(BaseHTTPRequestHandler):
 
     def _handle_hub_query(self, path, frame_type, feature, timeout):
         """/envConfig、/instanceSnapshot：应用经本机 agent 向中枢查环境开关、实例快照，agent 只转发，不缓存、不解读。
-        鉴权同 /queryPlugin；service（拉取编码）必填，长度按字符计；其余状态码和响应体照 hub_rpc.call 的结果原样发出。"""
-        if not AGENT_LOCAL_SECRET:
-            logger.warning('%s 拒绝请求：AGENT_LOCAL_SECRET 未配置', path)
-            self.send_response(403)
-            self.end_headers()
-            return
-        supplied = self.headers.get('X-Agent-Secret') or ''
-        if not hmac.compare_digest(supplied.encode('utf-8'), AGENT_LOCAL_SECRET.encode('utf-8')):
-            self.send_response(401)
-            self.end_headers()
+        鉴权同 /queryPlugin；service（拉取编码）必填，长度按字符计；其余状态码和响应体照 hub_rpc.call 的结果原样发出。
+
+        应用侧靠「有没有 reason」判断是谁拒绝的，所以 agent 自己拒绝的请求一律不带响应体：
+        400（service 缺失或超长）、401 / 403（密钥不符、没带、agent 未配置）、404（路径不认）；
+        而 hub_rpc.call 折出的错误（中枢经 agent 回来的 403 / 404 / 502，以及断线、不支持、忙、超时的 501 / 503 / 504）
+        都带 {"reason": ...}。于是没有 reason 的 401 / 403 是 agent 拒绝了应用的密钥，
+        没有 reason 的 404 是 agent 版本旧（还没有这个端点）。不要给 agent 自己的拒绝加响应体。"""
+        if not self._check_local_secret(path):
             return
         service = (parse_qs(urlparse(self.path).query).get('service') or [''])[0]
         if not _text(service, 1, 255):
@@ -263,8 +272,10 @@ class _HealthHandler(BaseHTTPRequestHandler):
 
 def start_health_server():
     if not AGENT_LOCAL_SECRET:
-        logger.warning('AGENT_LOCAL_SECRET 未配置：/queryPlugin 将拒绝所有请求（403）。'
-                       '如需 admin 经本机 agent 拉插件，请在 .env 配置该值并同步进 admin 的 sync-plugins 配置')
+        logger.warning('AGENT_LOCAL_SECRET 未配置：本机所有需要密钥的端点（/queryPlugin、/pluginSyncChanged、/verifyOpsCode、'
+                       '/envConfig、/instanceSnapshot）将拒绝所有请求（403）。'
+                       '如需 admin 等业务服务经本机 agent 调用它们，请在 .env 配置该值并同步进业务服务的配置'
+                       '（拉插件为 admin 的 sync-plugins 配置）')
     server = ThreadingHTTPServer((HEALTH_HOST, HEALTH_PORT), _HealthHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

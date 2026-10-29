@@ -16,4 +16,5 @@ CAPABILITIES = (
     'ops_code',         # 本机 /verifyOpsCode → ops_code_verify / ops_code_verify_result（PROTOCOL.md 第 10 节）
     'env_config',       # 本机 /envConfig → env_config_query / env_config_result：应用经 agent 向中枢取环境的两个配置开关
     'instance_snapshot',  # 本机 /instanceSnapshot → instance_snapshot_query / instance_snapshot_result：取本应用的实例快照
+    'plugin_query_env',   # /queryPlugin?withEnv=1 → plugin_query.withEnv / plugin_query_result.env；error 增加 not_bound（403）
 )

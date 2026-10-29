@@ -153,9 +153,11 @@ def test_start_health_server_creates_background_thread(monkeypatch: pytest.Monke
     assert thread_calls[0][1] is True
 
 
-def _make_qp_handler(module, path, connected, secret_header=None, request_return=None):
-    module.get_connection_state = lambda: {'connected': connected}
-    module.plugin_query.request = lambda service, timeout: request_return
+def _make_qp_handler(monkeypatch, module, path, connected, secret_header=None, request_return=None):
+    # 用 monkeypatch 换：core.plugin_query 是跨用例共享的模块，直接赋值会让替身留到后面的用例，
+    # 用真实 plugin_query.request 的用例就会拿到这个替身的返回值
+    monkeypatch.setattr(module, 'get_connection_state', lambda: {'connected': connected})
+    monkeypatch.setattr(module.plugin_query, 'request', lambda service, timeout, with_env=False: request_return)
     handler = module._HealthHandler.__new__(module._HealthHandler)
     handler.path = path
     handler.headers = {'X-Agent-Secret': secret_header} if secret_header is not None else {}
@@ -170,7 +172,7 @@ def _make_qp_handler(module, path, connected, secret_header=None, request_return
 def test_query_plugin_rejects_wrong_secret(monkeypatch):
     monkeypatch.setenv('AGENT_LOCAL_SECRET', 'topsecret')
     module = _import_health_server(monkeypatch)
-    h, responses = _make_qp_handler(module, '/queryPlugin?service=x', True, secret_header='wrong')
+    h, responses = _make_qp_handler(monkeypatch, module, '/queryPlugin?service=x', True, secret_header='wrong')
     h.do_GET()
     assert responses == [401]
 
@@ -178,7 +180,7 @@ def test_query_plugin_rejects_wrong_secret(monkeypatch):
 def test_query_plugin_503_when_disconnected(monkeypatch):
     monkeypatch.setenv('AGENT_LOCAL_SECRET', 'topsecret')
     module = _import_health_server(monkeypatch)
-    h, responses = _make_qp_handler(module, '/queryPlugin?service=x', False, secret_header='topsecret')
+    h, responses = _make_qp_handler(monkeypatch, module, '/queryPlugin?service=x', False, secret_header='topsecret')
     h.do_GET()
     assert responses == [503]
 
@@ -186,7 +188,7 @@ def test_query_plugin_503_when_disconnected(monkeypatch):
 def test_query_plugin_504_on_timeout(monkeypatch):
     monkeypatch.setenv('AGENT_LOCAL_SECRET', 'topsecret')
     module = _import_health_server(monkeypatch)
-    h, responses = _make_qp_handler(module, '/queryPlugin?service=x', True, secret_header='topsecret', request_return=None)
+    h, responses = _make_qp_handler(monkeypatch, module, '/queryPlugin?service=x', True, secret_header='topsecret', request_return=None)
     h.do_GET()
     assert responses == [504]
 
@@ -195,7 +197,7 @@ def test_query_plugin_200_returns_bare_array(monkeypatch):
     monkeypatch.setenv('AGENT_LOCAL_SECRET', 'topsecret')
     module = _import_health_server(monkeypatch)
     items = [{'pluginName': 'p', 'version': '1', 'url': 'u'}]
-    h, responses = _make_qp_handler(module, '/queryPlugin?service=x', True, secret_header='topsecret', request_return=items)
+    h, responses = _make_qp_handler(monkeypatch, module, '/queryPlugin?service=x', True, secret_header='topsecret', request_return=items)
     h.do_GET()
     assert responses == [200]
     body = json.loads(h.wfile.getvalue().decode('utf-8'))
@@ -207,7 +209,7 @@ def test_query_plugin_403_when_secret_unconfigured(monkeypatch):
     # 评审 H1：secret 未配置必须 fail-closed（403），不得放行任意请求
     monkeypatch.delenv('AGENT_LOCAL_SECRET', raising=False)
     module = _import_health_server(monkeypatch)
-    h, responses = _make_qp_handler(module, '/queryPlugin?service=x', True, secret_header=None)
+    h, responses = _make_qp_handler(monkeypatch, module, '/queryPlugin?service=x', True, secret_header=None)
     h.do_GET()
     assert responses == [403]
 
@@ -216,7 +218,7 @@ def test_query_plugin_400_when_service_missing(monkeypatch):
     # 评审 L3：缺 service 参数应 400（与 hubSync:queryPlugin 的必填校验对齐），不得静默 200 []
     monkeypatch.setenv('AGENT_LOCAL_SECRET', 'topsecret')
     module = _import_health_server(monkeypatch)
-    h, responses = _make_qp_handler(module, '/queryPlugin', True, secret_header='topsecret')
+    h, responses = _make_qp_handler(monkeypatch, module, '/queryPlugin', True, secret_header='topsecret')
     h.do_GET()
     assert responses == [400]
 
@@ -235,11 +237,13 @@ HUB_PATHS = [route[0] for route in HUB_ROUTES]
 def handler_for(monkeypatch):
     """造一个不起服务的 _HealthHandler（同 _make_handler 的 __new__ 写法）。
     secret 是 agent 配置的 AGENT_LOCAL_SECRET（'' = 未配置）；headers 默认带对的 X-Agent-Secret，传 {} 就是不带。
-    do_GET 之后看 status（回出的状态码）、sent_headers、json()（响应体，没有响应体为 None）。"""
+    do_GET 之后看 status（回出的状态码）、sent_headers、json()（响应体，没有响应体为 None）；
+    module 是这个 handler 用的 core.health_server 模块，用例要替换它里面的 plugin_query、get_connection_state 时用。"""
     def make(method, path, *, secret='s', headers=None):
         module = _import_health_server(monkeypatch)
         monkeypatch.setattr(module, 'AGENT_LOCAL_SECRET', secret)
         handler = module._HealthHandler.__new__(module._HealthHandler)
+        handler.module = module
         handler.command, handler.path = method, path
         handler.headers = {'X-Agent-Secret': secret} if headers is None else headers
         handler.wfile = io.BytesIO()
@@ -264,7 +268,7 @@ def handler_for(monkeypatch):
 @pytest.mark.parametrize('path,frame,feature,timeout', HUB_ROUTES)
 def test_forwards_to_hub_rpc(handler_for, monkeypatch, path, frame, feature, timeout):
     seen = []
-    monkeypatch.setattr(hub_rpc, 'call', lambda t, f, feat, timeout: seen.append((t, f, feat, timeout)) or (200, {'ok': True}))
+    monkeypatch.setattr(hub_rpc, 'call', lambda t, f, feat, actual_timeout: seen.append((t, f, feat, actual_timeout)) or (200, {'ok': True}))
     h = handler_for('GET', f'{path}?service=k3f9qm', secret='s')
     h.do_GET()
     assert (h.status, h.json(), seen) == (200, {'ok': True}, [(frame, {'service': 'k3f9qm'}, feature, timeout)])
@@ -284,6 +288,7 @@ def test_requires_secret(handler_for, monkeypatch, path, secret, headers, status
     monkeypatch.setattr(hub_rpc, 'call', lambda *args: calls.append(args))
     h = handler_for('GET', f'{path}?service=k3f9qm', secret=secret, headers=headers)
     h.do_GET()
+    # 响应体必须是 None：agent 自己拒绝的 401 / 403 不带响应体，应用侧靠「没有 reason」把它和中枢经 agent 回来的错误区分开
     assert (h.status, h.json(), calls) == (status, None, [])
 
 
@@ -297,6 +302,7 @@ def test_requires_service(handler_for, monkeypatch, path, query):
     monkeypatch.setattr(hub_rpc, 'call', lambda *args: calls.append(args))
     h = handler_for('GET', path + query)
     h.do_GET()
+    # 响应体必须是 None：agent 自己拒绝的 400 不带响应体，应用侧靠「没有 reason」区分
     assert (h.status, h.json(), calls) == (400, None, [])
 
 
@@ -319,6 +325,8 @@ def test_path_must_match_exactly(handler_for, monkeypatch, path):
     monkeypatch.setattr(hub_rpc, 'call', lambda *args: calls.append(args))
     h = handler_for('GET', path + '?service=k3f9qm')
     h.do_GET()
+    # 响应体必须是 None：agent 自己回的 404（路径不认，旧版 agent 也是这样）不带响应体；
+    # 中枢经 agent 回来的 404 带 {"reason": "not_found"}，应用侧靠有没有 reason 区分
     assert (h.status, h.json(), calls) == (404, None, [])
 
 
@@ -344,11 +352,13 @@ def test_hub_not_connected_is_503(handler_for, path):
 
 @pytest.mark.parametrize('path', HUB_PATHS)
 def test_hub_without_the_feature_is_501(handler_for, path):
-    hub_rpc.on_connected(lambda message: pytest.fail('中枢没声明这个特性，不该发出帧'))
+    sent = []
+    # 发送函数在通道的发送线程里调用，线程里 pytest.fail 抛的异常不会让测试失败：记下来，最后断言没发出过帧
+    hub_rpc.on_connected(sent.append)
     hub_rpc.set_features(['header_auth', 'ops_code'])
     h = handler_for('GET', f'{path}?service=k3f9qm')
     h.do_GET()
-    assert (h.status, h.json()) == (501, {'reason': 'hub_unsupported'})
+    assert (h.status, h.json(), sent) == (501, {'reason': 'hub_unsupported'}, [])    # 中枢没声明这个特性，不该发出帧
 
 
 @pytest.mark.parametrize('path,frame,feature,body_key,payload', [
@@ -393,4 +403,149 @@ def test_log_has_only_path_service_and_status(handler_for, monkeypatch, caplog):
 
 
 def test_capabilities_include_new_names():
-    assert {'env_config', 'instance_snapshot'} <= set(CAPABILITIES)
+    assert {'plugin_query_env', 'env_config', 'instance_snapshot'} <= set(CAPABILITIES)
+
+
+# ---- /queryPlugin?withEnv=1：拉插件顺带带回环境开关，并区分「服务器没绑定到应用所在的环境」 ----
+
+PLUGINS = [{'pluginName': 'a'}]
+ENV = {'allowUi': True, 'allowDs': False}
+
+
+def _serve_query_plugin(h, monkeypatch, request):
+    """让 h（GET /queryPlugin…）在 agent 已连上中枢、plugin_query.request 换成 request 的情况下处理一次请求。"""
+    monkeypatch.setattr(h.module, 'get_connection_state', lambda: {'connected': True})
+    monkeypatch.setattr(h.module.plugin_query, 'request', request)
+    h.do_GET()
+
+
+def test_not_bound_maps_to_403(handler_for, monkeypatch):
+    h = handler_for('GET', '/queryPlugin?service=k3f9qm')
+    error = h.module.plugin_query.QueryError('not_bound')
+    _serve_query_plugin(h, monkeypatch, lambda service, timeout, with_env=False: error)
+    # 带 reason：应用据此把「这台服务器没绑定到应用所在的环境」和 agent 自己拒绝密钥的 403（没有响应体）区分开
+    assert (h.status, h.json()) == (403, {'reason': 'not_bound'})
+    assert ('Content-Type', 'application/json') in h.sent_headers
+
+
+@pytest.mark.parametrize('query,expected', [
+    ('', False), ('&withEnv=1', True), ('&withEnv=true', True),
+    ('&withEnv=0', False), ('&withEnv=false', False), ('&withEnv=', False), ('&withEnv=yes', False),
+], ids=['absent', '1', 'true', '0', 'false', 'empty', 'yes'])
+def test_query_plugin_reads_with_env_param(handler_for, monkeypatch, query, expected):
+    seen = []
+    h = handler_for('GET', '/queryPlugin?service=k3f9qm' + query)
+    _serve_query_plugin(h, monkeypatch, lambda service, timeout, with_env=False: seen.append((service, with_env)) or [])
+    assert (h.status, seen) == (200, [('k3f9qm', expected)])
+
+
+def test_query_plugin_with_env_param_returns_object(handler_for, monkeypatch):
+    reply = {'plugins': PLUGINS, 'env': ENV}
+    h = handler_for('GET', '/queryPlugin?service=k3f9qm&withEnv=1')
+    _serve_query_plugin(h, monkeypatch, lambda service, timeout, with_env=False: reply)
+    assert (h.status, h.json()) == (200, reply)
+    assert ('Content-Type', 'application/json') in h.sent_headers
+
+
+@pytest.mark.parametrize('query,hub_env,expected', [
+    ('', ENV, PLUGINS),                                             # 老应用不带 withEnv：哪怕中枢回了 env，响应也仍是纯数组
+    ('&withEnv=1', ENV, {'plugins': PLUGINS, 'env': ENV}),
+    ('&withEnv=1', None, PLUGINS),                                  # 旧中枢不回 env：应用要了也仍是纯数组
+], ids=['old-app', 'new-app', 'old-hub'])
+def test_query_plugin_end_to_end_through_plugin_query(handler_for, monkeypatch, query, hub_env, expected):
+    # 不替换 plugin_query.request：请求帧原样发给中枢替身，结果帧回来后折成响应
+    h = handler_for('GET', '/queryPlugin?service=k3f9qm' + query)
+    monkeypatch.setattr(h.module, 'get_connection_state', lambda: {'connected': True})
+    pq, frames = h.module.plugin_query, []
+
+    def hub(frame):    # 像中枢那样回 plugin_query_result：不管请求带不带 withEnv，手里有 env 就回
+        frames.append(frame)
+        pq.resolve(frame['requestId'], PLUGINS, None, hub_env)
+
+    monkeypatch.setattr(pq, '_sender', hub)
+    h.do_GET()
+    assert (h.status, h.json()) == (200, expected)
+    assert [('withEnv' in frame) for frame in frames] == [bool(query)]    # 帧带 withEnv 当且仅当应用要了
+
+
+# ---- 本机鉴权：四个需要密钥的端点共用 _check_local_secret（/pluginSyncChanged 写法不同，见 test_plugin_reporting.py）----
+
+# 方法, 请求路径, 未配置密钥时 warning 里的端点名（/queryPlugin、/verifyOpsCode 不带斜杠，新端点是路径，原样保留）
+SECRET_ENDPOINTS = [
+    ('GET', '/queryPlugin?service=k3f9qm', 'queryPlugin'),
+    ('POST', '/verifyOpsCode', 'verifyOpsCode'),
+    ('GET', '/envConfig?service=k3f9qm', '/envConfig'),
+    ('GET', '/instanceSnapshot?service=k3f9qm', '/instanceSnapshot'),
+]
+SECRET_ENDPOINT_IDS = ['queryPlugin', 'verifyOpsCode', 'envConfig', 'instanceSnapshot']
+SECRET_REQUESTS = [(method, path) for method, path, _ in SECRET_ENDPOINTS]    # 不关心 warning 端点名的用例用
+
+
+def _serve(h):
+    """按请求方法跑一次 do_GET / do_POST。"""
+    getattr(h, 'do_' + h.command)()
+
+
+def _warnings(caplog):
+    return [record.getMessage() for record in caplog.records
+            if record.name == 'core.health_server' and record.levelno >= logging.WARNING]
+
+
+@pytest.mark.parametrize('method,path,label', SECRET_ENDPOINTS, ids=SECRET_ENDPOINT_IDS)
+def test_unconfigured_secret_is_403_with_a_warning_naming_only_the_endpoint(handler_for, caplog, method, path, label):
+    caplog.set_level(logging.DEBUG)
+    h = handler_for(method, path, secret='', headers={'X-Agent-Secret': 'guess-123'})
+    _serve(h)
+    # 响应体必须是 None：agent 自己拒绝的 403 不带响应体，应用侧靠「没有 reason」把它和 not_bound 的 403 区分开
+    assert (h.status, h.json()) == (403, None)
+    assert _warnings(caplog) == [f'{label} 拒绝请求：AGENT_LOCAL_SECRET 未配置']
+    assert 'guess-123' not in caplog.text
+
+
+@pytest.mark.parametrize('method,path', SECRET_REQUESTS, ids=SECRET_ENDPOINT_IDS)
+@pytest.mark.parametrize('supplied', [None, '', 'nope', 's3cre', 's3cret!', '密钥'],
+                         ids=['no-header', 'empty', 'wrong', 'prefix', 'longer', 'non-ascii'])
+def test_wrong_secret_is_401_without_body_or_warning(handler_for, caplog, method, path, supplied):
+    caplog.set_level(logging.DEBUG)
+    h = handler_for(method, path, secret='s3cret', headers={} if supplied is None else {'X-Agent-Secret': supplied})
+    _serve(h)
+    assert (h.status, h.json()) == (401, None)    # agent 自己拒绝的 401 不带响应体
+    assert _warnings(caplog) == []
+    assert 's3cret' not in caplog.text
+
+
+@pytest.mark.parametrize('method,path', SECRET_REQUESTS, ids=SECRET_ENDPOINT_IDS)
+def test_secret_is_compared_in_constant_time(handler_for, monkeypatch, method, path):
+    h = handler_for(method, path, secret='s3cret', headers={'X-Agent-Secret': 'guess'})
+    seen = []
+    monkeypatch.setattr(h.module.hmac, 'compare_digest', lambda a, b: seen.append((a, b)) or False)
+    _serve(h)
+    assert (h.status, seen) == (401, [(b'guess', b's3cret')])
+
+
+def test_check_local_secret_passes_silently_when_the_secret_matches(handler_for):
+    h = handler_for('GET', '/envConfig?service=k3f9qm', secret='s3cret', headers={'X-Agent-Secret': 's3cret'})
+    assert h._check_local_secret('/envConfig') is True
+    assert (h.status, h.json()) == (None, None)    # 通过时不回任何响应，由调用方接着处理
+
+
+@pytest.mark.parametrize('secret,headers,status', [
+    ('', {}, 403), ('', {'X-Agent-Secret': ''}, 403), ('s3cret', {}, 401), ('s3cret', {'X-Agent-Secret': 'x'}, 401),
+], ids=['unconfigured', 'unconfigured-empty-header', 'no-header', 'wrong'])
+def test_check_local_secret_replies_and_returns_false_when_refused(handler_for, secret, headers, status):
+    h = handler_for('GET', '/envConfig?service=k3f9qm', secret=secret, headers=headers)
+    assert h._check_local_secret('/envConfig') is False
+    assert (h.status, h.json()) == (status, None)
+
+
+def test_start_warns_that_every_secret_endpoint_refuses_when_unconfigured(monkeypatch, caplog):
+    module = _import_health_server(monkeypatch)
+    monkeypatch.setattr(module, 'AGENT_LOCAL_SECRET', '')
+    monkeypatch.setattr(module, 'ThreadingHTTPServer', lambda address, handler: SimpleNamespace(serve_forever=lambda: None))
+    monkeypatch.setattr(module, 'threading', SimpleNamespace(Thread=lambda target, daemon: SimpleNamespace(start=lambda: None)))
+    caplog.set_level(logging.DEBUG)
+    module.start_health_server()
+    warnings = _warnings(caplog)
+    assert len(warnings) == 1 and 'AGENT_LOCAL_SECRET' in warnings[0] and '403' in warnings[0]
+    for path in ('/queryPlugin', '/pluginSyncChanged', '/verifyOpsCode', '/envConfig', '/instanceSnapshot'):
+        assert path in warnings[0]

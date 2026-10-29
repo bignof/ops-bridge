@@ -137,7 +137,7 @@ def _on_message(ws, message):
                 _initial_report_ws = ws
                 request_report()
         elif msg_type == 'plugin_query_result':
-            plugin_query.resolve(data.get('requestId'), data.get('plugins', []), data.get('error'))
+            plugin_query.resolve(data.get('requestId'), data.get('plugins', []), data.get('error'), data.get('env'))
         elif msg_type == 'ops_code_verify_result':
             ops_code.resolve(data)
         elif msg_type in hub_rpc.RESULT_FRAMES:
