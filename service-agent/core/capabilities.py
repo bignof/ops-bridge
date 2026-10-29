@@ -17,4 +17,5 @@ CAPABILITIES = (
     'env_config',       # 本机 /envConfig → env_config_query / env_config_result：应用经 agent 向中枢取环境的两个配置开关
     'instance_snapshot',  # 本机 /instanceSnapshot → instance_snapshot_query / instance_snapshot_result：取本应用的实例快照
     'plugin_query_env',   # /queryPlugin?withEnv=1 → plugin_query.withEnv / plugin_query_result.env；error 增加 not_bound（403）
+    'discover_sync_service',  # compose_discover_result.projects[] 带 syncService / syncConfigError：目录里 sync-plugins.config.json 配的拉取编码
 )
