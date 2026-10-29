@@ -14,4 +14,6 @@ CAPABILITIES = (
     'compose_inspect',  # compose_discover / compose_inspect
     'plugin_ops',       # plugin_scan / plugin_remove / plugin_restore
     'ops_code',         # 本机 /verifyOpsCode → ops_code_verify / ops_code_verify_result（PROTOCOL.md 第 10 节）
+    'env_config',       # 本机 /envConfig → env_config_query / env_config_result：应用经 agent 向中枢取环境的两个配置开关
+    'instance_snapshot',  # 本机 /instanceSnapshot → instance_snapshot_query / instance_snapshot_result：取本应用的实例快照
 )

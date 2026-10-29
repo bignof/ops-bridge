@@ -5,15 +5,26 @@ import re
 import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 from config import AGENT_ID, AGENT_LOCAL_SECRET, CHINA_TZ, HEALTH_HOST, HEALTH_PORT
-from core import ops_code, plugin_query
+from core import hub_rpc, ops_code, plugin_query
 from core.handlers import get_command_execution_state
 from core.ws_client import get_connection_state
 
 logger = logging.getLogger(__name__)
 
 QUERY_PLUGIN_TIMEOUT = 8.0  # 必须 < 15s（sync-plugins.js:201 硬编码客户端超时上限）
+# 转发给中枢的两个查询的总时限（含等 hub_hello 协商的时间）：
+# 必须大于 hub_rpc.NEGOTIATE_SECONDS，否则旧版中枢（始终没有 hub_hello）会被判成超时 504，而不是 501；
+# 也要小于应用侧等 agent 的时限（环境开关 10 秒、快照 12 秒），中枢慢时应用拿到的是 agent 的 504，不是自己先超时
+ENV_CONFIG_TIMEOUT = 8.0
+SNAPSHOT_TIMEOUT = 10.0
+# 转发给中枢的本机查询：路径（不含查询串）精确匹配 → (请求帧, 中枢须在 hub_hello.features 声明的特性, 总时限)
+HUB_QUERY_ROUTES = {
+    '/envConfig': ('env_config_query', 'env_config', ENV_CONFIG_TIMEOUT),
+    '/instanceSnapshot': ('instance_snapshot_query', 'instance_snapshot', SNAPSHOT_TIMEOUT),
+}
 VERIFY_BODY_LIMIT = 4096
 OPERATION_RE = re.compile(r'^[A-Za-z0-9_.-]{1,64}:[A-Za-z0-9_.-]{1,64}$')
 
@@ -99,6 +110,10 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        path = self.path.partition('?')[0]
+        route = HUB_QUERY_ROUTES.get(path)    # 路径精确匹配：/envConfigs、/envConfig/ 都不认
+        if route is not None:
+            return self._handle_hub_query(path, *route)
         if self.path.startswith('/queryPlugin'):
             return self._handle_query_plugin()
         if self.path != '/health':
@@ -142,7 +157,6 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _handle_query_plugin(self):
-        from urllib.parse import urlparse, parse_qs
         if not AGENT_LOCAL_SECRET:
             # 评审 H1：secret 未配置 fail-closed（403），绝不放行——端点发布在宿主全网卡，
             # 空 secret 放行等于把该 namespace 插件清单匿名公开给同网段
@@ -207,6 +221,29 @@ class _HealthHandler(BaseHTTPRequestHandler):
         # 只记服务、操作和结果，绝不记口令
         logger.info('verifyOpsCode service=%r operation=%s status=%s result=%s',
                     fields['service'], fields['operation'], status, outcome)
+        self._send_json(status, body)
+
+    def _handle_hub_query(self, path, frame_type, feature, timeout):
+        """/envConfig、/instanceSnapshot：应用经本机 agent 向中枢查环境开关、实例快照，agent 只转发，不缓存、不解读。
+        鉴权同 /queryPlugin；service（拉取编码）必填，长度按字符计；其余状态码和响应体照 hub_rpc.call 的结果原样发出。"""
+        if not AGENT_LOCAL_SECRET:
+            logger.warning('%s 拒绝请求：AGENT_LOCAL_SECRET 未配置', path)
+            self.send_response(403)
+            self.end_headers()
+            return
+        supplied = self.headers.get('X-Agent-Secret') or ''
+        if not hmac.compare_digest(supplied.encode('utf-8'), AGENT_LOCAL_SECRET.encode('utf-8')):
+            self.send_response(401)
+            self.end_headers()
+            return
+        service = (parse_qs(urlparse(self.path).query).get('service') or [''])[0]
+        if not _text(service, 1, 255):
+            self.send_response(400)
+            self.end_headers()
+            return
+        status, body = hub_rpc.call(frame_type, {'service': service}, feature, timeout)
+        # 只记路径、拉取编码和状态码，不记密钥，也不记结果内容
+        logger.info('%s service=%r status=%s', path, service, status)
         self._send_json(status, body)
 
     def _send_json(self, status, body):
