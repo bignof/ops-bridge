@@ -7,6 +7,7 @@ import pytest
 
 from core import ops_code
 from core.capabilities import CAPABILITIES
+from core.hub_channel import DISCONNECTED
 
 FIELDS = {'service': 'done-admin', 'code': '135790', 'operation': 'backups:upload',
           'operator': {'userId': 1, 'name': '张三', 'ip': '172.18.0.1'}}
@@ -72,7 +73,7 @@ def test_round_trip_strips_envelope():
                              'namespace': {'code': 'prod', 'name': '生产'}}) is True
     thread.join(2)
     assert box['result'] == (200, {'valid': True, 'namespace': {'code': 'prod', 'name': '生产'}})
-    assert ops_code._pending == {}
+    assert ops_code._channel.pending == {}
 
 
 def test_late_result_after_timeout_is_dropped():
@@ -82,7 +83,7 @@ def test_late_result_after_timeout_is_dropped():
     thread.join(2)
     assert box['result'] == (504, None)
     assert ops_code.resolve({'type': 'ops_code_verify_result', 'requestId': sent[0]['requestId'], 'valid': True}) is False
-    assert ops_code._pending == {}
+    assert ops_code._channel.pending == {}
 
 
 def test_resolve_ignores_unknown_or_malformed_ids():
@@ -95,7 +96,7 @@ def test_resolve_ignores_unknown_or_malformed_ids():
 def test_disconnect_wakes_every_pending_request_at_once():
     _connect()
     workers = [_verify_async(timeout=5) for _ in range(3)]
-    assert _wait_for(lambda: len(ops_code._pending) == 3)
+    assert _wait_for(lambda: len(ops_code._channel.pending) == 3)
     started = time.monotonic()
     ops_code.on_disconnected()
     for thread, box in workers:
@@ -117,8 +118,8 @@ def test_result_from_previous_generation_is_dropped():
     sent = _connect()
     thread, box = _verify_async(timeout=5)
     assert _wait_for(lambda: sent)
-    with ops_code._lock:                            # 模拟：结果到达前连接已换代，等待方还没来得及清理
-        ops_code._generation += 1
+    with ops_code._channel.lock:                            # 模拟：结果到达前连接已换代，等待方还没来得及清理
+        ops_code._channel.generation += 1
     assert ops_code.resolve({'requestId': sent[0]['requestId'], 'valid': True}) is False
     ops_code.on_disconnected()
     thread.join(2)
@@ -128,7 +129,7 @@ def test_result_from_previous_generation_is_dropped():
 def test_in_flight_cap_returns_busy():
     _connect()
     workers = [_verify_async(timeout=5) for _ in range(ops_code.MAX_IN_FLIGHT)]
-    assert _wait_for(lambda: len(ops_code._pending) == ops_code.MAX_IN_FLIGHT)
+    assert _wait_for(lambda: len(ops_code._channel.pending) == ops_code.MAX_IN_FLIGHT)
     assert ops_code.verify(dict(FIELDS)) == (503, {'reason': 'busy'})
     ops_code.on_disconnected()
     for thread, _ in workers:
@@ -149,13 +150,13 @@ def test_blocked_sender_keeps_threads_and_queue_bounded():
     try:
         results = [ops_code.verify(dict(FIELDS), timeout=0.05) for _ in range(30)]
         assert len(calls) == 1                                   # 只有一个发送线程卡在 send 上
-        assert ops_code._queue.qsize() <= ops_code.SEND_QUEUE_SIZE
+        assert ops_code._channel.queue.qsize() <= ops_code.SEND_QUEUE_SIZE
         assert threading.active_count() <= baseline + 1          # 至多多出这一个发送线程
         assert all(r in ((504, None), (503, {'reason': 'busy'})) for r in results)
         assert (503, {'reason': 'busy'}) in results              # 队列满后直接 busy，不再排队
     finally:
         release.set()
-    assert _wait_for(lambda: ops_code._queue.qsize() == 0)
+    assert _wait_for(lambda: ops_code._channel.queue.qsize() == 0)
     assert len(calls) == 1                                       # 调用方都已放弃，排队的帧全部丢弃
 
 
@@ -172,7 +173,7 @@ def test_frames_queued_on_old_connection_are_not_sent_after_reconnect():
     first = _verify_async(timeout=5)
     assert _wait_for(lambda: old_calls)                          # 发送线程卡在旧连接的 send 上
     queued = _verify_async(timeout=5)
-    assert _wait_for(lambda: ops_code._queue.qsize() == 1)
+    assert _wait_for(lambda: ops_code._channel.queue.qsize() == 1)
     ops_code.on_disconnected()                                   # 断线：两个在途请求都立即返回
     for thread, box in (first, queued):
         thread.join(2)
@@ -191,16 +192,16 @@ def test_frames_queued_on_old_connection_are_not_sent_after_reconnect():
 def test_send_one_drops_stale_old_or_abandoned_frames():
     calls = []
     ops_code.on_connected(calls.append)
-    generation = ops_code._generation
-    with ops_code._lock:
-        ops_code._pending['live'] = {'event': threading.Event(), 'generation': generation, 'result': None}
+    generation = ops_code._channel.generation
+    with ops_code._channel.lock:
+        ops_code._channel.pending['live'] = {'event': threading.Event(), 'generation': generation, 'result': None}
     frame = {'type': 'ops_code_verify', 'requestId': 'live'}
     now = ops_code._monotonic()
-    assert ops_code._send_one((now - ops_code.SEND_STALE_SECONDS - 1, generation, 'live', frame)) is False
-    assert ops_code._send_one((now, generation - 1, 'live', frame)) is False
-    assert ops_code._send_one((now, generation, 'gone', frame)) is False
+    assert ops_code._channel.send_one((now - ops_code.SEND_STALE_SECONDS - 1, generation, 'live', frame)) is False
+    assert ops_code._channel.send_one((now, generation - 1, 'live', frame)) is False
+    assert ops_code._channel.send_one((now, generation, 'gone', frame)) is False
     assert calls == []
-    assert ops_code._send_one((now, generation, 'live', frame)) is True
+    assert ops_code._channel.send_one((now, generation, 'live', frame)) is True
     assert calls == [frame]
 
 
@@ -214,3 +215,57 @@ def test_send_failure_wakes_request_and_never_logs_code(caplog):
     assert ops_code.verify(dict(FIELDS), timeout=5) == (503, {'reason': 'disconnected'})
     assert FIELDS['code'] not in caplog.text
     assert 'RuntimeError' in caplog.text
+
+
+def test_result_received_before_disconnect_is_not_overwritten():
+    """结果刚到、等待线程还没来得及读，连接就断了：先到的说了算，不能把有效结果改成 disconnected。"""
+    _connect()
+    entry = {'event': threading.Event(), 'generation': ops_code._channel.generation, 'result': None}
+    with ops_code._channel.lock:
+        ops_code._channel.pending['r1'] = entry
+    assert ops_code.resolve({'type': 'ops_code_verify_result', 'requestId': 'r1', 'valid': True}) is True
+    ops_code.on_disconnected()
+    assert entry['event'].is_set() and entry['result'] is not DISCONNECTED
+    assert entry['result']['valid'] is True
+    ops_code.on_connected(lambda frame: None)               # 换连接时的唤醒同样不改写已有结果
+    assert entry['result']['valid'] is True
+
+
+def test_result_received_just_before_disconnect_is_still_returned():
+    def reply_then_drop(frame):
+        ops_code.resolve({'type': 'ops_code_verify_result', 'requestId': frame['requestId'], 'valid': True})
+        ops_code.on_disconnected()
+
+    ops_code.on_connected(reply_then_drop)
+    ops_code.set_features(['ops_code'])
+    assert ops_code.verify(dict(FIELDS), timeout=2) == (200, {'valid': True})
+
+
+def test_reconnect_without_close_wakes_waiters_of_the_old_connection():
+    sent = _connect()
+    thread, box = _verify_async(timeout=5)
+    assert _wait_for(lambda: sent)
+    started = time.monotonic()
+    ops_code.on_connected(lambda frame: None)               # 旧连接没走到 on_disconnected 就换了新连接
+    thread.join(2)
+    assert not thread.is_alive()
+    assert box['result'] == (503, {'reason': 'disconnected'})
+    assert time.monotonic() - started < 1                   # 不用干等到 5 秒的超时
+    assert ops_code._channel.pending == {}
+    assert ops_code.verify(dict(FIELDS)) == (503, {'reason': 'negotiating'})   # 新连接重新协商
+
+
+def test_busy_because_the_send_queue_is_full_leaves_no_registration_behind():
+    release = threading.Event()
+
+    def blocking_send(frame):
+        release.wait(5)
+
+    ops_code.on_connected(blocking_send)
+    ops_code.set_features(['ops_code'])
+    try:
+        results = [ops_code.verify(dict(FIELDS), timeout=0.05) for _ in range(30)]
+        assert (503, {'reason': 'busy'}) in results            # 队列满后直接 busy
+        assert ops_code._channel.pending == {}                 # 超时放弃的、被队列满拒掉的，登记都撤干净，不占在途名额
+    finally:
+        release.set()

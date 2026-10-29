@@ -5,7 +5,8 @@ import time
 
 import pytest
 
-from core import hub_rpc
+from core import hub_rpc, ops_code
+from core.hub_channel import DISCONNECTED
 
 ENV = {'allowUi': False, 'allowDs': True}
 SNAPSHOT = {'schemaVersion': 1, 'collectedAt': '2026-10-29T08:00:00.000Z', 'instances': []}
@@ -26,8 +27,13 @@ class Rpc:
         self.sent = []
         self.events = []        # 'hello' / 'frame' 的先后：证明请求是等到 hub_hello 之后才发出的
         self.reply = None
+        self.gate = None        # 设了就让 send 卡在这里，模拟半开连接下 send 阻塞
+        self.arrived = []       # 已经进到 send 里的帧（含卡在 gate 上的）
 
     def send(self, frame):
+        self.arrived.append(frame)
+        if self.gate is not None:
+            self.gate.wait(5)
         self.events.append('frame')
         self.sent.append(frame)
         if self.reply is not None:
@@ -79,9 +85,9 @@ def later(delay, fn):
 
 def register(request_id):
     """手工登记一个属于当前连接、没有等待线程的在途条目，用来确定性地检查 resolve / 唤醒对条目本身做了什么。"""
-    entry = {'event': threading.Event(), 'generation': hub_rpc._generation, 'result': None}
-    with hub_rpc._lock:
-        hub_rpc._pending[request_id] = entry
+    entry = {'event': threading.Event(), 'generation': hub_rpc._channel.generation, 'result': None}
+    with hub_rpc._channel.lock:
+        hub_rpc._channel.pending[request_id] = entry
     return entry
 
 
@@ -90,7 +96,7 @@ def call_async(timeout=5.0, fields=None):
     frame_type, default_fields, feature = ENV_QUERY
     args = (frame_type, dict(fields or default_fields), feature, timeout)
     box = {}
-    thread = threading.Thread(target=lambda: box.update(result=hub_rpc.call(*args)))
+    thread = threading.Thread(target=lambda: box.update(result=hub_rpc.call(*args)), daemon=True)
     thread.start()
     return thread, box
 
@@ -127,7 +133,7 @@ def test_call_returns_env_from_result_frame(rpc):
     rpc.connect(features=['env_config'])
     reply_with(rpc, {'type': 'env_config_result', 'env': {'allowUi': False, 'allowDs': True}})
     assert hub_rpc.call('env_config_query', {'service': 'k3f9qm'}, 'env_config', 1.0) == (200, {'allowUi': False, 'allowDs': True})
-    assert hub_rpc._pending == {}
+    assert hub_rpc._channel.pending == {}
 
 
 def test_call_returns_snapshot_from_result_frame(rpc):
@@ -176,7 +182,7 @@ def test_malformed_result_frames_are_502_unavailable(rpc, frame):
     rpc.connect()
     reply_with(rpc, {'type': ENV_RESULT, **frame})
     assert hub_rpc.call(*ENV_QUERY, 1.0) == UNAVAILABLE
-    assert hub_rpc._pending == {}
+    assert hub_rpc._channel.pending == {}
 
 
 # ---- hub_hello 协商 ----
@@ -184,7 +190,7 @@ def test_malformed_result_frames_are_502_unavailable(rpc, frame):
 def test_hub_without_feature_gets_501(rpc):
     rpc.connect(features=['header_auth'])
     assert hub_rpc.call('env_config_query', {'service': 'x'}, 'env_config', 1.0) == (501, {'reason': 'hub_unsupported'})
-    assert rpc.sent == [] and hub_rpc._pending == {}
+    assert rpc.sent == [] and hub_rpc._channel.pending == {}
 
 
 @pytest.mark.parametrize('features', [None, 'env_config', {'env_config': True}, []])
@@ -217,7 +223,7 @@ def test_no_hello_within_the_window_is_501(rpc, monkeypatch):
     started = time.monotonic()
     assert hub_rpc.call(*ENV_QUERY, 5.0) == HUB_UNSUPPORTED
     assert 0.1 <= time.monotonic() - started < 2     # 等了窗口那么久，而不是等满调用方的 5 秒
-    assert rpc.sent == [] and hub_rpc._pending == {}
+    assert rpc.sent == [] and hub_rpc._channel.pending == {}
 
 
 def test_window_already_closed_is_501_without_waiting_and_a_late_hello_still_works(rpc, clock):
@@ -236,7 +242,7 @@ def test_call_timeout_shorter_than_the_window_is_504(rpc):
     started = time.monotonic()
     assert hub_rpc.call(*ENV_QUERY, 0.2) == TIMEOUT      # 窗口 5 秒，但调用方只肯等 0.2 秒：不是「中枢太旧」
     assert time.monotonic() - started < 2
-    assert hub_rpc._pending == {}
+    assert hub_rpc._channel.pending == {}
 
 
 def test_timeout_is_the_total_budget_including_negotiation(rpc):
@@ -256,7 +262,7 @@ def test_reconnect_clears_features_and_restarts_negotiation(rpc):
     fresh = Rpc()
     fresh.connect(features=None)                          # 重连：特性回到未知，请求要等本连接的 hub_hello
     waiting = call_async(timeout=3)
-    assert wait_for(lambda: len(hub_rpc._pending) == 1)
+    assert wait_for(lambda: len(hub_rpc._channel.pending) == 1)
     time.sleep(0.1)
     assert fresh.sent == []
     fresh.hello(['env_config'])
@@ -276,19 +282,19 @@ def test_disconnect_wakes_pending_call(rpc):
     for worker in workers:
         assert finish(worker) == HUB_DISCONNECTED          # 等待中断线 → 503，不干等超时
     assert time.monotonic() - started < 1
-    assert hub_rpc._pending == {}
+    assert hub_rpc._channel.pending == {}
     assert hub_rpc.call(*ENV_QUERY, 1.0) == HUB_DISCONNECTED
 
 
 def test_disconnect_during_negotiation_wakes_the_waiting_call(rpc):
     rpc.connect(features=None)
     waiting = call_async(timeout=5)
-    assert wait_for(lambda: len(hub_rpc._pending) == 1)
+    assert wait_for(lambda: len(hub_rpc._channel.pending) == 1)
     started = time.monotonic()
     hub_rpc.on_disconnected()
     assert finish(waiting) == HUB_DISCONNECTED
     assert time.monotonic() - started < 1
-    assert rpc.sent == [] and hub_rpc._pending == {}
+    assert rpc.sent == [] and hub_rpc._channel.pending == {}
 
 
 def test_reconnect_without_close_wakes_waiters_of_the_old_connection(rpc):
@@ -302,7 +308,7 @@ def test_reconnect_without_close_wakes_waiters_of_the_old_connection(rpc):
     assert wait_for(lambda: fresh.sent)
     fresh_id = fresh.sent[0]['requestId']
     hub_rpc.resolve(result_frame(old_request_id, env={'allowUi': True, 'allowDs': True}))   # 旧连接的迟到结果
-    assert not hub_rpc._pending[fresh_id]['event'].is_set()
+    assert not hub_rpc._channel.pending[fresh_id]['event'].is_set()
     hub_rpc.resolve(result_frame(fresh_id, env=ENV))
     assert finish(waiting) == (200, ENV)
 
@@ -314,9 +320,9 @@ def test_stale_generation_result_is_dropped(rpc):
     worker = call_async()
     assert wait_for(lambda: rpc.sent)
     request_id = rpc.sent[0]['requestId']
-    entry = hub_rpc._pending[request_id]
-    with hub_rpc._lock:                                   # 模拟：结果到达前连接已换代，等待方还没来得及清理
-        hub_rpc._generation += 1
+    entry = hub_rpc._channel.pending[request_id]
+    with hub_rpc._channel.lock:                                   # 模拟：结果到达前连接已换代，等待方还没来得及清理
+        hub_rpc._channel.generation += 1
     hub_rpc.resolve(result_frame(request_id, env=ENV))
     assert not entry['event'].is_set() and entry['result'] is None
     hub_rpc.on_disconnected()
@@ -327,7 +333,7 @@ def test_late_result_after_timeout_is_dropped(rpc):
     rpc.connect()
     assert hub_rpc.call(*ENV_QUERY, 0.1) == TIMEOUT
     hub_rpc.resolve(result_frame(rpc.sent[0]['requestId'], env=ENV))
-    assert hub_rpc._pending == {}
+    assert hub_rpc._channel.pending == {}
 
 
 def test_stale_result_never_reaches_a_later_call(rpc):
@@ -338,7 +344,7 @@ def test_stale_result_never_reaches_a_later_call(rpc):
     assert wait_for(lambda: len(rpc.sent) == 2)
     fresh_id = rpc.sent[1]['requestId']
     hub_rpc.resolve(result_frame(stale_id, env={'allowUi': False, 'allowDs': False}))   # 第一次请求迟到的结果
-    entry = hub_rpc._pending[fresh_id]
+    entry = hub_rpc._channel.pending[fresh_id]
     assert not entry['event'].is_set()
     hub_rpc.resolve(result_frame(fresh_id, env=ENV))
     assert finish(worker) == (200, ENV)
@@ -348,7 +354,7 @@ def test_resolve_ignores_unknown_or_malformed_ids(rpc):
     rpc.connect()
     worker = call_async()
     assert wait_for(lambda: rpc.sent)
-    entry = hub_rpc._pending[rpc.sent[0]['requestId']]
+    entry = hub_rpc._channel.pending[rpc.sent[0]['requestId']]
     for data in ({'requestId': 'nope', 'env': ENV}, {'requestId': None, 'env': ENV},
                  {'requestId': 123, 'env': ENV}, {'requestId': ['x'], 'env': ENV}, {}):
         hub_rpc.resolve(data)
@@ -357,14 +363,20 @@ def test_resolve_ignores_unknown_or_malformed_ids(rpc):
     assert finish(worker) == HUB_DISCONNECTED
 
 
+def delivered_env(entry):
+    """条目里记下的是中枢送来的结果帧（而不是 DISCONNECTED），返回其中的 env。"""
+    assert entry['event'].is_set() and entry['result'] is not DISCONNECTED
+    return entry['result']['env']
+
+
 def test_result_received_before_disconnect_is_not_overwritten(rpc):
     rpc.connect()
     entry = register('r1')
     hub_rpc.resolve(result_frame('r1', env=ENV))
     hub_rpc.on_disconnected()                             # 结果刚到，连接紧接着断：先到的说了算
-    assert entry['result'] == {'env': ENV}
+    assert delivered_env(entry) == ENV
     hub_rpc.on_connected(lambda frame: None)              # 换连接时的唤醒同样不改写已有结果
-    assert entry['result'] == {'env': ENV}
+    assert delivered_env(entry) == ENV
 
 
 def test_result_received_just_before_disconnect_is_still_returned():
@@ -382,7 +394,7 @@ def test_disconnect_before_result_wins_and_the_late_result_is_dropped(rpc):
     entry = register('r1')
     hub_rpc.on_disconnected()
     hub_rpc.resolve(result_frame('r1', env=ENV))
-    assert entry['result'] is hub_rpc._DISCONNECTED
+    assert entry['result'] is DISCONNECTED
 
 
 def test_second_result_for_the_same_request_is_ignored(rpc):
@@ -390,7 +402,8 @@ def test_second_result_for_the_same_request_is_ignored(rpc):
     entry = register('r1')
     hub_rpc.resolve(result_frame('r1', env=ENV))
     hub_rpc.resolve(result_frame('r1', error='unavailable'))   # 重复或矛盾的第二帧不改写
-    assert entry['event'].is_set() and entry['result'] == {'env': ENV}
+    assert delivered_env(entry) == ENV
+    assert 'error' not in entry['result']
 
 
 def test_concurrent_calls_each_get_their_own_result(rpc):
@@ -410,9 +423,9 @@ def test_concurrent_calls_each_get_their_own_result(rpc):
 def test_busy_when_in_flight_full(rpc):
     rpc.connect()
     workers = [call_async(timeout=5) for _ in range(hub_rpc.MAX_IN_FLIGHT)]
-    assert wait_for(lambda: len(hub_rpc._pending) == hub_rpc.MAX_IN_FLIGHT)
+    assert wait_for(lambda: len(hub_rpc._channel.pending) == hub_rpc.MAX_IN_FLIGHT)
     assert hub_rpc.call(*ENV_QUERY, 1.0) == BUSY          # 第 MAX_IN_FLIGHT + 1 个
-    assert len(hub_rpc._pending) == hub_rpc.MAX_IN_FLIGHT
+    assert len(hub_rpc._channel.pending) == hub_rpc.MAX_IN_FLIGHT
     hub_rpc.on_disconnected()
     for worker in workers:
         assert finish(worker) == HUB_DISCONNECTED
@@ -423,7 +436,7 @@ def test_finished_call_frees_its_slot(rpc):
     workers = [call_async(timeout=5) for _ in range(hub_rpc.MAX_IN_FLIGHT)]
     assert wait_for(lambda: len(rpc.sent) == hub_rpc.MAX_IN_FLIGHT)
     hub_rpc.resolve(result_frame(rpc.sent[0]['requestId'], env=ENV))
-    assert wait_for(lambda: len(hub_rpc._pending) == hub_rpc.MAX_IN_FLIGHT - 1)    # 有一个调用拿到结果走了
+    assert wait_for(lambda: len(hub_rpc._channel.pending) == hub_rpc.MAX_IN_FLIGHT - 1)    # 有一个调用拿到结果走了
     replacement = call_async(timeout=5)
     assert wait_for(lambda: len(rpc.sent) == hub_rpc.MAX_IN_FLIGHT + 1)            # 腾出的名额被新请求用上，没有判 busy
     hub_rpc.on_disconnected()
@@ -434,7 +447,7 @@ def test_finished_call_frees_its_slot(rpc):
 def test_calls_waiting_for_hello_count_as_in_flight(rpc):
     rpc.connect(features=None)                            # 刚连上的几秒内涌进来的请求也不能无限堆积
     workers = [call_async(timeout=5) for _ in range(hub_rpc.MAX_IN_FLIGHT)]
-    assert wait_for(lambda: len(hub_rpc._pending) == hub_rpc.MAX_IN_FLIGHT)
+    assert wait_for(lambda: len(hub_rpc._channel.pending) == hub_rpc.MAX_IN_FLIGHT)
     assert hub_rpc.call(*ENV_QUERY, 1.0) == BUSY
     rpc.hello(['env_config'])                             # hub_hello 到了：8 个都发出请求
     assert wait_for(lambda: len(rpc.sent) == hub_rpc.MAX_IN_FLIGHT)
@@ -448,7 +461,7 @@ def test_timeout_returns_504(rpc):
     started = time.monotonic()
     assert hub_rpc.call(*ENV_QUERY, 0.3) == (504, {'reason': 'timeout'})
     assert 0.2 <= time.monotonic() - started < 2
-    assert hub_rpc._pending == {}
+    assert hub_rpc._channel.pending == {}
 
 
 # ---- 发送线程 ----
@@ -467,14 +480,14 @@ def test_blocked_sender_keeps_threads_and_queue_bounded():
     try:
         results = [hub_rpc.call(*ENV_QUERY, 0.05) for _ in range(30)]
         assert len(calls) == 1                                   # 只有一个发送线程卡在 send 上
-        assert hub_rpc._queue.qsize() <= hub_rpc.SEND_QUEUE_SIZE
+        assert hub_rpc._channel.queue.qsize() <= hub_rpc.SEND_QUEUE_SIZE
         assert threading.active_count() <= baseline + 1          # 至多多出这一个发送线程
         assert all(result in (TIMEOUT, BUSY) for result in results)
         assert BUSY in results                                   # 队列满后直接 busy，不再排队
-        assert hub_rpc._pending == {}                            # 放弃的调用都已清账
+        assert hub_rpc._channel.pending == {}                            # 放弃的调用都已清账
     finally:
         release.set()
-    assert wait_for(lambda: hub_rpc._queue.qsize() == 0)
+    assert wait_for(lambda: hub_rpc._channel.queue.qsize() == 0)
     assert len(calls) == 1                                       # 调用方都已放弃，排队的帧全部丢弃
 
 
@@ -491,7 +504,7 @@ def test_frames_queued_on_old_connection_are_not_sent_after_reconnect():
     first = call_async(timeout=5)
     assert wait_for(lambda: old_calls)                           # 发送线程卡在旧连接的 send 上
     queued = call_async(timeout=5)
-    assert wait_for(lambda: hub_rpc._queue.qsize() == 1)
+    assert wait_for(lambda: hub_rpc._channel.queue.qsize() == 1)
     hub_rpc.on_disconnected()                                    # 断线：两个在途请求都立即返回
     assert finish(first) == HUB_DISCONNECTED
     assert finish(queued) == HUB_DISCONNECTED
@@ -507,14 +520,42 @@ def test_frames_queued_on_old_connection_are_not_sent_after_reconnect():
 
 def test_send_one_drops_old_generation_or_abandoned_frames(rpc):
     rpc.connect()
-    generation = hub_rpc._generation
+    generation = hub_rpc._channel.generation
     register('live')
     frame = {'type': 'env_config_query', 'requestId': 'live'}
-    assert hub_rpc._send_one((generation - 1, 'live', frame)) is False    # 旧连接的帧
-    assert hub_rpc._send_one((generation, 'gone', frame)) is False        # 调用方已放弃的帧
+    now = hub_rpc._monotonic()
+    assert hub_rpc._channel.send_one((now, generation - 1, 'live', frame)) is False    # 旧连接的帧
+    assert hub_rpc._channel.send_one((now, generation, 'gone', frame)) is False        # 调用方已放弃的帧
     assert rpc.sent == []
-    assert hub_rpc._send_one((generation, 'live', frame)) is True
+    assert hub_rpc._channel.send_one((now, generation, 'live', frame)) is True
     assert rpc.sent == [frame]
+
+
+def test_old_frame_of_a_caller_still_waiting_is_sent(rpc):
+    rpc.connect()
+    register('live')
+    frame = {'type': 'env_config_query', 'requestId': 'live'}
+    way_back = hub_rpc._monotonic() - 3600                    # 在队列里躺了一小时，调用方却还在等
+    assert hub_rpc._channel.send_one((way_back, hub_rpc._channel.generation, 'live', frame)) is True
+    assert rpc.sent == [frame]
+
+
+def test_queued_frame_older_than_ops_code_stale_limit_is_still_sent_when_caller_waits(rpc, clock):
+    gate = threading.Event()
+    rpc.gate = gate                                           # 第一个请求卡在 send 上，第二个请求的帧在队列里排着
+    rpc.connect()
+    reply_with(rpc, {'type': ENV_RESULT, 'env': ENV})
+    try:
+        first = call_async(timeout=30)
+        assert wait_for(lambda: rpc.arrived)
+        second = call_async(timeout=30)
+        assert wait_for(lambda: hub_rpc._channel.queue.qsize() == 1)
+        clock[0] += ops_code.SEND_STALE_SECONDS + 2            # 排队时间超过 ops_code 的 8 秒上限，但没超过本次调用的 30 秒
+    finally:
+        gate.set()
+    assert finish(first) == (200, ENV)
+    assert finish(second) == (200, ENV)                       # 若套用 8 秒的过期规则，第二帧会被丢掉，调用只能超时
+    assert len(rpc.sent) == 2
 
 
 def test_send_failure_wakes_request_and_never_logs_the_frame(caplog):
